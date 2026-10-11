@@ -1,0 +1,16 @@
+{
+  "name": "pi-durable-exploration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "probe": "node --experimental-strip-types examples/quickstart.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "latest",
+    "@earendil-works/pi-ai": "latest",
+    "@earendil-works/pi-durable": "latest"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

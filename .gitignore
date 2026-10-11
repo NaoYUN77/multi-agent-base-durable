@@ -1,0 +1,79 @@
+# ── 上游依赖：pi checkout ──────────────────────────────────────────────
+# durable-cli-probe 的 node_modules/@earendil-works/* 是指向这里的软链。
+# 505MB，且带自己的 .git 历史，绝不入库。恢复方式见 durable-cli-probe/README.md。
+base-durable-vaction-agent/
+
+# ── 原 billryan/resume fork 的 .git，已挪到一边保留，不入库 ─────────────
+.git-resume-fork-backup/
+
+# ── Node 生成物 ─────────────────────────────────────────────────────────
+node_modules/
+*.log
+npm-debug.log*
+
+# ── Durable 运行产物：SQLite WAL 边车文件 ───────────────────────────────
+*.sqlite-wal
+*.sqlite-shm
+
+############################################
+## 简历模板残留（本目录原为 billryan/resume 的 fork）
+## 本仓库只承载 durable-cli-probe 探针项目，简历相关文件一律不入库。
+############################################
+
+# LaTeX 源码与模板
+*.tex
+*.sty
+*.cls
+*.bib
+*.bst
+
+# 字体与图片资源
+fonts/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+avatar.*
+
+# 模板脚手架
+Makefile
+latexmkrc
+LICENSE
+README.md.bak
+fontawesome*
+Noto*
+
+# 简历渲染工具（含真实姓名与本地路径，不属于本仓库主题）
+**/render_resume_pillow.py
+
+# LaTeX 中间产物
+*.aux
+*.bbl
+*.blg
+*.tex.undo
+*.tex.bak
+*.~te
+*.$te
+*.DVX
+*.DDF
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
+*.lof
+*.lot
+*.idx
+*.ilg
+*.ind
+*.dvi
+*.ps
+
+# 模板自带的 scripts/
+/scripts/
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

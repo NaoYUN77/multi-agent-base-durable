@@ -1,0 +1,19 @@
+# WAL and SHM sidecars are transient, machine-specific, and must never be
+# committed: they are only meaningful alongside a live connection.
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+
+# The .sqlite files themselves ARE committed on purpose: they are the durable
+# transcripts this probe exists to produce, and the README cites specific entry
+# ids in them as evidence. A reader can open them and inspect the committed
+# `pi.tool-result` entries directly, without re-running anything.
+#
+# They were scanned before committing and contain no credentials: no `ntn_` or
+# `secret_` token, no `sk-` key, no email address, no absolute path. The payload
+# is the Notion sample page content and the probe's own prompts.
+#
+# If you re-run the probe locally, prefer a scratch database instead of
+# overwriting these (e.g. --db ./data/scratch.sqlite).
+*.db

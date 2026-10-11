@@ -1,0 +1,26 @@
+{
+	"name": "durable-cli-probe",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "TASK-001: minimal Pi Durable run-chain probe. Resolves the local pi checkout, never the registry.",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"link": "node scripts/link-checkout.mjs",
+		"cli": "node --conditions=source --experimental-strip-types src/cli.ts",
+		"notion:me": "node --conditions=source --experimental-strip-types src/notion/cli-me.ts",
+		"notion:search": "node --conditions=source --experimental-strip-types src/notion/cli-search.ts",
+		"notion:read-page": "node --conditions=source --experimental-strip-types src/notion/cli-read-page.ts",
+		"notion:tool": "node --conditions=source --experimental-strip-types src/notion/cli-tool.ts",
+		"test": "vitest --run",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@notionhq/client": "5.27.0",
+		"@types/node": "22.19.19",
+		"typescript": "7.0.2",
+		"vitest": "4.1.11"
+	}
+}
