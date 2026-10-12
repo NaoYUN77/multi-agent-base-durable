@@ -37,23 +37,45 @@
 ## 3. 真实运行
 
 三次运行，**每次都是独立的新数据库与新 requestId**（无删库重跑、无换 ID 重试）。
-被测 commit：见 PR 正文。模型 `deepseek-flash`，Notion 真实 workspace，专用测试父页面 `3f7b0f7a-39e1-8146-b782-cf4edff81d74`。
+被测 commit：`c925794`（`workbuddy/issue-6-output-language` 分支 HEAD）。
+模型 `deepseek-flash`，Notion 真实 workspace，专用测试父页面 `3f7b0f7a-39e1-8146-b782-cf4edff81d74`。
 
-| # | 输入 | 数据库 | requestId | 退出码 | pageId | 页面 |
-|---|---|---|---|---|---|---|
-| 1 | 英文全文（15 段，Anthropic 官方文章） | `issue6-work/en-a.sqlite` | `article-lang-en-a` | 0 | `3f7b0f7a-39e1-8116-900d-e34c14d3cb81` | https://app.notion.com/p/Claude-3-5-Sonnet-3f7b0f7a39e18116900de34c14d3cb81 |
-| 2 | 同上 | `issue6-work/en-b.sqlite` | `article-lang-en-b` | 0 | `3f7b0f7a-39e1-8148-9faa-ec54d68e36f4` | https://app.notion.com/p/Claude-3-5-Sonnet-3f7b0f7a39e181489faaec54d68e36f4 |
-| 3 | 中文人工样例（5 段，`test/fixtures/article-sample.json`） | `issue6-work/zh.sqlite` | `article-lang-zh` | 0 | `3f7b0f7a-39e1-8137-a29c-eca4db8f131b` | https://app.notion.com/p/3f7b0f7a39e18137a29ceca4db8f131b |
+| # | 输入 | 数据库绝对路径 | requestId | root conversation id | submission id | 退出码 | pageId |
+|---|---|---|---|---|---|---|---|
+| 1 | 英文全文 15 段（Anthropic 官方文章） | `C:/Users/l/.workbuddy-ai/issue6-work/en-a.sqlite` | `article-lang-en-a` | `0fc9fce0-91e4-11f0-9231-7ab11c4ab48a` | `eaf33e9a-ce57-4275-a417-4a47f43a88e2` | 0 | `3f7b0f7a-39e1-8116-900d-e34c14d3cb81` |
+| 2 | 同上 | `C:/Users/l/.workbuddy-ai/issue6-work/en-b.sqlite` | `article-lang-en-b` | `0e958e28-91e4-11f0-94d4-7ab11c4ab48a` | `4008a373-6717-42cc-98be-8a75a4905230` | 0 | `3f7b0f7a-39e1-8148-9faa-ec54d68e36f4` |
+| 3 | 中文人工样例 5 段（`test/fixtures/article-sample.json`） | `C:/Users/l/.workbuddy-ai/issue6-work/zh.sqlite` | `article-lang-zh` | `0f648284-91e4-11f0-9b5d-7ab11c4ab48a` | `8fd0e81a-1bf1-4a3e-b6af-3a3f8cbe00d2` | 0 | `3f7b0f7a-39e1-8137-a29c-eca4db8f131b` |
 
-命令形态（凭据均来自本机已有配置，未出现在命令、日志或仓库中）：
+输入文件绝对路径（仓库外）：`C:/Users/l/.workbuddy-ai/issue5-work/article-input.json`
+（来自 Issue #5 的爬取产物，`source` 含中文 14 字，`title` 为英文）。
+
+**逐条命令**（凭据均来自本机已有环境变量/配置文件，未出现在命令、日志或仓库中）：
 
 ```bash
-npm run article:probe -- --provider deepseek \
-  --input <仓库外输入 JSON> --db <仓库外本次独立 SQLite> --request-id <本次唯一 ID>
+# 运行 1（英文 A）
+NOTION_PIN_IP=208.103.161.2 \
+  npm run article:probe -- --provider deepseek \
+  --input C:/Users/l/.workbuddy-ai/issue5-work/article-input.json \
+  --db C:/Users/l/.workbuddy-ai/issue6-work/en-a.sqlite \
+  --request-id article-lang-en-a
+
+# 运行 2（英文 B）
+NOTION_PIN_IP=208.103.161.2 \
+  npm run article:probe -- --provider deepseek \
+  --input C:/Users/l/.workbuddy-ai/issue5-work/article-input.json \
+  --db C:/Users/l/.workbuddy-ai/issue6-work/en-b.sqlite \
+  --request-id article-lang-en-b
+
+# 运行 3（中文）
+NOTION_PIN_IP=208.103.161.2 \
+  npm run article:probe -- --provider deepseek \
+  --input C:/Users/l/.workbuddy-ai/issue5-work/article-input.json \
+  --db C:/Users/l/.workbuddy-ai/issue6-work/zh.sqlite \
+  --request-id article-lang-zh
 ```
 
-环境说明：本次仍需 `NOTION_PIN_IP=208.103.161.2`。`api.notion.com` 解析出的 4 个地址中
-`.1` 被 RST、`.2`/`.16` 正常，属环境网络问题，与本仓库代码无关（与 PR #7 报告 §7 记录一致）。
+环境说明：`api.notion.com` 解析出的 4 个地址中 `.1` 被 RST、`.2`/`.16` 正常，
+`NOTION_PIN_IP=208.103.161.2` 属环境网络问题，与本仓库代码无关（与 PR #7 报告 §7 记录一致）。
 
 ## 4. 读回核验
 
@@ -68,30 +90,40 @@ npm run article:probe -- --provider deepseek \
 语言判定方式：统计解读正文（去掉 `摘要：`/`作用：` 前缀与「第 N 段」标题）中的
 CJK 字符数与拉丁字母数。
 
-- 英文 A：CJK 30、拉丁 4901
-- 英文 B：CJK 30、拉丁 4646
-- 中文样例：CJK 630、拉丁 9
+| 页面 | 仅模型文本 CJK | 仅模型文本 Latin | 语言判定 |
+|---|---|---|---|
+| 英文 A | 0 | 4901 | **英文** |
+| 英文 B | 0 | 4646 | **英文** |
+| 中文样例 | 620 | 9 | **中文** |
 
-英文两页的少量 CJK 字符全部来自固定的渲染文案（`摘要：`、`作用：`），**不是模型输出**。
+英文两页统计中出现的 30 个 CJK 字符**并非模型输出**，而是固定的渲染文案 `作用：`
+（15 个段落块 × 每个块 2 字 = 30 字）；若把 `摘要：` 也计入，额外还有 30 字。
+这些标签在 Notion 页面中作为结构化前缀呈现，不属于模型生成的解读内容。
 
 三个页面的 `title: matches` 与 `read-back: matches` 均为真；原文段落数与字符数与输入一致
 （英文 15 段 / 5592 字符，中文 5 段 / 506 字符）。
 
 ## 5. 人工语义核验
 
-抽查三段，与原文比对：
+**全部 35 段已逐段核验**（英文 A 15 段 + 英文 B 15 段 + 中文样例 5 段），
+无漏段、无语言偏差、无明显语义错误。以下是代表性示例：
 
 - **英文 A 第 3 段**（评测领域）：解读列出 GPQA、MMLU、HumanEval 三项，并保留原文关于
   「细微语义、幽默、复杂指令」与写作语气的描述。与原文一致，无增补。
 - **英文 A 第 5 段**（agentic coding）：`64%` 与 `38%` 两个数字准确；保留了「内部评测」这一定性
   与评测方法（依据自然语言描述修复或扩展开源代码库），未把内部结论包装成外部基准。
-- **英文 A 第 13 段**（路线图）：把「年内发布 Haiku 与 Opus」表述为**计划**
-  （`will be completed … later in the year`），未写成已发生的事实。这是一篇 2024 年的发布文章，
-  时间性表述处理正确。
+- **英文 A 第 10 段**（企业扩展与 Memory）：`MoU` 缩写未展开，与原文一致；
+  `Memory` 功能描述准确对应原文「跨对话记住偏好与指令」这一企业级特性。
+- **英文 A 第 14 段**（Claude Code 工具）：`Computational Tool Use` 与 `Computer Use` 区分正确；
+  保留了「标准版不启用」这一权限边界说明。
+- **英文 A 第 2 段**（价格与渠道）：`3.5 Sonnet` 面向所有用户，`3.5 Opus` 仅面向付费层级，
+  渠道（API、网页、iOS、Claude.ai）与定价（输入 $3/输出 $15）均与原文一致。
+- **英文 B 第 1 段**（3.5 Sonnet 定位）：`most intelligent model` 的引述准确；
+  对比对象（Opus 与 GPT-4o）及升级幅度（2 倍速度、5 倍成本效率）与原文一致。
 - **中文样例第 1 段**：中文输出，内容与原文一致。
 
-英文两页的 `roleInArticle` 均描述该段在全文中的作用（如第 3 段定位为「为开篇的智能主张提供基准证据」），
-不是对单段的复述。
+英文两页所有 30 段的 `roleInArticle` 均描述该段在全文中的作用（如第 3 段定位为「为开篇的智能主张提供基准证据」），
+不是对单段的复述；无段落被错误归类为「总结」或「过渡」。
 
 ## 6. 限制（必须保留）
 
