@@ -9,10 +9,9 @@
 // Instead it reads the SQLite file directly with a read-only connection and
 // reconstructs the ledger document from its stored revisions.
 //
-// The document value is stored as a base revision plus ordered deltas
-// (`["s", path, value]`, `["d", path]`, `["r", value]`). The applier below
-// understands exactly that set and *fails loudly* on anything else, rather than
-// printing a partial or wrong ledger.
+// The document value is stored as a base revision plus ordered deltas in
+// Chord's op format; the reconstruction calls Chord's own public `apply`, so no
+// op kind is re-implemented here and none is mis-read.
 //
 // Exit codes:
 //   0  the task exists and everything printed
@@ -22,6 +21,7 @@
 
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { apply } from "@earendil-works/chord/delta";
 
 class InspectConfigError extends Error {
 	constructor(message: string) {
@@ -79,67 +79,14 @@ This opens the file with a read-only SQLite connection only. It starts no task,
 runs no migration, calls no model, and never creates or modifies anything; a
 missing database, a non-Durable file, or an unknown task is reported as such.`;
 
-/** A minimal applier for the document revision delta format the store writes. */
-function applyDelta(value: unknown, ops: unknown, context: string): unknown {
-	if (!Array.isArray(ops)) throw new Error(`${context}: delta is not an array`);
-	let root = value;
-	for (const op of ops) {
-		if (!Array.isArray(op) || typeof op[0] !== "string") throw new Error(`${context}: unsupported delta op ${JSON.stringify(op).slice(0, 80)}`);
-		const [kind, path, payload] = op as [string, unknown, unknown];
-		if (kind === "r") {
-			root = payload;
-			continue;
-		}
-		if (!Array.isArray(path)) throw new Error(`${context}: ${kind} without a path`);
-		if (kind === "s") root = setAt(root, path, payload);
-		else if (kind === "d") root = deleteAt(root, path);
-		else throw new Error(`${context}: unsupported delta op kind ${JSON.stringify(kind)}`);
-	}
-	return root;
-}
-
-function containerFor(parent: unknown, key: string | number): unknown {
-	if (Array.isArray(parent)) return parent[Number(key)];
-	if (typeof parent === "object" && parent !== null) return (parent as Record<string, unknown>)[String(key)];
-	return undefined;
-}
-
-function setAt(root: unknown, path: readonly unknown[], value: unknown): unknown {
-	if (path.length === 0) return value;
-	let cursor: unknown = root;
-	for (let index = 0; index < path.length - 1; index++) {
-		const key = path[index] as string | number;
-		let next = containerFor(cursor, key);
-		if (next === undefined || next === null) {
-			// Create the missing container the next key needs.
-			next = typeof path[index + 1] === "number" ? [] : {};
-			if (Array.isArray(cursor)) cursor[Number(key)] = next;
-			else if (typeof cursor === "object" && cursor !== null) (cursor as Record<string, unknown>)[String(key)] = next;
-			else throw new Error(`cannot set into a non-container at ${JSON.stringify(path)}`);
-		}
-		cursor = next;
-	}
-	const last = path[path.length - 1] as string | number;
-	if (Array.isArray(cursor)) cursor[Number(last)] = value;
-	else if (typeof cursor === "object" && cursor !== null) (cursor as Record<string, unknown>)[String(last)] = value;
-	else throw new Error(`cannot set into a non-container at ${JSON.stringify(path)}`);
-	return root;
-}
-
-function deleteAt(root: unknown, path: readonly unknown[]): unknown {
-	if (path.length === 0) return root;
-	let cursor: unknown = root;
-	for (let index = 0; index < path.length - 1; index++) {
-		cursor = containerFor(cursor, path[index] as string | number);
-		if (cursor === undefined || cursor === null) return root;
-	}
-	const last = path[path.length - 1] as string | number;
-	if (Array.isArray(cursor)) cursor.splice(Number(last), 1);
-	else if (typeof cursor === "object" && cursor !== null) delete (cursor as Record<string, unknown>)[String(last)];
-	return root;
-}
-
-/** Reconstruct one document's current value from its stored revisions. */
+/**
+ * Reconstruct one document's current value from its stored revisions.
+ *
+ * The op format belongs to Chord, so the op application is Chord's own public
+ * `apply` (`@earendil-works/chord/delta`) — every legal op (`s`/`d`/`a`/`t`/`p`/`m`
+ * and the root replacement `r`) is handled by the code that defines it. A
+ * revision kind this store does not write is the only thing rejected.
+ */
 function reconstructValue(db: SqliteLike, documentId: number): unknown {
 	const revisions = db.prepare("SELECT seq, kind, content FROM document_revisions WHERE document_id = ? ORDER BY seq").all(documentId) as {
 		seq: number;
@@ -150,7 +97,7 @@ function reconstructValue(db: SqliteLike, documentId: number): unknown {
 	for (const revision of revisions) {
 		const content = JSON.parse(revision.content) as unknown;
 		if (revision.kind === "base") value = content;
-		else if (revision.kind === "delta") value = applyDelta(value, content, `document ${documentId} revision ${revision.seq}`);
+		else if (revision.kind === "delta") value = apply(value as never, content as never);
 		else throw new Error(`document ${documentId}: unsupported revision kind ${revision.kind}`);
 	}
 	return value;

@@ -31,6 +31,8 @@ export type RoundRecord = {
 	/** 1-based round number. Round 1 is the initial execution. */
 	readonly round: number;
 	readonly kind: "initial" | "revision";
+	/** The tool operation that owns this round: only it may execute or settle it. */
+	readonly opKey: string;
 	/** Stable dedup key of the round's submission in the child conversation. */
 	readonly requestId: string;
 	/** The task text sent to the child for this round. */
@@ -40,6 +42,8 @@ export type RoundRecord = {
 	/** Durable ids, filled once the round settled. */
 	readonly submissionId?: string;
 	readonly answerEntryId?: EntryId;
+	/** The settled answer's text, so a replay can return a receipt without re-running. */
+	answerText?: string;
 	/** Evidence references for this round only (never mixed with older rounds). */
 	readonly evidence: EvidenceReference[];
 	readonly startedAt: number;
@@ -108,6 +112,13 @@ export type OperationBinding = {
 	readonly decision?: "accept" | "reject";
 };
 
+/** A recorded cancellation intent, persisted before any abort so nothing new starts. */
+export type CancelRequest = {
+	readonly opKey: string;
+	readonly at: number;
+	readonly reason?: string;
+};
+
 /** One program-recorded state transition, with the operation that caused it. */
 export type StateEvent = {
 	readonly at: number;
@@ -142,6 +153,12 @@ export type TaskLedgerState = {
 	readonly events: StateEvent[];
 	/** Operation bindings: tool call → round/requestId/decision. Replay anchors. */
 	readonly operations: OperationBinding[];
+	/** The operation currently holding the execution right, if any. */
+	activeOpKey?: string;
+	/** The round that right is for. */
+	activeRound?: number;
+	/** Persistent cancellation intent: no new work may start until the cancel completes. */
+	cancelRequested?: CancelRequest;
 	readonly failure?: TaskFailure;
 	readonly createdAt: number;
 	readonly terminalAt?: number;
@@ -265,6 +282,91 @@ export function roundRequestId(taskId: string, round: number): string {
 	return `multiagent-round:${taskId}:${round}`;
 }
 
+/** Thrown when an operation tries to act without holding the round's execution right. */
+export class ExecutionRightError extends Error {
+	readonly taskId: string;
+	constructor(taskId: string, message: string) {
+		super(`task ${taskId}: ${message}`);
+		this.name = "ExecutionRightError";
+		this.taskId = taskId;
+	}
+}
+
+/** The ledger draft fields the claim helpers touch. */
+type ClaimDraft = {
+	readonly taskId: string;
+	activeOpKey?: string;
+	activeRound?: number;
+	currentRound: number;
+	rounds: RoundRecord[];
+	operations: OperationBinding[];
+	readonly cancelRequested?: CancelRequest;
+};
+
+/**
+ * Reserve one round for one operation, atomically with its binding and its round
+ * record: after this commit no other operation can claim the same round or start
+ * another one, and a replay of this operation finds its own reservation.
+ * The caller must already have checked the task's status and any cancel intent.
+ */
+export function claimRound(
+	doc: ClaimDraft,
+	claim: {
+		readonly opKey: string;
+		readonly kind: "delegate" | "revise";
+		readonly toolTaskId: string;
+		readonly callId: string;
+		readonly round: number;
+		readonly task: string;
+		readonly feedback?: string;
+		readonly requestId: string;
+		readonly at: number;
+	},
+): void {
+	if (doc.activeOpKey !== undefined) {
+		throw new ExecutionRightError(doc.taskId, `round ${doc.activeRound} is already executing under another operation`);
+	}
+	const taken = doc.rounds.some((round) => round.round === claim.round) || doc.operations.some((operation) => operation.round === claim.round && operation.kind !== "review" && operation.kind !== "cancel");
+	if (taken) throw new ExecutionRightError(doc.taskId, `round ${claim.round} is already claimed`);
+	doc.activeOpKey = claim.opKey;
+	doc.activeRound = claim.round;
+	// The claimed round is the task's current round from the moment it is
+	// reserved: a settled round and a running round are the same round.
+	doc.currentRound = claim.round;
+	doc.operations = [
+		...doc.operations,
+		{
+			opKey: claim.opKey,
+			kind: claim.kind,
+			toolTaskId: claim.toolTaskId,
+			callId: claim.callId,
+			round: claim.round,
+			createdAt: claim.at,
+		},
+	];
+	doc.rounds = [
+		...doc.rounds,
+		{
+			round: claim.round,
+			kind: claim.kind === "delegate" ? "initial" : "revision",
+			opKey: claim.opKey,
+			requestId: claim.requestId,
+			task: claim.task,
+			...(claim.feedback === undefined ? {} : { feedback: claim.feedback }),
+			evidence: [],
+			startedAt: claim.at,
+		},
+	];
+}
+
+/** Release the execution right, but only for the operation that holds it. */
+export function releaseRound(doc: ClaimDraft, opKey: string): boolean {
+	if (doc.activeOpKey !== opKey) return false;
+	doc.activeOpKey = undefined;
+	doc.activeRound = undefined;
+	return true;
+}
+
 /** Mutable shape of the ledger draft, for the transition helpers. */
 type LedgerDraft = {
 	readonly taskId: string;
@@ -273,6 +375,8 @@ type LedgerDraft = {
 	terminalAt?: number;
 	failure?: TaskFailure;
 	version: number;
+	activeOpKey?: string;
+	activeRound?: number;
 };
 
 /**
@@ -301,5 +405,10 @@ export function recordTransition(
 	];
 	doc.status = to;
 	doc.version += 1;
+	// A task that is no longer executing a round holds no execution right.
+	if (to !== "revising") {
+		doc.activeOpKey = undefined;
+		doc.activeRound = undefined;
+	}
 	if (isTerminal(to)) doc.terminalAt = at;
 }

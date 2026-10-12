@@ -175,7 +175,7 @@ describe("TASK-003 read-only inspection", () => {
 		expect(inspected.stdout).toMatch(/call=call|call=/);
 	}, 90_000);
 
-	it("refuses a database whose ledger document uses an unsupported delta op", async () => {
+	it("reconstructs a ledger from a real Chord delta and rejects an invalid op", async () => {
 		const require = createRequire(import.meta.url);
 		const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
 		const databasePath = join(directory, "weird.sqlite");
@@ -191,13 +191,38 @@ describe("TASK-003 read-only inspection", () => {
 				last.seq + 1,
 				"delta",
 				1,
-				JSON.stringify([["x", ["status"], "accepted"]]),
+				JSON.stringify([["s", ["version"], 99]]),
 			);
 		} finally {
 			db.close();
 		}
-		const inspected = await runInspect(databasePath, "task-smoke");
-		expect(inspected.code).toBe(1);
-		expect(inspected.stderr).toContain("unsupported delta op");
+		// A legal op appended by the same format Chord writes is applied, not
+		// rejected: the inspect reads `version` from the reconstructed value.
+		const legal = await runInspect(databasePath, "task-smoke");
+		expect(legal.code).toBe(0);
+		expect(legal.stdout).toContain("task: task-smoke");
+		expect(legal.stdout).toContain("version: 99");
+
+		// An op kind Chord does not define fails loudly instead of printing a
+		// wrong ledger.
+		const db2 = new DatabaseSync(databasePath);
+		try {
+			const doc = db2.prepare("SELECT id FROM documents WHERE kind LIKE ?").get("%multiagent.task-ledger%") as { id: number };
+			const last2 = db2.prepare("SELECT seq FROM document_revisions WHERE document_id = ? ORDER BY seq DESC LIMIT 1").get(doc.id) as {
+				seq: number;
+			};
+			db2.prepare("INSERT INTO document_revisions (document_id, seq, kind, version, content) VALUES (?, ?, ?, ?, ?)").run(
+				doc.id,
+				last2.seq + 1,
+				"delta",
+				1,
+				JSON.stringify([["zz", ["status"], "accepted"]]),
+			);
+		} finally {
+			db2.close();
+		}
+		const invalid = await runInspect(databasePath, "task-smoke");
+		expect(invalid.code).toBe(1);
+		expect(invalid.stderr.length).toBeGreaterThan(0);
 	}, 90_000);
 });

@@ -13,6 +13,13 @@
 // Boundary 4 — a local tool is mid-execution: on restart the interrupted tool
 //              task replays per its `replay: "safe"` policy and produces
 //              exactly one result.
+// Boundary 5 — the round's intent is committed and NO submission exists yet
+//              (the pre-submit barrier): the replay makes exactly one.
+// Boundary 6 — the round's outcome is committed but the parent tool result is
+//              not: the replay returns the persisted receipt and changes
+//              nothing (the ledger version must not move).
+// Boundary 7 — the delegation omitted `taskId`: the derived business id must
+//              survive the interruption unchanged.
 
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -57,11 +64,11 @@ function readRows(databasePath: string, sql: string, params: readonly string[] =
 	}
 }
 
-async function readLedgerTask(databasePath: string) {
+async function readLedgerTask(databasePath: string, taskId = "task-smoke") {
 	const runtime: ProbeRuntime = await openProbe({ databasePath, provider: "faux" });
 	try {
 		const root = await runtime.harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
-		return runtime.harness.snapshot(TaskLedgerDoc, root.id, "task-smoke", context);
+		return runtime.harness.snapshot(TaskLedgerDoc, root.id, taskId, context);
 	} finally {
 		await runtime.close();
 	}
@@ -198,4 +205,81 @@ describe("TASK-003 cross-process recovery", () => {
 		).toBe(1);
 		expect(readRows(databasePath, "SELECT id FROM tasks WHERE kind LIKE ? AND status = ?", ["%pi.tool%", "running"]).length).toBe(0);
 	}, 120_000);
+	it("makes exactly one submission after a kill at the pre-submit barrier (boundary 5)", async () => {
+		const databasePath = join(directory, "recover-5.sqlite");
+
+		const killed = await runRunner(["--db", databasePath, "--request-id", "run-5a", "--input", "DELEGATE", "--kill-when", "pre-submit"]);
+		expect(killed.code).not.toBe(0);
+
+		// The intent is committed and the submission does not exist yet.
+		const mid = await readLedgerTask(databasePath);
+		expect(mid?.rounds).toHaveLength(1);
+		expect(mid?.rounds[0]?.settledAt).toBeUndefined();
+		expect(mid?.status).toBe("running");
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:1"%'])).toHaveLength(0);
+
+		const resumed = await runRunner(["--db", databasePath, "--request-id", "run-5b", "--input", "RESUME"]);
+		expect(resumed.code).toBe(0);
+		const after = await readLedgerTask(databasePath);
+		expect(after?.status).toBe("awaiting_review");
+		expect(after?.rounds).toHaveLength(1);
+		expect(after?.rounds[0]?.settledAt).toBeDefined();
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:1"%'])).toHaveLength(1);
+	}, 90_000);
+
+	it("returns the persisted receipt after a kill post-outcome, changing nothing (boundary 6)", async () => {
+		const databasePath = join(directory, "recover-6.sqlite");
+
+		const killed = await runRunner(["--db", databasePath, "--request-id", "run-6a", "--input", "DELEGATE", "--kill-when", "after-outcome"]);
+		expect(killed.code).not.toBe(0);
+
+		// The round is settled; the parent tool result never landed.
+		const before = await readLedgerTask(databasePath);
+		expect(before?.status).toBe("awaiting_review");
+		expect(before?.rounds[0]?.settledAt).toBeDefined();
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:1"%'])).toHaveLength(1);
+		const versionBefore = before?.version;
+		const eventsBefore = JSON.stringify(before?.events);
+
+		// The replay must return the receipt without re-submitting or re-transitioning.
+		const resumed = await runRunner(["--db", databasePath, "--request-id", "run-6b", "--input", "RESUME"]);
+		expect(resumed.code).toBe(0);
+		const after = await readLedgerTask(databasePath);
+		expect(after?.status).toBe("awaiting_review");
+		expect(after?.rounds).toHaveLength(1);
+		expect(after?.version).toBe(versionBefore);
+		expect(JSON.stringify(after?.events)).toBe(eventsBefore);
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:1"%'])).toHaveLength(1);
+
+		// The task is still usable: the review closes it.
+		const reviewed = await runRunner(["--db", databasePath, "--request-id", "run-6c", "--input", "REVIEW"]);
+		expect(reviewed.code).toBe(0);
+		const accepted = await readLedgerTask(databasePath);
+		expect(accepted?.status).toBe("accepted");
+		expect(accepted?.rounds).toHaveLength(1);
+	}, 90_000);
+
+	it("keeps the derived business id stable when taskId was omitted (boundary 7)", async () => {
+		const databasePath = join(directory, "recover-7.sqlite");
+
+		const killed = await runRunner(["--db", databasePath, "--request-id", "run-7a", "--input", "DELEGATE", "--kill-when", "child-conversation", "--no-task-id"]);
+		expect(killed.code).not.toBe(0);
+
+		const docs = readRows(databasePath, "SELECT key_value FROM documents WHERE kind LIKE ?", ["%multiagent.task-ledger%"]);
+		expect(docs).toHaveLength(1);
+		const derivedId = JSON.parse(String(docs[0]?.key_value)) as string;
+		expect(derivedId).toMatch(/^task-\d+$/);
+		expect(readRows(databasePath, "SELECT id FROM conversations WHERE owner_conversation_id IS NOT NULL")).toHaveLength(1);
+
+		const resumed = await runRunner(["--db", databasePath, "--request-id", "run-7b", "--input", "RESUME", "--no-task-id"]);
+		expect(resumed.code).toBe(0);
+		// Same document, same child, exactly one submission for the derived id.
+		expect(readRows(databasePath, "SELECT key_value FROM documents WHERE kind LIKE ?", ["%multiagent.task-ledger%"])).toHaveLength(1);
+		expect(readRows(databasePath, "SELECT id FROM conversations WHERE owner_conversation_id IS NOT NULL")).toHaveLength(1);
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", [`%"multiagent-round:${derivedId}:1"%`])).toHaveLength(1);
+		const after = await readLedgerTask(databasePath, derivedId);
+		expect(after?.status).toBe("awaiting_review");
+		expect(after?.rounds).toHaveLength(1);
+		expect(after?.taskId).toBe(derivedId);
+	}, 90_000);
 });

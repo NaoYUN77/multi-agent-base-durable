@@ -19,7 +19,7 @@
 		"typecheck": "tsc --noEmit",
 		"multiagent:probe": "node --conditions=source --experimental-strip-types src/multiagent/cli-multiagent.ts",
 		"multiagent:inspect": "node --conditions=source --experimental-strip-types src/multiagent/cli-multiagent-inspect.ts",
-		"multiagent:test": "vitest --run test/multiagent.test.ts test/multiagent-cancel.test.ts test/multiagent-revision.test.ts test/multiagent-evidence.test.ts test/multiagent-compaction.test.ts test/multiagent-recovery.test.ts test/multiagent-inspect.test.ts test/multiagent-prompts.test.ts"
+		"multiagent:test": "vitest --run test/multiagent.test.ts test/multiagent-concurrency.test.ts test/multiagent-cancel.test.ts test/multiagent-revision.test.ts test/multiagent-evidence.test.ts test/multiagent-compaction.test.ts test/multiagent-recovery.test.ts test/multiagent-inspect.test.ts test/multiagent-prompts.test.ts"
 	},
 	"devDependencies": {
 		"@notionhq/client": "5.27.0",

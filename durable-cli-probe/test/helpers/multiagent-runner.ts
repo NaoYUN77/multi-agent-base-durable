@@ -28,7 +28,15 @@
 //                       flight)
 //   tool-pause          while the local tool is executing: the child asks for a
 //                       pause and the process kills itself inside it
+//   pre-submit          at the round's verification barrier: the intent is
+//                       committed and NO submission exists yet
+//   after-outcome       at the barrier after the round's outcome is committed
+//                       and before the parent tool result exists
+//
+// `--no-task-id` makes the delegation omit `taskId`, so the derived business id
+// (from the tool task) is what recovery has to keep stable.
 
+import { createRequire } from "node:module";
 import type { Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { context, openProbe, openRoot } from "../../src/runtime.ts";
@@ -52,6 +60,9 @@ const databasePath = parseArg("db");
 const requestId = parseArg("request-id");
 const input = parseArg("input") ?? "DELEGATE";
 const killWhen = parseArg("kill-when");
+const omitTaskId = process.argv.includes("--no-task-id");
+/** The verification barriers must fire once, not on every round. */
+let barrierFired = false;
 if (databasePath === undefined || requestId === undefined) {
 	console.error("usage: runner --db <path> --request-id <id> [--input DELEGATE|REVIEW|REVISE|RESUME] [--kill-when condition]");
 	process.exit(2);
@@ -117,10 +128,19 @@ const router: FauxResponseFactory = (request) => {
 		);
 	}
 	if (textOf().includes("REVIEW")) {
-		return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-smoke", decision: "accept" }, { id: "runner-accept" })], { stopReason: "toolUse" });
+		return fauxAssistantMessage(
+			[fauxToolCall("task_review", { taskId: "task-smoke", decision: "accept", round: 1 }, { id: "runner-accept" })],
+			{ stopReason: "toolUse" },
+		);
 	}
 	return fauxAssistantMessage(
-		[fauxToolCall("task_delegate", { taskId: "task-smoke", task: `count ${MAT}`, childTools: ["text_stats"] }, { id: "runner-delegate" })],
+		[
+			fauxToolCall(
+				"task_delegate",
+				omitTaskId ? { task: `count ${MAT}`, childTools: ["text_stats"] } : { taskId: "task-smoke", task: `count ${MAT}`, childTools: ["text_stats"] },
+				{ id: "runner-delegate" },
+			),
+		],
 		{ stopReason: "toolUse" },
 	);
 };
@@ -133,6 +153,19 @@ const runtime = await openProbe({
 		createMultiagentExtension({
 			model: { provider: "faux", modelId: "faux-1" },
 			childInstructions: "You are the child agent of the recovery check.",
+			// The verification barriers: kill exactly at the named window, once.
+			beforeSubmit: () => {
+				if (killWhen === "pre-submit" && !barrierFired) {
+					barrierFired = true;
+					killNow();
+				}
+			},
+			afterOutcome: () => {
+				if (killWhen === "after-outcome" && !barrierFired) {
+					barrierFired = true;
+					killNow();
+				}
+			},
 		}),
 	],
 	registryExtensions: [ChildTools],
@@ -141,10 +174,28 @@ const runtime = await openProbe({
 const root = await openRoot(runtime);
 runtime.harness.resume();
 
+/**
+ * The business task id. With `--no-task-id` the tool derives it from the tool
+ * task, so the runner reads it back from the ledger document itself.
+ */
+function resolveTaskId(): string {
+	if (!omitTaskId) return "task-smoke";
+	const require = createRequire(import.meta.url);
+	const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+	const db = new DatabaseSync(databasePath!, { readOnly: true });
+	try {
+		const rows = db.prepare("SELECT key_value FROM documents WHERE kind LIKE ?").all("%multiagent.task-ledger%") as { key_value: string }[];
+		if (rows.length !== 1) throw new Error(`expected exactly one ledger document, found ${rows.length}`);
+		return JSON.parse(rows[0]!.key_value) as string;
+	} finally {
+		db.close();
+	}
+}
+
 // RESUME: submit nothing; let the Harness continue whatever was interrupted.
 if (input === "RESUME") {
 	await runtime.harness.waitForIdle(context);
-	const ledger = await runtime.harness.snapshot(TaskLedgerDoc, root.id, "task-smoke", context);
+	const ledger = await runtime.harness.snapshot(TaskLedgerDoc, root.id, resolveTaskId(), context);
 	console.log(
 		JSON.stringify({
 			ok: true,
@@ -167,11 +218,12 @@ if (settled.status !== "done") {
 	await runtime.close();
 	process.exit(1);
 }
-const ledger = await runtime.harness.snapshot(TaskLedgerDoc, root.id, "task-smoke", context);
+const ledger = await runtime.harness.snapshot(TaskLedgerDoc, root.id, resolveTaskId(), context);
 console.log(
 	JSON.stringify({
 		ok: true,
 		input,
+		taskId: resolveTaskId(),
 		status: ledger?.status ?? null,
 		rounds: ledger?.rounds.length ?? 0,
 		childConversationId: ledger?.childConversationId ?? null,

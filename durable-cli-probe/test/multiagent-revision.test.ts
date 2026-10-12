@@ -71,7 +71,9 @@ const router: FauxResponseFactory = (request) => {
 		const toolName = (last as { toolName?: string }).toolName;
 		// Rejection loop: reject, revise, reject, revise, reject → failed.
 		if (toolName === "task_delegate" || (toolName === "task_revise" && resultText.includes("settled"))) {
-			return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-gamma", decision: "reject", reason: "not enough" }, { id: `call-reject-${requests.length}` })], { stopReason: "toolUse" });
+			// `round` is required: take it from the delegation report itself.
+			const round = Number(/round (\d+) settled/.exec(resultText)?.[1] ?? "1");
+			return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-gamma", decision: "reject", reason: "not enough", round }, { id: `call-reject-${requests.length}` })], { stopReason: "toolUse" });
 		}
 		if (toolName === "task_review" && resultText.includes("rejected")) {
 			return fauxAssistantMessage([fauxToolCall("task_revise", { taskId: "task-gamma", task: `redo ${TASK}`, feedback: "redo it" }, { id: `call-revise-${requests.length}` })], { stopReason: "toolUse" });

@@ -30,6 +30,7 @@ import {
 	type Extension,
 	type ModelRef,
 	type ToolExecutionApi,
+	type ToolRegistration,
 	type ToolExecutionResult,
 } from "@earendil-works/pi-durable";
 import { CHILD_TOOL_NAMES, ChildTools, textCheckTool, textStatsTool } from "./child-tools.ts";
@@ -37,12 +38,16 @@ import { resolveChildTools, runDelegationRound, type DelegationHost } from "./de
 import { entryText } from "./evidence.ts";
 import {
 	canRevise,
+	claimRound,
+	ExecutionRightError,
 	isTerminal,
 	MAX_REVISIONS,
 	operationKey,
 	recordTransition,
+	releaseRound,
 	reviewOutcome,
 	RevisionLimitError,
+	roundRequestId,
 	TaskLedgerDoc,
 	type EvidenceReference,
 	type OperationBinding,
@@ -55,6 +60,13 @@ export interface MultiagentExtensionOptions {
 	readonly model: ModelRef;
 	/** Instructions installed verbatim in every child conversation. */
 	readonly childInstructions: string;
+	/**
+	 * Verification barrier awaited after a round's intent is committed and before
+	 * its submission exists; the recovery tests kill the process there.
+	 */
+	readonly beforeSubmit?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
+	/** Verification barrier awaited after a round's outcome is committed. */
+	readonly afterOutcome?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
 }
 
 /** The full structured evidence record as the main model must see it. */
@@ -87,12 +99,13 @@ function roundReport(taskId: string, round: number, outcome: {
 	answerEntryId: EntryId | undefined;
 	extraction: { evidence: readonly EvidenceReference[] } | undefined;
 	error?: string;
+	receipt?: boolean;
 }): string {
 	if (!outcome.extraction) {
 		return JSON.stringify({ taskId, round, ok: false, error: outcome.error ?? "round failed" });
 	}
 	return [
-		`task ${taskId} round ${round} settled`,
+		`task ${taskId} round ${round} settled${outcome.receipt === true ? " (replayed receipt)" : ""}`,
 		`childConversationId: ${outcome.childConversationId ?? "unknown"}`,
 		`submissionId: ${outcome.submissionId ?? "unknown"}`,
 		`answerEntryId: ${outcome.answerEntryId ?? "unknown"}`,
@@ -118,12 +131,16 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 		mainExtension: Extension;
 		childExtension: Extension;
 		childInstructions: string;
-		childToolObjects: readonly { readonly name: string }[];
+		childToolObjects: readonly ToolRegistration[];
+		beforeSubmit?: MultiagentExtensionOptions["beforeSubmit"];
+		afterOutcome?: MultiagentExtensionOptions["afterOutcome"];
 	} = {
 		mainExtension: undefined as unknown as Extension,
 		childExtension: ChildTools,
 		childInstructions: options.childInstructions,
 		childToolObjects: [textStatsTool, textCheckTool],
+		...(options.beforeSubmit === undefined ? {} : { beforeSubmit: options.beforeSubmit }),
+		...(options.afterOutcome === undefined ? {} : { afterOutcome: options.afterOutcome }),
 	};
 
 	const taskDelegateTool = defineTool({
@@ -154,36 +171,64 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 				return { output: [{ type: "text", text: "taskId must not be empty." }], isError: true };
 			}
 			const opKey = operationKey("delegate", String(api.taskId), api.callId);
-			const resolved = await api.commit(async (tx) => {
+			const requestId = roundRequestId(taskId, 1);
+			// Validate the whitelist before claiming anything.
+			let granted: readonly ToolRegistration[];
+			try {
+				granted = resolveChildTools(args.childTools ?? [...CHILD_TOOL_NAMES]);
+			} catch (error) {
+				return { output: [{ type: "text", text: `delegate refused: ${(error as Error).message}` }], isError: true };
+			}
+			// One commit reserves the round: binding + round record + the
+			// execution-right slot, so two parallel delegations cannot both start.
+			const reserved = await api.commit(async (tx) => {
 				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, taskId, { taskId, model: options.model });
 				const bound = doc.operations.find((operation) => operation.opKey === opKey);
-				if (bound !== undefined) return { round: bound.round, replay: true as const, error: undefined };
-				// A new call: the task must not already have a life of its own.
-				if (isTerminal(doc.status)) return { round: 0, error: `task ${taskId} is ${doc.status}; it accepts nothing further.` };
-				if (doc.rounds.length > 0) return { round: 0, error: `task ${taskId} was already delegated; use task_revise or task_review.` };
-				doc.operations = [
-					...doc.operations,
-					{
+				if (bound !== undefined) {
+					// A rerun of this very call: resume its round (or return its
+					// receipt later, which `runDelegationRound` does by itself).
+					return { round: bound.round, childTools: granted.map((tool) => tool.name), error: undefined };
+				}
+				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${taskId} is being cancelled.` };
+				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${taskId} is ${doc.status}; it accepts nothing further.` };
+				if (doc.rounds.length > 0) return { round: 0, childTools: [], error: `task ${taskId} was already delegated; use task_revise or task_review.` };
+				if (doc.activeOpKey !== undefined) {
+					return { round: 0, childTools: [], error: `task ${taskId} round ${doc.activeRound} is already executing under another operation.` };
+				}
+				try {
+					claimRound(doc, {
 						opKey,
 						kind: "delegate",
 						toolTaskId: String(api.taskId),
 						callId: api.callId,
 						round: 1,
-						createdAt: Date.now(),
-					},
-				];
-				return { round: 1, replay: false as const, error: undefined };
+						task: args.task,
+						requestId,
+						at: Date.now(),
+					});
+				} catch (error) {
+					if (error instanceof ExecutionRightError) return { round: 0, childTools: [], error: error.message };
+					throw error;
+				}
+				return { round: 1, childTools: granted.map((tool) => tool.name), error: undefined };
 			}, callContext);
-			if (resolved.error !== undefined) return { output: [{ type: "text", text: resolved.error }], isError: true };
+			if (reserved.error !== undefined) return { output: [{ type: "text", text: reserved.error }], isError: true };
 
-			const childTools = resolveChildTools(args.childTools ?? [...CHILD_TOOL_NAMES]);
 			const outcome = await runDelegationRound(
 				api,
 				callContext,
-				{ ...host, childToolObjects: childTools },
-				{ taskId, round: resolved.round, kind: "initial", task: args.task, model: options.model, opKey },
+				host,
+				{
+					taskId,
+					round: reserved.round,
+					kind: "initial",
+					task: args.task,
+					model: options.model,
+					opKey,
+					childToolObjects: resolveChildTools(reserved.childTools.length === 0 ? [...CHILD_TOOL_NAMES] : reserved.childTools),
+				},
 			);
-			return { output: [{ type: "text", text: roundReport(taskId, resolved.round, outcome) }], isError: outcome.ok === false };
+			return { output: [{ type: "text", text: roundReport(taskId, reserved.round, outcome) }], isError: outcome.ok === false };
 		},
 	});
 
@@ -201,58 +246,86 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 		executionMode: "parallel",
 		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
 			const opKey = operationKey("revise", String(api.taskId), api.callId);
-			const resolved = await api.commit(async (tx) => {
+			// One commit: check the lifecycle, take the execution right and record
+			// the round. A second parallel revision is refused here, not later.
+			const reserved = await api.commit(async (tx) => {
 				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, args.taskId, { taskId: args.taskId, model: options.model });
-				// Replay of the same call resumes the round it already created.
 				const bound = doc.operations.find((operation) => operation.opKey === opKey);
-				if (bound !== undefined) return { round: bound.round, childTools: [...doc.childTools], error: undefined };
+				if (bound !== undefined) {
+					return { round: bound.round, childTools: [...doc.childTools], error: undefined };
+				}
+				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${args.taskId} is being cancelled.` };
 				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}; it accepts nothing further.` };
 				if (doc.status !== "awaiting_review" && doc.status !== "revising") {
 					return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}, not revisable.` };
 				}
 				if (doc.childConversationId === undefined) return { round: 0, childTools: [], error: `task ${args.taskId} has no sub-agent conversation yet.` };
+				if (doc.activeOpKey !== undefined) {
+					return {
+						round: 0,
+						childTools: [],
+						error: `task ${args.taskId} round ${doc.activeRound} is already executing under another operation; review or wait for it first.`,
+					};
+				}
 				if (!canRevise(doc.currentRound)) return { round: 0, childTools: [], error: `task ${args.taskId} already used its ${MAX_REVISIONS} revisions.` };
 				const round = doc.currentRound + 1;
-				doc.operations = [
-					...doc.operations,
-					{ opKey, kind: "revise", toolTaskId: String(api.taskId), callId: api.callId, round, createdAt: Date.now() },
-				];
+				try {
+					claimRound(doc, {
+						opKey,
+						kind: "revise",
+						toolTaskId: String(api.taskId),
+						callId: api.callId,
+						round,
+						task: args.task,
+						feedback: args.feedback,
+						requestId: roundRequestId(args.taskId, round),
+						at: Date.now(),
+					});
+					// A revision's intent lands the task in `revising` — from
+					// `awaiting_review` when the main model revises directly, or already
+					// there right after a recorded rejection.
+					if (doc.status !== "revising") recordTransition(doc, "revising", Date.now(), { opKey, round });
+				} catch (error) {
+					if (error instanceof ExecutionRightError) return { round: 0, childTools: [], error: error.message };
+					throw error;
+				}
 				return { round, childTools: [...doc.childTools], error: undefined };
 			}, callContext);
-			if (resolved.error !== undefined) return { output: [{ type: "text", text: resolved.error }], isError: true };
+			if (reserved.error !== undefined) return { output: [{ type: "text", text: reserved.error }], isError: true };
 
 			// Revisions keep the tools granted at delegation time: the whitelist is
 			// part of the task's authorization, not the model's per-round choice.
-			const childTools = resolveChildTools(resolved.childTools.length === 0 ? [...CHILD_TOOL_NAMES] : resolved.childTools);
+			const childTools = resolveChildTools(reserved.childTools.length === 0 ? [...CHILD_TOOL_NAMES] : reserved.childTools);
 			const outcome = await runDelegationRound(
 				api,
 				callContext,
-				{ ...host, childToolObjects: childTools },
+				host,
 				{
 					taskId: args.taskId,
-					round: resolved.round,
+					round: reserved.round,
 					kind: "revision",
 					task: args.task,
 					feedback: args.feedback,
 					model: options.model,
 					opKey,
+					childToolObjects: childTools,
 				},
 			);
-			return { output: [{ type: "text", text: roundReport(args.taskId, resolved.round, outcome) }], isError: outcome.ok === false };
+			return { output: [{ type: "text", text: roundReport(args.taskId, reserved.round, outcome) }], isError: outcome.ok === false };
 		},
 	});
 
 	const taskReviewTool = defineTool({
 		name: "task_review",
 		description:
-			"Accept or reject a specific round of a delegated task. Rejecting persists your feedback round and lets you call " +
-			"task_revise; accepting closes the task. Pass round to bind the decision explicitly; a decision for an older round " +
-			"is refused. Repeating the same decision for the same round changes nothing.",
+			"Accept or reject a specific round of a delegated task. `round` is required: a decision for an older round is refused. " +
+			"Rejecting persists your feedback round and lets you call task_revise; accepting closes the task. " +
+			"Repeating the same decision for the same round changes nothing. A round that is still executing cannot be reviewed.",
 		parameters: Type.Object({
 			taskId: Type.String(),
 			decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
+			round: Type.Number({ description: "The round this decision is about (from the delegation report). Required." }),
 			reason: Type.Optional(Type.String({ description: "Why, for a reject." })),
-			round: Type.Optional(Type.Number({ description: "The round this decision is about; defaults to the current round." })),
 		}),
 		replay: "safe",
 		executionMode: "parallel",
@@ -265,18 +338,17 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 				if (bound !== undefined) {
 					return { text: `task ${args.taskId} round ${bound.round} already ${bound.decision}ed (${doc.status}).`, refused: false };
 				}
-				if (isTerminal(doc.status)) {
-					return { text: `task ${args.taskId} is ${doc.status}; it accepts nothing further.`, refused: true };
+				if (doc.cancelRequested !== undefined) return { text: `task ${args.taskId} is being cancelled; it accepts no review.`, refused: true };
+				if (isTerminal(doc.status)) return { text: `task ${args.taskId} is ${doc.status}; it accepts nothing further.`, refused: true };
+				if (doc.activeOpKey !== undefined) {
+					return { text: `task ${args.taskId} round ${doc.activeRound} is still executing; review it once it settles.`, refused: true };
 				}
-				if (doc.status !== "awaiting_review") {
-					return { text: `task ${args.taskId} is ${doc.status}, not awaiting_review.`, refused: true };
-				}
-				const targetRound = args.round ?? doc.currentRound;
+				if (doc.status !== "awaiting_review") return { text: `task ${args.taskId} is ${doc.status}, not awaiting_review.`, refused: true };
 				// Stale decisions: a decision aimed at an older round must not land
 				// on the newer one that arrived meanwhile.
-				if (targetRound !== doc.currentRound) {
+				if (args.round !== doc.currentRound) {
 					return {
-						text: `stale review: task ${args.taskId} is at round ${doc.currentRound}, not ${targetRound}; re-read with task_status.`,
+						text: `stale review: task ${args.taskId} is at round ${doc.currentRound}, not ${args.round}; re-read with task_status.`,
 						refused: true,
 					};
 				}
@@ -289,12 +361,12 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 						// The rejection itself is still recorded as a review event.
 						doc.operations = [
 							...doc.operations,
-							{ opKey, kind: "review", toolTaskId: String(api.taskId), callId: api.callId, round: targetRound, createdAt: Date.now(), decision: "reject" },
+							{ opKey, kind: "review", toolTaskId: String(api.taskId), callId: api.callId, round: args.round, createdAt: Date.now(), decision: "reject" },
 						];
 						doc.reviews = [
 							...doc.reviews,
 							{
-								round: targetRound,
+								round: args.round,
 								decision: "reject",
 								...(args.reason === undefined ? {} : { reason: args.reason }),
 								at: Date.now(),
@@ -303,7 +375,7 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 								opKey,
 							},
 						];
-						recordTransition(doc, "failed", Date.now(), { opKey, round: targetRound, reason: "revision_limit" });
+						recordTransition(doc, "failed", Date.now(), { opKey, round: args.round, reason: "revision_limit" });
 						doc.failure = { reason: "revision_limit", detail: error.message, at: Date.now() };
 						return { text: `task ${args.taskId} failed: revision limit reached.`, refused: false };
 					}
@@ -313,12 +385,12 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 				// between the checks above and these writes.
 				doc.operations = [
 					...doc.operations,
-					{ opKey, kind: "review", toolTaskId: String(api.taskId), callId: api.callId, round: targetRound, createdAt: Date.now(), decision: args.decision },
+					{ opKey, kind: "review", toolTaskId: String(api.taskId), callId: api.callId, round: args.round, createdAt: Date.now(), decision: args.decision },
 				];
 				doc.reviews = [
 					...doc.reviews,
 					{
-						round: targetRound,
+						round: args.round,
 						decision: args.decision,
 						...(args.reason === undefined ? {} : { reason: args.reason }),
 						at: Date.now(),
@@ -327,8 +399,8 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 						opKey,
 					},
 				];
-				recordTransition(doc, next, Date.now(), { opKey, round: targetRound });
-				return { text: `task ${args.taskId} round ${targetRound} ${args.decision}ed -> ${next}.`, refused: false };
+				recordTransition(doc, next, Date.now(), { opKey, round: args.round });
+				return { text: `task ${args.taskId} round ${args.round} ${args.decision}ed -> ${next}.`, refused: false };
 			}, callContext);
 			return { output: [{ type: "text", text: result.text }], isError: result.refused === true };
 		},
@@ -337,8 +409,9 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 	const taskCancelTool = defineTool({
 		name: "task_cancel",
 		description:
-			"Cancel a delegated task: aborts the sub-agent's work, confirms nothing of it is still running, and closes the task " +
-			"as cancelled. History and evidence stay readable. A terminal task refuses the cancel.",
+			"Cancel a delegated task: records a cancellation intent that blocks new work, aborts the sub-agent's work, confirms " +
+			"nothing of it is still running, and closes the task as cancelled. History and evidence stay readable. " +
+			"A terminal task refuses the cancel; a cancel that cannot confirm an idle child reports that instead of closing.",
 		parameters: Type.Object({
 			taskId: Type.String(),
 			reason: Type.Optional(Type.String({ description: "Why the task is cancelled." })),
@@ -347,16 +420,26 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 		executionMode: "parallel",
 		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
 			const opKey = operationKey("cancel", String(api.taskId), api.callId);
+			// Phase A: persist the cancellation intent (and this operation) before
+			// touching anything. From here no new round may start, no submission may
+			// be made, and an interrupted round is not turned into a failure.
 			const prepared = await api.commit(async (tx) => {
 				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, args.taskId, { taskId: args.taskId, model: options.model });
 				const bound = doc.operations.find((operation) => operation.opKey === opKey);
-				if (bound !== undefined) return { status: doc.status, childConversationId: doc.childConversationId, replay: true as const, error: undefined };
-				if (isTerminal(doc.status)) return { status: doc.status, childConversationId: doc.childConversationId, error: `task ${args.taskId} is ${doc.status}; it cannot be cancelled.` };
+				if (bound !== undefined) {
+					return { childConversationId: doc.childConversationId, status: doc.status, error: undefined };
+				}
+				if (isTerminal(doc.status)) {
+					return { childConversationId: doc.childConversationId, status: doc.status, error: `task ${args.taskId} is ${doc.status}; it cannot be cancelled.` };
+				}
+				if (doc.cancelRequested === undefined) {
+					doc.cancelRequested = { opKey, at: Date.now(), ...(args.reason === undefined ? {} : { reason: args.reason }) };
+				}
 				doc.operations = [
 					...doc.operations,
 					{ opKey, kind: "cancel", toolTaskId: String(api.taskId), callId: api.callId, round: doc.currentRound, createdAt: Date.now() },
 				];
-				return { status: doc.status, childConversationId: doc.childConversationId, replay: false as const, error: undefined };
+				return { childConversationId: doc.childConversationId, status: doc.status, error: undefined };
 			}, callContext);
 			if (prepared.error !== undefined) return { output: [{ type: "text", text: prepared.error }], isError: true };
 
@@ -372,7 +455,13 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 
 			const finished = await api.commit(async (tx) => {
 				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, args.taskId, { taskId: args.taskId, model: options.model });
-				if (isTerminal(doc.status)) return { text: `task ${args.taskId} is ${doc.status} (cancel had nothing left to close).`, ok: true as const };
+				if (isTerminal(doc.status)) {
+					// Honest reporting: a task that ended as something else was not
+					// cancelled by this call, and that is not a success.
+					if (doc.status === "cancelled") return { text: `task ${args.taskId} is already cancelled.`, ok: true as const };
+					return { text: `cancel did not apply: task ${args.taskId} already ended as ${doc.status}.`, ok: false as const };
+				}
+				if (doc.cancelRequested === undefined) return { text: `cancel intent for task ${args.taskId} is missing.`, ok: false as const };
 				// No hidden child work: every task of the child conversation must be
 				// terminal before the task itself becomes terminal.
 				if (childConversationId !== undefined) {
@@ -387,11 +476,11 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 						cursor = page.next;
 					}
 					if (live.length > 0) {
-						return { text: `cancel incomplete: child work still live (${live.join(", ")}).`, ok: false as const };
+						return { text: `cancel incomplete: child work still live (${live.join(", ")}); the intent is kept.`, ok: false as const };
 					}
 				}
-				const reason = args.reason ?? "cancelled_by_main";
-				recordTransition(doc, "cancelled", Date.now(), { opKey, round: doc.currentRound, reason });
+				const reason = doc.cancelRequested.reason ?? "cancelled_by_main";
+				recordTransition(doc, "cancelled", Date.now(), { opKey: doc.cancelRequested.opKey, round: doc.currentRound, reason });
 				doc.failure = { reason: "cancelled", detail: reason, at: Date.now() };
 				return { text: `task ${args.taskId} cancelled (${reason}).`, ok: true as const };
 			}, callContext);
@@ -415,9 +504,7 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 					return conversations.map((conversation) => conversation.id);
 				}, callContext);
 				return {
-					output: [
-						{ type: "text", text: `child conversations: ${listing.length === 0 ? "(none)" : listing.join(", ")}` },
-					],
+					output: [{ type: "text", text: `child conversations: ${listing.length === 0 ? "(none)" : listing.join(", ")}` }],
 				};
 			}
 			const summary = await api.commit(async (tx) => {
@@ -432,16 +519,21 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 						status: doc.status,
 						version: doc.version,
 						currentRound: doc.currentRound,
+						activeOpKey: doc.activeOpKey ?? null,
+						activeRound: doc.activeRound ?? null,
+						cancelRequested: doc.cancelRequested ?? null,
 						childConversationId: doc.childConversationId ?? null,
 						childTools: [...doc.childTools],
 						createdAt: doc.createdAt,
 						rounds: doc.rounds.map((round) => ({
 							round: round.round,
 							kind: round.kind,
+							opKey: round.opKey,
 							requestId: round.requestId,
 							submissionId: round.submissionId ?? null,
 							answerEntryId: round.answerEntryId ?? null,
 							evidence: round.evidence.length,
+							settled: round.settledAt !== undefined,
 						})),
 						reviews: [...doc.reviews],
 						events: [...doc.events],
