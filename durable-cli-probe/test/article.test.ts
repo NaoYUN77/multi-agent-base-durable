@@ -318,12 +318,16 @@ describe("article spec loading", () => {
 		expect(articleSpecPath().replace(/\\/g, "/")).toMatch(/\/prompts\/article-analysis\.md$/);
 	});
 
-	it("puts the spec and the numbered paragraphs into the prompt", () => {
-		const prompt = buildAnalysisPrompt("SPEC-BODY", SAMPLE);
+	it("puts the spec, the numbered paragraphs, and the tool name into the prompt", () => {
+		const prompt = buildAnalysisPrompt("SPEC-BODY", SAMPLE, "notion_write_article");
 		expect(prompt).toContain("SPEC-BODY");
 		expect(prompt).toContain('"paragraphId": 1');
 		expect(prompt).toContain("第一段。");
 		expect(prompt).toContain("段落数：3");
+		// The reply must arrive as a tool call; saying so in the prompt is what
+		// makes a real model do it rather than printing JSON as text.
+		expect(prompt).toContain("notion_write_article");
+		expect(prompt).toContain("不要把 JSON 作为文本输出");
 	});
 });
 

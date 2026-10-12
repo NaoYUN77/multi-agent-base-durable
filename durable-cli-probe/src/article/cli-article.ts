@@ -163,7 +163,7 @@ async function main(): Promise<void> {
 		throw error;
 	}
 
-	const prompt = buildAnalysisPrompt(spec, article);
+	const prompt = buildAnalysisPrompt(spec, article, NOTION_WRITE_TOOL_NAME);
 
 	console.log(`[article] provider=${args.provider} input=${args.inputPath}`);
 	console.log(`[article] title=${JSON.stringify(article.title)} source=${JSON.stringify(article.source)}`);

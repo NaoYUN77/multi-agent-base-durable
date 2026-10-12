@@ -63,8 +63,11 @@ export function loadArticleSpec(root?: string): string {
  * what the model was told. The article follows as JSON: paragraphs are sent as an
  * array, and the model is told the array index + 1 is the `paragraphId` it must
  * echo back. Sending them as data (not prose) keeps the numbering unambiguous.
+ *
+ * `toolName` is a parameter rather than an import so this module stays free of
+ * any dependency on the Notion side — the caller knows which tool it installed.
  */
-export function buildAnalysisPrompt(spec: string, input: ArticleInput): string {
+export function buildAnalysisPrompt(spec: string, input: ArticleInput, toolName: string): string {
 	const payload = {
 		title: input.title,
 		source: input.source,
@@ -86,6 +89,6 @@ export function buildAnalysisPrompt(spec: string, input: ArticleInput): string {
 		JSON.stringify(payload, null, 2),
 		"```",
 		"",
-		"只输出符合规范的 JSON 对象。",
+		`现在按规范调用 \`${toolName}\` 工具，把 ${input.paragraphs.length} 段解读一次性提交。不要把 JSON 作为文本输出。`,
 	].join("\n");
 }
