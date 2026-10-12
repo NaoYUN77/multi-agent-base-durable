@@ -12,10 +12,10 @@
 
 | 文件 | 职责 |
 |---|---|
-| `src/multiagent/ledger.ts` | 任务台账（conversation-scoped `defineDocFamily`，每任务一文档）、状态机与合法转换校验、轮次/审阅事件类型 |
+| `src/multiagent/ledger.ts` | 任务台账（conversation-scoped `defineDocFamily`，每任务一文档）、状态机与合法转换校验、**操作绑定**（`<kind>:<toolTaskId>:<callId>` → round/requestId/decision）、**全量状态转换事件**、版本号、轮次/审阅事件类型 |
 | `src/multiagent/child-tools.ts` | 子侧本地无副作用工具（`text_stats` / `text_check`）与 `ChildTools` 扩展 |
 | `src/multiagent/delegation.ts` | 单轮委派执行封装（task-owned 子会话、显式 configure、稳定 requestId、意图先行提交、程序证据提取） |
-| `src/multiagent/tools.ts` | 主侧五个管理工具（`task_delegate` / `task_revise` / `task_review` / `task_status` / `task_evidence`） |
+| `src/multiagent/tools.ts` | 主侧六个管理工具（`task_delegate` / `task_revise` / `task_review` / `task_cancel` / `task_status` / `task_evidence`），全部 `replay: "safe"` + `executionMode: "parallel"` |
 | `src/multiagent/evidence.ts` | 证据提取：从真实 Entry 记录按轮次边界提取工具证据（entryId / byTaskId / toolCallId / toolName / isError / 参数概要 / 结果摘录 / 截断标识） |
 | `src/multiagent/cli-multiagent.ts` | `multiagent:probe` 入口（真实运行 + 恢复 kill 点） |
 | `src/multiagent/cli-multiagent-inspect.ts` | `multiagent:inspect` 只读入口（不建库、不起任务、不调模型） |
@@ -36,17 +36,20 @@ running ──► awaiting_review ──► accepted           （终态）
 - 初始轮：`running` → 提交子任务 → `awaiting_review`。
 - 拒绝：`awaiting_review` → `revising`（事件入台账）；返工完成后回 `awaiting_review`。
 - 验收：`awaiting_review` → `accepted`。
+- 取消：任意非终态 → `cancelled`（先 abort 子会话、确认子会话无活跃任务，再落终态）。
 - 第三轮仍被拒绝：`awaiting_review` → `failed`（`revision_limit`），不自动接受。
-- 技术错误（提交失败、未 done）直接 `failed`，不包装成答案。
-- 终态后一切执行/返工被程序拒绝；历史与证据仍可读。
+- 技术错误（提交失败、未 done、**空最终答案**）直接 `failed`，不包装成答案。
+- 终态后一切执行/返工/取消被程序拒绝；历史与证据仍可读。
+- 每次转换追加 `events` 条目并 `version += 1`；同一 commit 内完成"检查 + 写入"。
 
 ## 关键设计决策
 
 1. **子会话创建用 foreground task-owned 模式**（`tx.createConversation({ ownership: { kind: "task", taskId } })`），不用 fork。返工跨工具 Task 复用经实测验证：新工具 Task 可用 `tx.scanConversations({ ownerConversationId })` 找回原子会话并继续 submit（探针证据见 PR 正文）。
 2. **授权边界是 child 的 `tools` 集合**（configure 显式设置），`modelTools` 只影响可见性；管理扩展从 child 移除，`ChildTools` 显式加入——子既看不到也调不到委派/审阅工具。
-3. **意图先行**：每轮的 round 记录（含稳定 requestId）在提交 submission 之前落账，崩溃恢复后重放同轮不会新增轮次或重复提交；submission 经稳定 requestId 天然去重。
-4. **证据只来自库**：程序从子会话 Entry/Task/Submission 提取，模型从不自述 ID 或成功状态。
-5. **台账事件显式持久化**在 Document 内，不依赖默认 revision 策略。
+3. **意图先行 + 操作绑定**：每个工具调用以 `<kind>:<toolTaskId>:<callId>` 绑定到轮次/决定；绑定与轮次记录在提交 submission 之前落账。同一调用的重放（`replay: "safe"` 重跑）恢复原轮次与原 requestId，不会新增轮次；新调用得到新键、新轮次。业务任务 ID 由工具任务标识稳定派生（`task-${api.taskId}`），省略 `taskId` 也不受重放影响。
+4. **证据只来自库**：程序从子会话 Entry/Task/Submission 提取（含 `byTaskId`、`toolCallId`、`data.diagnostics`），参数摘要按定义脱敏（长字符串 → `<string:N>`），分页必须完整否则显式失败；最终答案取 `settled.answer`，空答案即失败。模型从不自述 ID 或成功状态。
+5. **台账事件显式持久化**在 Document 内（`events`/`reviews`/`operations`），不依赖默认 revision 策略。
+6. **只读取证不走 Harness**：`multiagent:inspect` 用裸 SQLite `readOnly` 连接 + 文档 revision 重建，不迁移、不重整 running 任务、不创建 root；遇到未知 delta op 显式失败。
 
 ## 验收对照（AC-01 ~ AC-10）
 
@@ -58,14 +61,14 @@ running ──► awaiting_review ──► accepted           （终态）
 | 04 | ledger 证据与真实 entry 逐字段比对；轮次边界；截断标识；`task_evidence` 全文取回与三类越权拒绝 |
 | 05 | 返工闭环 + 幂等 + 非法转换 + `revision_limit` → failed（端到端与单元两层） |
 | 06 | 终态后执行拒绝、历史可读、新任务新上下文 |
-| 07 | 真实子进程 SIGKILL 两个边界（submission in flight / awaiting_review 未 review）+ 工具重放唯一结果 |
+| 07 | 真实子进程 SIGKILL **四个边界**（子会话建立/提交在途、awaiting_review 未审阅、返工意图已落账但提交未完成、本地安全工具执行中）+ inspect 前后字节与逻辑记录一致 |
 | 08 | 主/子真实压缩（`conversation.compact`）：有效上下文改变、旧 Entry 仍可读、台账/证据仍准确 |
-| 09 | `npm run typecheck` + `npm test`（98 passed，含 87 既有）+ 改动范围核对 |
-| 10 | 真实 DeepSeek 主子同模型闭环一次成功（见验证报告的取证记录） |
+| 09 | `npm run typecheck` + `npm test`（114 passed，含 87 既有）+ 改动范围核对 |
+| 10 | 真实 DeepSeek 主子同模型闭环一次成功，且 CLI 的程序侧验收校验通过（见验证报告 §6） |
 
 ## 交付命令
 
 - `npm run multiagent:test` — 确定性 AC-01~08，无网络
 - `npm run multiagent:probe -- --provider deepseek --db <绝对路径> --request-id <ID>` — 真实运行
-- `npm run multiagent:inspect -- --db <同一路径> --task-id <业务任务ID>` — 只读取证
+- `npm run multiagent:inspect -- --db <同一路径> --task-id <业务任务ID>` — 只读取证（裸 SQLite，不启动 Harness）
 - `npm run multiagent:probe -- --help` — 用法、入口、限制与退出码

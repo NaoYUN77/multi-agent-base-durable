@@ -64,6 +64,8 @@ export type EvidenceReference = {
 	readonly excerpt: string;
 	/** True when the excerpt is not the complete persisted text. */
 	readonly truncated: boolean;
+	/** Structured harness diagnostics recorded on the result entry, when any. */
+	readonly diagnostics?: string[];
 };
 
 /** One review decision by the main model, with the full transition it caused. */
@@ -74,6 +76,8 @@ export type ReviewEvent = {
 	readonly at: number;
 	readonly before: TaskBusinessStatus;
 	readonly after: TaskBusinessStatus;
+	/** The tool operation that recorded this decision (task/call association). */
+	readonly opKey: string;
 };
 
 /** Terminal outcome detail for `failed` / `cancelled`. */
@@ -82,6 +86,42 @@ export type TaskFailure = {
 	readonly detail?: string;
 	readonly at: number;
 };
+
+/**
+ * Binding of one tool *operation* (a delegate/revise/review/cancel tool call)
+ * to its durable outcome. The key is `<kind>:<toolTaskId>:<callId>`: a rerun of
+ * the same call after an interruption replays with the same key, so it resumes
+ * the round and requestId it already created instead of minting new ones. Two
+ * different calls never share a key, so two parallel calls stay distinct.
+ */
+export type OperationBinding = {
+	readonly opKey: string;
+	readonly kind: "delegate" | "revise" | "review" | "cancel";
+	/** The durable task that invoked the tool. */
+	readonly toolTaskId: string;
+	/** The tool call id within that task. */
+	readonly callId: string;
+	/** Round this operation is bound to. */
+	readonly round: number;
+	readonly createdAt: number;
+	/** Recorded decision of a completed review operation (idempotent replay). */
+	readonly decision?: "accept" | "reject";
+};
+
+/** One program-recorded state transition, with the operation that caused it. */
+export type StateEvent = {
+	readonly at: number;
+	readonly from: TaskBusinessStatus;
+	readonly to: TaskBusinessStatus;
+	readonly opKey?: string;
+	readonly round?: number;
+	readonly reason?: string;
+};
+
+/** Build the stable operation key of one tool invocation. */
+export function operationKey(kind: OperationBinding["kind"], toolTaskId: string, callId: string): string {
+	return `${kind}:${toolTaskId}:${callId}`;
+}
 
 export type TaskLedgerState = {
 	/** Business task id, independent of any Durable task id. */
@@ -98,9 +138,15 @@ export type TaskLedgerState = {
 	readonly currentRound: number;
 	readonly rounds: RoundRecord[];
 	readonly reviews: ReviewEvent[];
+	/** Every program-recorded transition, in order. Reviews reference their op key. */
+	readonly events: StateEvent[];
+	/** Operation bindings: tool call → round/requestId/decision. Replay anchors. */
+	readonly operations: OperationBinding[];
 	readonly failure?: TaskFailure;
 	readonly createdAt: number;
 	readonly terminalAt?: number;
+	/** Bumped on every recorded transition: the optimistic-concurrency token. */
+	version: number;
 };
 
 /**
@@ -112,7 +158,18 @@ export type TaskLedgerState = {
  */
 export const TaskLedgerDoc = defineDocFamily<TaskLedgerState, { readonly taskId: string; readonly model: ModelRef }>({
 	kind: "app.multiagent.task-ledger",
-	version: 1,
+	version: 2,
+	// v1 documents predate operation bindings, state events and the version
+	// counter; a v1 read is filled in rather than rejected.
+	migrate: (value, fromVersion) => {
+		if (fromVersion >= 2) return value as unknown as TaskLedgerState;
+		return {
+			...value,
+			events: Array.isArray(value.events) ? value.events : [],
+			operations: Array.isArray(value.operations) ? value.operations : [],
+			version: typeof value.version === "number" ? value.version : 0,
+		} as unknown as TaskLedgerState;
+	},
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
@@ -125,7 +182,10 @@ export const TaskLedgerDoc = defineDocFamily<TaskLedgerState, { readonly taskId:
 		currentRound: 0,
 		rounds: [],
 		reviews: [],
+		events: [],
+		operations: [],
 		createdAt: 0,
+		version: 0,
 	}),
 });
 
@@ -180,6 +240,16 @@ export function reviewOutcome(taskId: string, status: TaskBusinessStatus, decisi
 	return "revising";
 }
 
+/** Revision rounds used so far: every round after the initial one. */
+export function revisionsUsed(currentRound: number): number {
+	return Math.max(0, currentRound - 1);
+}
+
+/** True when another revision round may still be started. */
+export function canRevise(currentRound: number): boolean {
+	return revisionsUsed(currentRound) < MAX_REVISIONS;
+}
+
 /** Raised when a rejection would exceed the revision limit; the task becomes `failed`. */
 export class RevisionLimitError extends Error {
 	readonly taskId: string;
@@ -193,4 +263,43 @@ export class RevisionLimitError extends Error {
 /** Stable request id for one round. A rerun of the same round resolves to the same submission. */
 export function roundRequestId(taskId: string, round: number): string {
 	return `multiagent-round:${taskId}:${round}`;
+}
+
+/** Mutable shape of the ledger draft, for the transition helpers. */
+type LedgerDraft = {
+	readonly taskId: string;
+	status: TaskBusinessStatus;
+	events: StateEvent[];
+	terminalAt?: number;
+	failure?: TaskFailure;
+	version: number;
+};
+
+/**
+ * Apply one program-validated transition to a ledger draft: assert legality,
+ * append the event, bump the optimistic-concurrency version, and stamp the
+ * terminal time for terminal statuses. Callers pass the draft they read inside
+ * their own commit, so the check and the write are one atomic unit.
+ */
+export function recordTransition(
+	doc: LedgerDraft,
+	to: TaskBusinessStatus,
+	at: number,
+	meta?: { readonly opKey?: string; readonly round?: number; readonly reason?: string },
+): void {
+	assertTransition(doc.taskId, doc.status, to);
+	doc.events = [
+		...doc.events,
+		{
+			at,
+			from: doc.status,
+			to,
+			...(meta?.opKey === undefined ? {} : { opKey: meta.opKey }),
+			...(meta?.round === undefined ? {} : { round: meta.round }),
+			...(meta?.reason === undefined ? {} : { reason: meta.reason }),
+		},
+	];
+	doc.status = to;
+	doc.version += 1;
+	if (isTerminal(to)) doc.terminalAt = at;
 }

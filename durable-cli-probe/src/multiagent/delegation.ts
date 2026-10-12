@@ -14,18 +14,17 @@
 // The ownership question the Issue flagged is settled by measurement, not by
 // assumption: a child created by tool Task A stays usable from a later tool
 // Task B (the revision call) once A is terminal. See the PR's ownership probe.
+//
+// The caller (tools.ts) owns round *numbering* through operation bindings:
+// the round number passed here is already the one the persisted operation is
+// bound to, so a rerun of the same tool call resumes the same round instead of
+// minting the next one.
 
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, EntryId, Extension, ModelRef, ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
 import { configure } from "@earendil-works/pi-durable";
 import { extractRoundEvidence, type RoundExtraction } from "./evidence.ts";
-import {
-	assertTransition,
-	roundRequestId,
-	TaskLedgerDoc,
-	type EvidenceReference,
-	type RoundRecord,
-} from "./ledger.ts";
+import { roundRequestId, recordTransition, TaskLedgerDoc, type EvidenceReference, type RoundRecord } from "./ledger.ts";
 import { textCheckTool, textStatsTool } from "./child-tools.ts";
 
 /** Everything a round run needs from its host. The main conversation id comes
@@ -49,6 +48,8 @@ export type RoundInput = {
 	readonly task: string;
 	readonly feedback?: string;
 	readonly model: ModelRef;
+	/** The operation that owns this round (task/call association for events). */
+	readonly opKey: string;
 };
 
 /** What a settled round reports to the ledger and to the main model. */
@@ -85,8 +86,8 @@ export function resolveChildTools(names: readonly string[]): readonly ToolRegist
  * Status bookkeeping:
  *   - initial round: ledger starts `running`, this call ends at `awaiting_review`
  *     (or `failed` on a technical error — never dressed up as an answer).
- *   - revision round: ledger must be `awaiting_review`, this call passes through
- *     `revising` and ends at `awaiting_review` again (or `failed`).
+ *   - revision round: the operation binding already moved the task to
+ *     `revising`; this call ends at `awaiting_review` again (or `failed`).
  */
 export async function runDelegationRound(
 	api: ToolExecutionApi,
@@ -96,23 +97,21 @@ export async function runDelegationRound(
 ): Promise<RoundOutcome> {
 	const requestId = roundRequestId(input.taskId, input.round);
 
-	// ── Phase 1: intent + child conversation, in one recoverable commit ──────
+	// ── Phase 1: child conversation, created once and reused forever ────────
 	const childId = await api.commit(async (tx) => {
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, {
 			taskId: input.taskId,
 			model: input.model,
 		});
 		if (doc.mainConversationId === undefined) doc.mainConversationId = api.conversationId;
+		if (doc.createdAt === 0) doc.createdAt = Date.now();
 		if (doc.childConversationId !== undefined) return doc.childConversationId;
 		const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
-		const record =
-			existing ?? (await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } }));
-		// Explicit configuration — the child starts as a copy of the main agent, so
-		// both the management extension and the tool set must be set by hand.
+		const record = existing ?? (await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } }));
+		// The child starts as a copy of the main agent, so the management
+		// extension is removed and the child-side one is added by hand: the
+		// delegated tool must resolve, and nothing else may.
 		await configure(tx, record.id, {
-			// The child starts as a copy of the main agent, so the management
-			// extension is removed and the child-side one is added by hand: the
-			// delegated tool must resolve, and nothing else may.
 			extensions: { remove: [host.mainExtension], add: [host.childExtension] },
 			instructions: host.childInstructions,
 			tools: host.childToolObjects,
@@ -124,14 +123,14 @@ export async function runDelegationRound(
 		return record.id;
 	}, callContext);
 
-	const intent = await api.commit(async (tx) => {
+	// ── Phase 2: the round's intent, committed before the submission ─────────
+	await api.commit(async (tx) => {
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, {
 			taskId: input.taskId,
 			model: input.model,
 		});
 		// Idempotent: a rerun of the same round must not append a second record.
-		const already = doc.rounds.find((round) => round.requestId === requestId);
-		if (already !== undefined) return already;
+		if (doc.rounds.some((round) => round.requestId === requestId)) return;
 		const round: RoundRecord = {
 			round: input.round,
 			kind: input.kind,
@@ -147,17 +146,14 @@ export async function runDelegationRound(
 		// when the main model revises directly, or already there right after a
 		// recorded rejection (the recorded transition was the rejection's).
 		if (input.kind === "revision" && doc.status !== "revising") {
-			assertTransition(input.taskId, doc.status, "revising");
-			doc.status = "revising";
+			recordTransition(doc, "revising", Date.now(), { opKey: input.opKey, round: input.round });
 		}
-		return round;
 	}, callContext);
-	void intent;
 
-	// ── Phase 2: submit with the stable request id and wait ──────────────────
+	// ── Phase 3: submit with the stable request id and wait ─────────────────
 	const handle = await api.conversation(childId, callContext);
 	if (handle === undefined) {
-		return await failRound(api, callContext, host, input, `child conversation ${childId} not found`);
+		return await failRound(api, callContext, input, `child conversation ${childId} not found`);
 	}
 	let settled;
 	try {
@@ -167,25 +163,48 @@ export async function runDelegationRound(
 		);
 		settled = await submission.wait(callContext);
 	} catch (error) {
-		return await failRound(api, callContext, host, input, `submission failed: ${String(error)}`);
+		return await failRound(api, callContext, input, `submission failed: ${String(error)}`);
 	}
 	if (settled.status !== "done" || settled.type !== "input") {
 		return await failRound(
 			api,
 			callContext,
-			host,
 			input,
 			`submission ended ${settled.status} (${settled.type === "input" ? "" : settled.type}${settled.status === "unanswered" ? `: ${settled.reason}` : ""})`,
 		);
 	}
 
-	// ── Phase 3: evidence extraction + outcome, in one commit ────────────────
-	const outcome = await api.commit(async (tx) => {
+	// ── Phase 4: evidence extraction + outcome, in one commit ────────────────
+	return api.commit(async (tx) => {
 		const extraction = await extractRoundEvidence(tx, {
 			conversationId: childId,
 			minEntryId: settled.entry,
 			maxEntryId: settled.answer,
+			answerEntryId: settled.answer,
 		});
+		// An empty final answer is a failure of the round, not something to
+		// paper over with earlier assistant text.
+		if (extraction.answerText.trim() === "") {
+			const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, {
+				taskId: input.taskId,
+				model: input.model,
+			});
+			try {
+				recordTransition(doc, "failed", Date.now(), { opKey: input.opKey, round: input.round, reason: "empty_answer" });
+			} catch {
+				// Already terminal: leave the terminal record alone.
+			}
+			doc.failure = { reason: "empty_answer", detail: `round ${input.round} settled without answer text`, at: Date.now() };
+			return {
+				ok: false as const,
+				childConversationId: childId,
+				submissionId: String(settled.id),
+				answerText: extraction.answerText,
+				answerEntryId: extraction.answerEntryId,
+				extraction,
+				error: "the sub-agent settled without an answer",
+			};
+		}
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, {
 			taskId: input.taskId,
 			model: input.model,
@@ -202,8 +221,21 @@ export async function runDelegationRound(
 					}
 				: round,
 		);
-		assertTransition(input.taskId, doc.status, "awaiting_review");
-		doc.status = "awaiting_review";
+		// Atomic terminal/lifecycle check: a terminal or already-advanced task
+		// must not be dragged back by a late-finishing round.
+		try {
+			recordTransition(doc, "awaiting_review", Date.now(), { opKey: input.opKey, round: input.round });
+		} catch {
+			return {
+				ok: false as const,
+				childConversationId: childId,
+				submissionId: String(settled.id),
+				answerText: extraction.answerText,
+				answerEntryId: extraction.answerEntryId,
+				extraction,
+				error: `task ${input.taskId} is ${doc.status}; the finished round was not applied`,
+			};
+		}
 		return {
 			ok: true as const,
 			childConversationId: childId,
@@ -213,15 +245,12 @@ export async function runDelegationRound(
 			extraction,
 		};
 	}, callContext);
-
-	return outcome;
 }
 
 /** Mark the round and the task failed; a technical error is never an answer. */
 async function failRound(
 	api: ToolExecutionApi,
 	callContext: Context,
-	host: DelegationHost,
 	input: RoundInput,
 	detail: string,
 ): Promise<RoundOutcome> {
@@ -230,13 +259,13 @@ async function failRound(
 			taskId: input.taskId,
 			model: input.model,
 		});
+		if (doc.status === "failed" || doc.status === "accepted" || doc.status === "cancelled") return;
 		try {
-			assertTransition(input.taskId, doc.status, "failed");
+			recordTransition(doc, "failed", Date.now(), { opKey: input.opKey, round: input.round, reason: "technical_error" });
 		} catch {
-			// Already terminal: leave the terminal record alone.
+			// Not a legal failure from here (should not happen); leave as-is.
 			return;
 		}
-		doc.status = "failed";
 		doc.failure = { reason: "technical_error", detail, at: Date.now() };
 	}, callContext);
 	return {

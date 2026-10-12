@@ -6,12 +6,28 @@
 //
 // Usage:
 //   node --conditions=source --experimental-strip-types test/helpers/multiagent-runner.ts \
-//     --db <absolute path> --request-id <id> --input <DELEGATE|REVIEW> [--kill-when <condition>]
+//     --db <absolute path> --request-id <id> --input <DELEGATE|REVIEW|REVISE|RESUME> \
+//     [--kill-when <child-conversation|awaiting_review|revising-intent|tool-pause>]
 //
-// The script:
+// Modes:
 //   DELEGATE  the main agent delegates `task-smoke`; the child runs text_stats
 //             and answers; the main agent finishes with text (no review).
 //   REVIEW    the main agent accepts `task-smoke`'s current round.
+//   REVISE    the main agent sends a revision and finishes.
+//   RESUME    nothing is submitted: the process opens the database, resumes
+//             whatever was interrupted, waits for idle, and reports the ledger.
+//             This is how a restart continues an interrupted round on its own.
+//
+// Kill conditions (the process dies uncleanly at the named boundary):
+//   child-conversation  on the child's first model request (intent committed,
+//                       submission in flight)
+//   awaiting_review     when the main agent sees the delegation's tool result
+//                       (the round settled, the main model has not reviewed)
+//   revising-intent     on the child's first request of a *revision* round
+//                       (the revision intent is committed, its submission in
+//                       flight)
+//   tool-pause          while the local tool is executing: the child asks for a
+//                       pause and the process kills itself inside it
 
 import type { Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
@@ -22,6 +38,30 @@ import { TaskLedgerDoc } from "../../src/multiagent/ledger.ts";
 
 const SENTINEL = "RUNNER-SENTINEL-2D7B";
 const MAT = "MAT-RECOVER-5A1C";
+const REVISION_MARK = "REVISION-ROUND-TWO";
+/** Long enough that the killer lands inside the tool, short enough to keep the test quick. */
+const TOOL_PAUSE_MS = 1_500;
+const TOOL_KILL_AFTER_MS = 300;
+
+function parseArg(name: string): string | undefined {
+	const index = process.argv.indexOf(`--${name}`);
+	return index === -1 ? undefined : process.argv[index + 1];
+}
+
+const databasePath = parseArg("db");
+const requestId = parseArg("request-id");
+const input = parseArg("input") ?? "DELEGATE";
+const killWhen = parseArg("kill-when");
+if (databasePath === undefined || requestId === undefined) {
+	console.error("usage: runner --db <path> --request-id <id> [--input DELEGATE|REVIEW|REVISE|RESUME] [--kill-when condition]");
+	process.exit(2);
+}
+
+/** Die uncleanly at a recovery boundary. */
+function killNow(): never {
+	process.kill(process.pid, "SIGKILL");
+	throw new Error("unreachable");
+}
 
 function flatten(messages: readonly Message[]): string {
 	return messages
@@ -37,15 +77,6 @@ function flatten(messages: readonly Message[]): string {
 }
 
 const router: FauxResponseFactory = (request) => {
-	// Recovery kill points live on the request path itself: the process dies at
-	// a moment a model turn is actually in flight, which a wall-clock poll can
-	// miss when the deterministic script runs to completion between timers.
-	if (killWhen === "child-conversation" && !flatten(request.messages).includes(SENTINEL)) killNow();
-	if (killWhen === "awaiting_review") {
-		const lastResult = [...request.messages].reverse().find((message) => message.role === "toolResult");
-		const toolName = lastResult === undefined ? "" : String((lastResult as { toolName?: string }).toolName ?? "");
-		if (lastResult !== undefined && toolName === "task_delegate") killNow();
-	}
 	const flat = flatten(request.messages);
 	const last = [...request.messages].reverse().find((message) => message.role !== "system");
 	const textOf = (): string => {
@@ -57,18 +88,33 @@ const router: FauxResponseFactory = (request) => {
 			.join("\n");
 	};
 
+	// ── Child side ──────────────────────────────────────────────────────────
 	if (!flat.includes(SENTINEL)) {
-		// The child: run the tool, then answer.
+		if (killWhen === "child-conversation") killNow();
+		if (killWhen === "revising-intent" && textOf().includes(REVISION_MARK)) killNow();
 		if (last?.role !== "toolResult") {
-			return fauxAssistantMessage([fauxToolCall("text_stats", { text: MAT, marker: "MAT" }, { id: "runner-call-1" })], { stopReason: "toolUse" });
+			const args: Record<string, string | number> = { text: MAT, marker: "MAT" };
+			if (killWhen === "tool-pause") {
+				args.pauseMs = TOOL_PAUSE_MS;
+				// The kill must land inside the tool, not on a model turn.
+				setTimeout(() => killNow(), TOOL_KILL_AFTER_MS);
+			}
+			return fauxAssistantMessage([fauxToolCall("text_stats", args, { id: "runner-call-1" })], { stopReason: "toolUse" });
 		}
 		return fauxAssistantMessage([fauxText(`RUNNER-CHILD-ANSWER: ${MAT}`)]);
 	}
+
+	// ── Main side ───────────────────────────────────────────────────────────
 	if (last?.role === "toolResult") {
 		const toolName = (last as { toolName?: string }).toolName;
-		if (toolName === "task_delegate") return fauxAssistantMessage([fauxText("RUNNER-MAIN-DONE")]);
-		if (toolName === "task_review") return fauxAssistantMessage([fauxText("RUNNER-REVIEW-DONE")]);
+		if (toolName === "task_delegate" && killWhen === "awaiting_review") killNow();
 		return fauxAssistantMessage([fauxText("RUNNER-MAIN-DONE")]);
+	}
+	if (textOf().includes("REVISE")) {
+		return fauxAssistantMessage(
+			[fauxToolCall("task_revise", { taskId: "task-smoke", task: `${REVISION_MARK} count ${MAT}`, feedback: "again" }, { id: "runner-revise" })],
+			{ stopReason: "toolUse" },
+		);
 	}
 	if (textOf().includes("REVIEW")) {
 		return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-smoke", decision: "accept" }, { id: "runner-accept" })], { stopReason: "toolUse" });
@@ -79,36 +125,40 @@ const router: FauxResponseFactory = (request) => {
 	);
 };
 
-function parseArg(name: string): string | undefined {
-	const index = process.argv.indexOf(`--${name}`);
-	return index === -1 ? undefined : process.argv[index + 1];
-}
-
-const databasePath = parseArg("db");
-const requestId = parseArg("request-id");
-const input = parseArg("input") ?? "DELEGATE";
-const killWhen = parseArg("kill-when");
-if (databasePath === undefined || requestId === undefined) {
-	console.error("usage: runner --db <path> --request-id <id> [--input DELEGATE|REVIEW] [--kill-when condition]");
-	process.exit(2);
-}
-
 const runtime = await openProbe({
 	databasePath,
 	provider: "faux",
 	fauxRouter: router,
-	extensions: [createMultiagentExtension({ model: { provider: "faux", modelId: "faux-1" }, childInstructions: "You are the child agent of the recovery check." })],
+	extensions: [
+		createMultiagentExtension({
+			model: { provider: "faux", modelId: "faux-1" },
+			childInstructions: "You are the child agent of the recovery check.",
+		}),
+	],
 	registryExtensions: [ChildTools],
 });
 
-/** Die uncleanly at a recovery boundary. */
-function killNow(): never {
-	process.kill(process.pid, "SIGKILL");
-	throw new Error("unreachable");
-}
-
 const root = await openRoot(runtime);
 runtime.harness.resume();
+
+// RESUME: submit nothing; let the Harness continue whatever was interrupted.
+if (input === "RESUME") {
+	await runtime.harness.waitForIdle(context);
+	const ledger = await runtime.harness.snapshot(TaskLedgerDoc, root.id, "task-smoke", context);
+	console.log(
+		JSON.stringify({
+			ok: true,
+			input,
+			status: ledger?.status ?? null,
+			rounds: ledger?.rounds.length ?? 0,
+			settledRounds: ledger?.rounds.filter((round) => round.submissionId !== undefined).length ?? 0,
+			childConversationId: ledger?.childConversationId ?? null,
+		}),
+	);
+	await runtime.close();
+	process.exit(0);
+}
+
 const submission = await root.submit({ type: "input", content: `${input} ${SENTINEL}`, requestId }, context);
 const settled = await submission.wait(context);
 await runtime.harness.waitForIdle(context);

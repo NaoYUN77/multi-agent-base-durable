@@ -161,7 +161,7 @@ describe("TASK-003 revision limit and evidence retrieval", () => {
 		// The main conversation recorded the refusals it received.
 		const entries = await root.entries({}, 1000, undefined, context);
 		const flat = entries.items.flatMap((entry) => entry.model ?? []).map((message) => JSON.stringify(message)).join("\n");
-		expect(flat).toContain("not revisable");
+		expect(/accepts nothing further|not revisable/.test(flat)).toBe(true);
 
 		// AC-02 from the provider side: no child request saw the main sentinel.
 		const childRequests = requests.filter((request) => !request.includes(MAIN_SENTINEL));
