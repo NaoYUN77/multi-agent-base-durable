@@ -311,6 +311,25 @@ describe("article spec loading", () => {
 		expect(spec).toContain("roleInArticle");
 	});
 
+	it("states the language rule symmetrically, in both directions", () => {
+		const spec = loadArticleSpec();
+		// The previous wording only exemplified Chinese, which is the behaviour
+		// Issue #6 is about. Both directions must be spelled out.
+		expect(spec).toMatch(/英文[\s\S]{0,40}英文/);
+		expect(spec).toMatch(/中文[\s\S]{0,40}中文/);
+	});
+
+	it("names the things that must NOT decide the output language", () => {
+		const spec = loadArticleSpec();
+		// The spec's own language is the most likely decoy: it is written in Chinese.
+		expect(spec).toContain("本规范自身的语言");
+		// Metadata that happens to be Chinese must not drive the output language.
+		expect(spec).toContain("source");
+		expect(spec).toContain("title");
+		// And the rule must be anchored to the body, not to the instructions.
+		expect(spec).toMatch(/正文/);
+	});
+
 	it("throws rather than silently continuing when the file is absent", () => {
 		expect(() => loadArticleSpec("C:/definitely/not/a/root")).toThrowError(ArticleSpecError);
 	});
