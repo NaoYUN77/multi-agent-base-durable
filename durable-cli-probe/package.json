@@ -16,7 +16,10 @@
 		"notion:tool": "node --conditions=source --experimental-strip-types src/notion/cli-tool.ts",
 		"article:probe": "node --conditions=source --experimental-strip-types src/article/cli-article.ts",
 		"test": "vitest --run",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"multiagent:probe": "node --conditions=source --experimental-strip-types src/multiagent/cli-multiagent.ts",
+		"multiagent:inspect": "node --conditions=source --experimental-strip-types src/multiagent/cli-multiagent-inspect.ts",
+		"multiagent:test": "vitest --run test/multiagent.test.ts test/multiagent-revision.test.ts test/multiagent-evidence.test.ts test/multiagent-compaction.test.ts test/multiagent-recovery.test.ts"
 	},
 	"devDependencies": {
 		"@notionhq/client": "5.27.0",

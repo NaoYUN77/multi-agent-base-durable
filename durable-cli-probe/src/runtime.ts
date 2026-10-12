@@ -30,11 +30,19 @@ import {
 	fauxProvider,
 	fauxToolCall,
 	type FauxProviderHandle,
+	type FauxResponseFactory,
 	type Model,
 	type Models,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, type Extension, type JsonObject, type Registry } from "@earendil-works/pi-durable";
+import {
+	createRegistry,
+	Harness,
+	type Extension,
+	type HarnessSettings,
+	type JsonObject,
+	type Registry,
+} from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
 /** The context every call in this probe runs under. Matches the checkout's own examples. */
@@ -68,6 +76,15 @@ export interface ProbeOptions {
 	 */
 	readonly fauxToolTurns?: readonly (readonly { readonly name: string; readonly arguments: JsonObject }[])[];
 	/**
+	 * TASK-003: a scripted response *router* for the faux provider, used only
+	 * when `provider` is `faux`. Unlike `fauxResponses`, it sees every actual
+	 * request (`TranscriptContext.messages`), which is what the multiagent
+	 * isolation proofs need: the request the provider receives is the evidence,
+	 * not the model's word about it. Appended after `fauxResponses` and
+	 * `fauxToolTurns`, so a scripted sequence stays deterministic until it ends.
+	 */
+	readonly fauxRouter?: FauxResponseFactory;
+	/**
 	 * Base URL for `provider: "custom"`. Include the API version path, e.g.
 	 * `https://api.deepseek.com` or `https://gateway.example.com/v1`.
 	 */
@@ -89,6 +106,19 @@ export interface ProbeOptions {
 	 * persisted. The optional `notion-read` extension arrives this way.
 	 */
 	readonly extensions?: readonly Extension[];
+	/**
+	 * TASK-003: extensions installed into the registry but *not* selected for the
+	 * root conversation. The child-side tools arrive this way: a delegated task
+	 * grants them per-task through `configure`, so the main agent must not see
+	 * them at all, while the registry must still resolve them.
+	 */
+	readonly registryExtensions?: readonly Extension[];
+	/**
+	 * TASK-003: Harness settings. The compaction test narrows
+	 * `compaction.keepRecentTokens` so a short deterministic transcript still
+	 * crosses the built-in compaction threshold; every other default stands.
+	 */
+	readonly settings?: HarnessSettings;
 }
 
 /** Everything a caller needs to run submissions and to close cleanly. */
@@ -205,6 +235,9 @@ async function buildModels(
 				),
 			),
 			...fauxResponses.map((text) => fauxAssistantMessage(text)),
+			// TASK-003: a router answers every remaining request from the request
+			// itself; it is appended last so fixed scripts keep their order.
+			...(options.fauxRouter === undefined ? [] : Array.from({ length: 200 }, () => options.fauxRouter!)),
 		]);
 		return { models, faux, modelId: options.modelId ?? DEFAULT_MODEL_ID.faux, providerId: "faux" };
 	}
@@ -257,6 +290,9 @@ export async function openProbe(options: ProbeOptions): Promise<ProbeRuntime> {
 	const registry = createRegistry();
 	const extensions = options.extensions ?? [];
 	for (const extension of extensions) registry.install(extension);
+	// Installed but not selected for the root: the registry can resolve them
+	// when a child conversation's agent is configured to include them.
+	for (const extension of options.registryExtensions ?? []) registry.install(extension);
 	const installedExtensions = registry.snapshot().installed().map((extension) => extension.name);
 
 	const storage = await openNodeSqliteStorage(options.databasePath);
@@ -266,6 +302,7 @@ export async function openProbe(options: ProbeOptions): Promise<ProbeRuntime> {
 			models: built.models,
 			registry,
 			onReport: (error) => reports.push(error),
+			...(options.settings === undefined ? {} : { settings: options.settings }),
 		},
 		context,
 	);
