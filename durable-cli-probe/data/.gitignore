@@ -17,3 +17,8 @@
 # If you re-run the probe locally, prefer a scratch database instead of
 # overwriting these (e.g. --db ./data/scratch.sqlite).
 *.db
+
+# Issue #3 run databases are NOT committed. That issue requires run databases,
+# logs, and credentials to stay out of the repository, so the article probes'
+# stores are excluded even though the TASK-002 ones above are kept.
+article-*.sqlite

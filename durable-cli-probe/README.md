@@ -649,3 +649,83 @@ export NOTION_PIN_IP=208.103.161.2   # optional; omit for normal DNS
 - No sub-agents, RAG, MCP, OAuth, Telegram/Feishu, Notion UI automation, or write operations, per the task.
 - No git commit was made.
 
+---
+
+## 17. Issue #3: writing an article to Notion
+
+TASK-002 could only read. This adds the first write path, and with it the first
+place where a mistake is not free.
+
+### What it adds
+
+| Path | Role |
+| --- | --- |
+| `prompts/article-analysis.md` | The processing spec. Loaded at runtime by `src/article/spec.ts`, which throws if it is missing or blank — a spec that exists while the code ignores it is worse than none. |
+| `src/article/contract.ts` | The input contract and the model-reply contract, plus their validators. |
+| `src/notion/article-blocks.ts` | Renders an article into explicit Notion blocks. |
+| `src/notion/article-write.ts` | The `pages.create` wrapper, the failure classifier, and the read-back comparison. |
+| `src/notion/article-tool.ts` | The `notion_write_article` tool, registered as the `notion-write` extension. |
+| `src/article/cli-article.ts` | `npm run article:probe`. |
+
+### Three decisions worth stating
+
+**The write is a separate tool, not a fourth action on `notion_read`.** The read
+tool's guarantee is "three actions, all GETs, safe to replay". Adding a write
+action would silently remove that guarantee for every existing caller. A second
+tool keeps the contracts independent and lets a conversation be granted one
+without the other.
+
+**The model cannot choose what is written or where.** Its parameters carry only
+per-paragraph `summary` and `roleInArticle`. The article's original text and the
+destination page id come from the closure, built from the input file and from
+`NOTION_ARTICLE_PARENT_PAGE_ID`. A bad reply can fail the run; it cannot relocate
+or rewrite content.
+
+**`replay: "unsafe"`.** Durable only reruns a recovered call when the stored and
+current policies are both `"safe"` (`packages/durable/src/harness/tool.ts:170`).
+A create is not idempotent, so an interrupted call must surface as an
+interruption, not repeat. The SDK's own retry policy is left alone: reading
+`Client.js`'s `canRetry` shows 429/529 retried for every method, but 500/503 only
+for GET/DELETE — so a POST is never silently repeated.
+
+### Configuration
+
+```bash
+export NOTION_ARTICLE_PARENT_PAGE_ID='<32-hex page id>'   # required, no fallback
+npm run article:probe -- --provider faux --input test/fixtures/article-sample.json \
+  --db ./data/article-probe.sqlite --request-id article-1
+```
+
+`NOTION_ARTICLE_PARENT_PAGE_ID` is deliberately separate from `NOTION_PAGE_ID`.
+Sharing one variable would mean that pointing the probe at a page to *read* it
+also authorises writing under it. There is no fallback between them.
+
+### Verification, and what each kind proves
+
+| Kind | Proves |
+| --- | --- |
+| `npm run typecheck` | types line up |
+| `npm test` (44 article tests) | validation rejects bad input before any request; rendered blocks carry the original text unchanged; failures are classified determinate vs indeterminate; a create is attempted exactly once; a content mismatch is reported as failure |
+| faux + real Notion | the write and read-back path works against the live API |
+| deepseek + real Notion | a real model can read the spec and produce a conforming reply — **not run here**, see limitations |
+
+The read-back is the acceptance check, not the create's status code. A `200` from
+`pages.create` proves a page exists; `readBackArticlePage` re-fetches it, extracts
+every block's text, and compares it against what was sent. A mismatch is returned
+as `isError`, so "the page exists" cannot be mistaken for "the page is right".
+
+### Limitations
+
+- **The real-model path is not verified.** `DEEPSEEK_API_KEY` was not available in
+  this environment, so `--provider deepseek` was never executed. A faux run proves
+  the wiring; it says nothing about whether a real model produces a conforming
+  reply. Do not read the faux result as model evidence.
+- **One request per article.** An article rendering to more than 100 blocks, or a
+  payload over 500KB, is rejected before writing rather than appended in batches.
+- **No exactly-once guarantee.** Replaying a completed `requestId` does not create
+  a second page (verified), but an interrupted create can leave a page that the
+  probe does not know about; `ArticleWriteIndeterminateError` says so rather than
+  guessing.
+- **Only the rendered block sequence is compared.** Formatting attributes such as
+  colour or annotations are not asserted.
+
