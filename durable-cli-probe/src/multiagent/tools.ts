@@ -63,10 +63,16 @@ export interface MultiagentExtensionOptions {
 	/** Instructions installed verbatim in every child conversation. */
 	readonly childInstructions: string;
 	/**
-	 * Verification barrier awaited after a round's intent is committed and before
-	 * its submission exists; the recovery tests kill the process there.
+	 * Verification barrier awaited after the execution-right check and before the
+	 * cancellation gate; tests park a round here to observe the pre-gate window.
 	 */
 	readonly beforeSubmit?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
+	/**
+	 * Verification barrier awaited after the cancellation gate has passed and
+	 * immediately before the submission: the "gate passed, submit not yet called"
+	 * window. The recovery tests kill the process here.
+	 */
+	readonly atSubmit?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
 	/** Verification barrier awaited after a round's outcome is committed. */
 	readonly afterOutcome?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
 }
@@ -135,6 +141,7 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 		childInstructions: string;
 		childToolObjects: readonly ToolRegistration[];
 		beforeSubmit?: MultiagentExtensionOptions["beforeSubmit"];
+		atSubmit?: MultiagentExtensionOptions["atSubmit"];
 		afterOutcome?: MultiagentExtensionOptions["afterOutcome"];
 	} = {
 		mainExtension: undefined as unknown as Extension,
@@ -142,6 +149,7 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 		childInstructions: options.childInstructions,
 		childToolObjects: [textStatsTool, textCheckTool],
 		...(options.beforeSubmit === undefined ? {} : { beforeSubmit: options.beforeSubmit }),
+		...(options.atSubmit === undefined ? {} : { atSubmit: options.atSubmit }),
 		...(options.afterOutcome === undefined ? {} : { afterOutcome: options.afterOutcome }),
 	};
 
@@ -192,6 +200,11 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 					return { round: bound.round, childTools: granted.map((tool) => tool.name), error: undefined };
 				}
 				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${taskId} is ${doc.status}; it accepts nothing further.` };
+				// A pending cancellation blocks *new* operations outright: no round is
+				// claimed, nothing is written, no revision budget is consumed. (A
+				// replayed, already-bound operation is handled above and still ends at
+				// the submission gate.)
+				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${taskId} is being cancelled; it accepts no new work.` };
 				if (doc.rounds.length > 0) return { round: 0, childTools: [], error: `task ${taskId} was already delegated; use task_revise or task_review.` };
 				if (doc.activeOpKey !== undefined) {
 					return { round: 0, childTools: [], error: `task ${taskId} round ${doc.activeRound} is already executing under another operation.` };
@@ -257,6 +270,9 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 					return { round: bound.round, childTools: [...doc.childTools], error: undefined };
 				}
 				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}; it accepts nothing further.` };
+				// Same barrier as delegation: a pending cancellation must not let a new
+				// revision claim the next round, advance the ledger or consume budget.
+				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${args.taskId} is being cancelled; it accepts no new work.` };
 				if (doc.status !== "awaiting_review" && doc.status !== "revising") {
 					return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}, not revisable.` };
 				}

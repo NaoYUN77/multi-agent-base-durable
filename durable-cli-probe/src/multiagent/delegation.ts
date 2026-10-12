@@ -50,11 +50,19 @@ export type DelegationHost = {
 	/** The child tools granted for this task, as tool objects (the program's whitelist). */
 	readonly childToolObjects: readonly ToolRegistration[];
 	/**
-	 * Verification barrier, awaited after the round's intent is committed and
-	 * before its submission exists. The cross-process tests kill the process here
-	 * to exercise the "intent committed, submit not yet made" window.
+	 * Verification barrier awaited after the execution-right check and before the
+	 * cancellation gate. Tests park a round here to observe the pre-gate window.
 	 */
 	readonly beforeSubmit?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
+	/**
+	 * Verification barrier awaited after the cancellation gate has passed and
+	 * immediately before `handle.submit` — the window the third/fourth reviews
+	 * pointed at ("gate passed, submit not yet called"). A round parked here has
+	 * already been admitted, so releasing it does submit; the point of the hook is
+	 * to prove that a cancellation still cannot close the task while the round
+	 * holds the execution right, and that nothing new starts after it closes.
+	 */
+	readonly atSubmit?: (info: { readonly taskId: string; readonly round: number; readonly requestId: string }) => void | Promise<void>;
 	/**
 	 * Verification barrier, awaited after the round's outcome is committed and
 	 * before the tool returns. Kills here exercise "result committed, parent tool
@@ -268,9 +276,8 @@ export async function runDelegationRound(
 		};
 	}
 
-	// The verification barrier sits *inside* the admission window: the gate above
-	// has already passed and the submission below has not been made. The recovery
-	// and admission tests park the round here.
+	// Pre-gate barrier: the execution-right check above has passed and the
+	// cancellation gate below has not run yet.
 	if (host.beforeSubmit !== undefined) await host.beforeSubmit({ taskId: input.taskId, round: input.round, requestId });
 
 	// Second admission, immediately before the submission: a cancel that landed
@@ -288,6 +295,10 @@ export async function runDelegationRound(
 			error: blockedLate,
 		};
 	}
+
+	// Post-gate barrier: the cancellation gate has passed and the submission is
+	// about to be made. This is the exact window the reviews asked to cover.
+	if (host.atSubmit !== undefined) await host.atSubmit({ taskId: input.taskId, round: input.round, requestId });
 
 	const handle = await api.conversation(childId, callContext);
 	if (handle === undefined) {

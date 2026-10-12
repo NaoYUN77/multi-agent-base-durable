@@ -10,7 +10,8 @@
 | 二轮 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | 不通过（5 项：并发预留、取消屏障、已结算重放、delta 解码、pre-submit 边界） | 见 §10 |
 | 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11（实现提交 `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`） |
 | 四轮 | `29839b75ecc5`（`bb544b1` + 文档提交） | 不通过（2×P2：准入测试的握手/窗口、AC-10 证据归属） | 见 §12（实现提交 `202005f750b06dd507a52acc86ce3db5621274bb`） |
-| 本轮 | `202005f750b06dd507a52acc86ce3db5621274bb`（实现提交，完整 SHA；其后的文档提交只改报告与 spec） | 待审阅 | — |
+| 五轮 | `ca0748d77305`（`202005f` + 文档提交） | 不通过（1×P1 + 1×P2：为可观察性删弱了生产准入、屏障仍非真正窗口） | 见 §13 |
+| 本轮 | 见 PR 正文（本轮实现提交，完整 SHA；其后的文档提交只改报告与 spec） | 待审阅 | — |
 
 **结论口径修正**：二轮审阅指出上一版报告把 AC-05/06/07 写成"通过"不成立——当时的实现里并发调用可同时占用同一轮次、取消没有持久化屏障、已结算轮次的原操作重放会再次执行 outcome 逻辑、`revising-intent` kill 点实际发生在 submission 之后、inspect 的 delta 解释会读错合法 op。本报告据实修订：**上一轮的 AC-05/06/07 结论作废**，本轮按新实现与新测试重新给出结论（§3）。
 
@@ -21,7 +22,7 @@
 | 被测 commit | `202005f750b06dd507a52acc86ce3db5621274bb`（本轮实现提交，完整 SHA） |
 | 底座（本地 Pi checkout） | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`（未改动） |
 | 环境 | Windows，Node `v22.22.2` |
-| 自动化检查 | `npm run typecheck` 退出 0；`npm test` **125 passed**（87 既有 + 38 新增，13 个文件） |
+| 自动化检查 | `npm run typecheck` 退出 0；`npm test` **127 passed**（87 既有 + 40 新增，13 个文件） |
 
 ## 2. Ownership 实测（Issue 标注的未知边界）
 
@@ -61,17 +62,28 @@
 | 7 | 省略 `taskId` 的委派 + 中断 | 派生 ID（`task-<toolTaskId>`）在重启前后一致；1 文档、1 子会话、该 ID 的 round 1 submission 恰 1 条 |
 | 8 | **返工的 `beforeSubmit` 屏障**（round 2 意图已落账、其 submission 尚未发生） | kill 时 round 2 的 submission **0 条**、status=revising、round 2 记录含 feedback 与 opKey；重启后 round 2 submission **恰 1 条**、**无 round 3**、round 1 证据与审阅记录不变 |
 
-## 4b. 取消与提交准入（三轮引入，四轮改为可观察的握手）
+## 4b. 取消与提交准入（五轮定稿）
 
-设计：**取消意图只在唯一的准入闸口被检查**——Stage 2 的第二次准入，紧邻 `handle.submit`。更早的阶段（claim、Stage 0、Stage 1、第一次准入）只查**执行权**与**终态**，因此持有执行权的轮次总能走到该闸口（可被观察），而"取消已完成"必然意味着任务已终态，所有路径都会拒绝。`beforeSubmit` 验证屏障就位于闸口**之前**，覆盖"闸口已过、提交未发"的窗口。
+**生产侧的两层规则**：
 
-`multiagent-cancel-admission.test.ts`（2 项，首轮与返工各一，含显式 enter/release 握手）：
+1. **取消意图阻止新工作**：`task_delegate` / `task_revise` 在**新 claim 之前**（已绑定重放分支之后）检查 `cancelRequested`，命中即拒绝且不写任何东西（不新增轮次/绑定、不推进 `currentRound`/`version`、不消耗返工额度）；Stage 0/1 与第一次准入保留**执行权**与**终态**守卫；`task_review` 也拒绝取消期间的审阅。
+2. **唯一的提交闸口**：第二次准入（紧邻 `handle.submit`）检查取消意图与执行权；被拒时交回执行权。配合执行权协议（取消完成阶段只在无轮次持权且子会话无活跃任务时才落终态），不存在"取消终态之后仍有新提交或活跃子工作"。
 
-1. 同一条消息里发出委派与取消（并行工具调用；同一会话的 inbox 会把第二个提交排队，因此这是唯一能让取消与 park 中的轮次并发的配置）；
-2. 轮次到达屏障后**握手信号 `entered` 触发**，证明它确实处于准入窗口内（而不是"没进入 hook 也照样通过"）；
-3. 在 park 期间断言：执行权仍被该轮持有（`activeOpKey` 匹配 `delegate:`/`revise:`）、`cancelRequested` 已记录、状态非终态、该轮 submission **0 条**，且取消的结果文本为 **`cancel pending`**（工具返回与终态明确区分）；
-4. 释放屏障 → 该轮到达第二次准入，看到意图后拒绝提交（并交回执行权）；
-5. 再次调用取消 → 终态 `cancelled`；断言该轮 submission 始终为 0、子会话无活跃任务；返工用例另断言 round 1 的 submission 数、证据数与审阅记录逐项不变。
+**两个验证屏障**（都只由测试注入，不改变业务行为）：
+
+| 屏障 | 位置 | 用途 |
+|---|---|---|
+| `beforeSubmit` | 执行权检查之后、**取消闸口之前** | 覆盖"闸口尚未运行"的窗口 |
+| `atSubmit` | **取消闸口之后**、`handle.submit` 之前 | 覆盖评审所指的真正间隙（"闸口已过、提交未调用"） |
+
+`multiagent-cancel-admission.test.ts`（4 项）：
+
+1. **前 gate（首轮）**：轮次 park 在 `beforeSubmit`（握手 `entered` 证明进入）；取消返回 `cancel pending`、状态非终态、执行权被持有、submission 0 条；释放后该轮在闸口被拒 → **始终 0 条**；重试取消 → `cancelled`、子会话无活跃任务。
+2. **前 gate（返工）**：同上，并断言 round 1 的 submission 数、证据数与审阅记录不变。
+3. **真正窗口（post-gate）**：测试用**受控 wrapper 延迟取消的启动**（生产检查不动），让轮次先 park 在 `atSubmit`（闸口已过、尚未提交）并断言此时**意图尚未记录**；随后启动取消 → 仍 `cancel pending`、非终态、0 条；释放后该轮**确实提交**，其提交在取消终态前被中止/结算；重试取消 → `cancelled`，并断言**终态之后 submission 数不再增加**、子会话无活跃任务。
+4. **取消期间拒绝新工作**：意图已落账且任务非终态时发起新的 `task_revise` → 被拒（`accepts no new work`），且 `rounds`/`operations`/`currentRound`/`version` 全部不变、`activeOpKey` 为空。
+
+为什么仍用单进程、同一条消息：同一会话的 inbox 会把新提交排队到当前运行结束，因此"取消与 park 中的轮次并发"只能出现在同一条消息的并行调用里；而"先进入窗口、再启动取消"由测试侧的 wrapper 排序（而非删弱生产检查）。跨进程只适合"前一进程已死"的恢复语义（§4 的八个边界）。
 
 ## 5. 只读检查（inspect）
 
@@ -180,3 +192,9 @@ operation review:40:call_00_25rRWjS1RvZs4zsWsXN10026 kind=review task=40 call=�
 1. **P2 准入测试没有握手、屏障不在闸口之后** → ① 把取消意图的检查**收敛到唯一的准入闸口**（Stage 2 第二次准入，紧邻 `handle.submit`）：claim、Stage 0、Stage 1、第一次准入只查执行权与终态，因此持有执行权的轮次**总能到达该闸口**，不会因为并发的取消而在更早阶段被拒绝（这也修掉了"测试可能只证明取消先到"的漏洞）；② `beforeSubmit` 屏障移到闸口**之前**，正好覆盖"闸口已过、提交未发"的窗口；③ 测试改为**显式 enter/release 握手**：先等 `entered` 触发（证明真的进入了窗口），在 park 期间断言执行权被持有、意图已记录、状态非终态、该轮 submission 为 0，并断言取消的返回是 **`cancel pending`**（不再把工具返回与取消终态混称完成），随后释放并断言**仍然 0 条 submission**，最后重试取消得到终态 `cancelled`；首轮与返工各一项。④ 每个拒绝出口（Stage 1、两次准入、failRound、abort、reservation 缺失）都交回执行权，保证 pending 的取消最终能关闭。
 2. **P2 AC-10 证据归属** → §6 改为**逐次分列**：每次运行的被测 SHA、绝对 DB、requestId、子工具白名单、工具结果 entry/call、delegate op、review op 全部独立记录；smoke4/5/6 的 call/op 标识互不相同（已核对）；smoke1 的误验收保留为历史失败记录。本轮以 **smoke6**（在 `202005f…` 上运行）作为 AC-10 证据。
 3. **计数同步** → 全文改为 125 tests / 13 文件、八个恢复边界、四次成功运行；历史条目注明其所属提交。
+
+## 13. 五轮审阅的逐条回应（本轮实现）
+
+1. **P1 为可观察性删弱了生产准入** → **恢复** `task_delegate` / `task_revise` 在**新 claim 之前**的 `cancelRequested` 拒绝（位置在已绑定重放分支之后；重放路径不变），并保留 Stage 0/1 的执行权与终态守卫。取消意图因此重新成为"新工作的屏障"：取消期间新操作不 claim、不写绑定/轮次、不推进 `currentRound`/`version`、不消耗返工额度。**不再靠删弱生产检查来让测试进入窗口**：改为测试侧**受控 wrapper 延迟取消的启动**，让轮次先 park 到窗口内再开始取消。新增确定性测试：意图已落账 → 新 `task_revise` 被拒且 `rounds`/`operations`/`currentRound`/`version` 全部不变。
+2. **P2 屏障仍非真正窗口** → 新增第二个屏障 **`atSubmit`**，位于**取消闸口之后**、`handle.submit` 之前，正是评审所指的间隙。新测试在该窗口 park（并断言此时意图尚未记录），随后启动取消 → 仍 `cancel pending`；释放后该轮**确实提交**，但取消终态之前其提交被中止/结算，且**终态之后 submission 数不再增加**、子会话无活跃任务——即评审要求的"取消终态之后没有新提交或活跃子工作"。原有前 gate 用例保留。
+3. **文档口径** → 不再声称"屏障在取消闸口之前"却"覆盖闸口已过"：报告与 PR 明确区分两个屏障与各自的覆盖窗口（§4b 表格）。

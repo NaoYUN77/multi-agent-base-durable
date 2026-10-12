@@ -1,9 +1,16 @@
 // TASK-003 test/multiagent-cancel-admission.test.ts
 //
-// The fourth review's P2: the admission test must *prove* the round is inside
-// the admission window (the gate has passed, the submission has not been made),
-// observe `cancel pending` while the execution right is held, and then prove
-// that releasing the round still produces no submission.
+// The fourth review's P2 (handshake) and the fifth review's P1/P2:
+//   * a round parked at `beforeSubmit` is *before* the cancellation gate: the
+//     handshake proves it, the cancel stays pending while the right is held, and
+//     releasing it makes the round refuse at the gate — no submission at all;
+//   * a round parked at `atSubmit` is *after* the cancellation gate: releasing it
+//     does submit, so the property asserted there is the one the fifth review
+//     asked for — the cancel still stays pending while the right is held, and
+//     once it reaches `cancelled` there is no new submission and no live work;
+//   * a pending cancellation blocks *new* operations outright: a fresh
+//     delegate/revise is refused before it claims a round, with rounds,
+//     operations, currentRound and version unchanged.
 //
 // Why one process and one message: a conversation processes one run at a time —
 // a second submission to the same conversation is queued in the inbox until the
@@ -28,6 +35,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
 import { ChildTools } from "../src/multiagent/child-tools.ts";
+import type { Extension } from "@earendil-works/pi-durable";
 import { createMultiagentExtension } from "../src/multiagent/tools.ts";
 import { TaskLedgerDoc } from "../src/multiagent/ledger.ts";
 
@@ -53,6 +61,8 @@ function flatten(messages: readonly Message[]): string {
 
 /** Which round the barrier parks (undefined: park nothing). */
 let parkRound: number | undefined;
+/** Which window the barrier parks in. */
+let parkWindow: "pre-gate" | "post-gate" = "pre-gate";
 
 const router: FauxResponseFactory = (request) => {
 	const flat = flatten(request.messages);
@@ -107,6 +117,12 @@ const router: FauxResponseFactory = (request) => {
 			{ stopReason: "toolUse" },
 		);
 	}
+	if (input.includes("REVISE-AGAIN")) {
+		return fauxAssistantMessage(
+			[fauxToolCall("task_revise", { taskId: "task-adm", round: 1, task: `ROUND-TWO ${MAT}`, feedback: "again" }, { id: "adm-revise-again" })],
+			{ stopReason: "toolUse" },
+		);
+	}
 	if (input.includes("CLOSE")) {
 		return fauxAssistantMessage([fauxToolCall("task_cancel", { taskId: "task-adm", reason: "driver close" }, { id: "adm-close" })], {
 			stopReason: "toolUse",
@@ -124,13 +140,17 @@ describe("TASK-003 cancellation admission control", () => {
 	let runtime: ProbeRuntime | undefined;
 	let gate: { promise: Promise<void>; resolve: () => void };
 	let entered: { promise: Promise<void>; resolve: () => void };
+	/** Releases the cancellation tool's start (see `delayCancel`). */
+	let cancelGate: { promise: Promise<void>; resolve: () => void };
 
 	beforeEach(async () => {
 		directory = await mkdtemp(join(tmpdir(), "multiagent-admission-"));
 		databasePath = join(directory, "admission.sqlite");
 		parkRound = undefined;
+		parkWindow = "pre-gate";
 		gate = Promise.withResolvers<void>();
 		entered = Promise.withResolvers<void>();
+		cancelGate = Promise.withResolvers<void>();
 	});
 
 	afterEach(async () => {
@@ -139,24 +159,47 @@ describe("TASK-003 cancellation admission control", () => {
 		await rm(directory, { recursive: true, force: true });
 	});
 
+	/**
+	 * Test-side wrapper: hold the cancel tool's execution until the test releases
+	 * it. Production checks are untouched; only the *start* of the cancellation is
+	 * sequenced, so a round can be parked in the post-gate window before the
+	 * cancellation begins (tool calls in one message otherwise start together).
+	 */
+	function delayCancel(extension: Extension): Extension {
+		return {
+			...extension,
+			tools: (extension.tools ?? []).map((tool) =>
+				tool.name === "task_cancel"
+					? {
+							...tool,
+							execute: async (args: never, api: never, ctx: never) => {
+								await cancelGate.promise;
+								return tool.execute(args, api, ctx);
+							},
+						}
+					: tool,
+			),
+		} as Extension;
+	}
+
 	async function open(): Promise<{ harness: ProbeRuntime["harness"]; root: Awaited<ReturnType<typeof openRoot>> }> {
+		// Park the round under test at the requested window and announce that it is
+		// there: `beforeSubmit` is the pre-gate window, `atSubmit` the post-gate one.
+		const park = async (info: { round: number }): Promise<void> => {
+			if (info.round !== parkRound) return;
+			entered.resolve();
+			await gate.promise;
+		};
+		const extension = createMultiagentExtension({
+			model: { provider: "faux", modelId: "faux-1" },
+			childInstructions: "You are the child.",
+			...(parkWindow === "pre-gate" ? { beforeSubmit: park } : { atSubmit: park }),
+		});
 		runtime = await openProbe({
 			databasePath,
 			provider: "faux",
 			fauxRouter: router,
-			extensions: [
-				createMultiagentExtension({
-					model: { provider: "faux", modelId: "faux-1" },
-					childInstructions: "You are the child.",
-					// Park exactly the round under test *inside* the admission window and
-					// announce that it is there.
-					beforeSubmit: async (info) => {
-						if (info.round !== parkRound) return;
-						entered.resolve();
-						await gate.promise;
-					},
-				}),
-			],
+			extensions: [delayCancel(extension)],
 			registryExtensions: [ChildTools],
 		});
 		const root = await openRoot(runtime);
@@ -201,6 +244,7 @@ describe("TASK-003 cancellation admission control", () => {
 
 	it("keeps the cancel pending while the initial round is inside the admission window (AC-06)", async () => {
 		parkRound = 1;
+		cancelGate.resolve();
 		const { harness, root } = await open();
 
 		// One message, two parallel calls. The round parks inside the window and
@@ -244,6 +288,7 @@ describe("TASK-003 cancellation admission control", () => {
 
 	it("keeps the cancel pending while a revision is inside the admission window (AC-06)", async () => {
 		parkRound = 2;
+		cancelGate.resolve();
 		const { harness, root } = await open();
 
 		// Round 1 completes and is rejected, so the task waits at `revising`.
@@ -288,5 +333,86 @@ describe("TASK-003 cancellation admission control", () => {
 		expect(after.rounds[0]!.evidence.length).toBe(round1Evidence);
 		expect(after.reviews).toEqual(round1Reviews);
 		expect(after.rounds[1]!.settledAt).toBeUndefined();
+	}, 60000);
+	it("keeps the cancel pending in the post-gate window and starts nothing after it closes (AC-06)", async () => {
+		parkWindow = "post-gate";
+		parkRound = 1;
+		const { harness, root } = await open();
+
+		// The round parks *after* the cancellation gate, and the cancellation has
+		// not started yet: the window is covered without racing the gate.
+		const turn = root.submit({ type: "input", content: `DELEGATE-AND-CANCEL ${MAIN_SENTINEL}` }, context);
+		await entered.promise;
+		const parked = await ledgerOf(harness, root.id);
+		expect(parked.activeOpKey).toMatch(/^delegate:/);
+		expect(parked.status).toBe("running");
+		expect(roundSubmissions(1)).toBe(0);
+		expect(parked.cancelRequested).toBeUndefined();
+
+		// Now start the cancellation: while the round holds the right and is past
+		// the gate, the cancel must stay pending and must not close the task.
+		cancelGate.resolve();
+		await poll(async () => (await ledgerOf(harness, root.id)).cancelRequested !== undefined, "the cancellation intent");
+		await poll(async () => (await transcript(harness, root.id)).includes("cancel pending"), "the cancel to report pending");
+		const whilePending = await ledgerOf(harness, root.id);
+		expect(whilePending.status).not.toBe("cancelled");
+		expect(roundSubmissions(1)).toBe(0);
+
+		// Release: the round is already admitted, so it proceeds to submit; the
+		// cancel's abort stops it. The cancel itself must not have closed the task
+		// while the right was held.
+		gate.resolve();
+		await (await turn).wait(context);
+		await harness.waitForIdle(context);
+		const beforeClose = roundSubmissions(1);
+		expect(beforeClose).toBeLessThanOrEqual(1);
+
+		// Retry the cancel: it closes only now, and nothing new starts after that.
+		await (await root.submit({ type: "input", content: `CLOSE ${MAIN_SENTINEL}` }, context)).wait(context);
+		await harness.waitForIdle(context);
+		const after = await ledgerOf(harness, root.id);
+		expect(after.status).toBe("cancelled");
+		expect(roundSubmissions(1)).toBe(beforeClose);
+		const childId = after.childConversationId;
+		if (childId !== undefined) {
+			const tasks = await root.commit((tx) => tx.scanTasks({ conversationId: childId }, 200), context);
+			expect(tasks.items.filter((task) => task.state.status !== "terminal")).toEqual([]);
+		}
+	}, 60000);
+
+	it("refuses new work while a cancellation is pending, changing nothing (AC-05/06)", async () => {
+		parkRound = 1;
+		const { harness, root } = await open();
+
+		// Park the round (pre-gate), start the cancellation while it is parked, then
+		// release it: it refuses at the gate, so the task stays non-terminal with the
+		// intent recorded and no cancellation running any more.
+		const turn = root.submit({ type: "input", content: `DELEGATE-AND-CANCEL ${MAIN_SENTINEL}` }, context);
+		await entered.promise;
+		cancelGate.resolve();
+		await poll(async () => (await ledgerOf(harness, root.id)).cancelRequested !== undefined, "the cancellation intent");
+		await poll(async () => (await transcript(harness, root.id)).includes("cancel pending"), "the cancel to report pending");
+		gate.resolve();
+		await (await turn).wait(context);
+		await harness.waitForIdle(context);
+		const before = await ledgerOf(harness, root.id);
+		expect(before.status).not.toBe("cancelled");
+		expect(before.cancelRequested).toBeDefined();
+
+		// A new revision must be refused before it claims anything.
+		await (await root.submit({ type: "input", content: `REVISE-AGAIN ${MAIN_SENTINEL}` }, context)).wait(context);
+		await harness.waitForIdle(context);
+		const after = await ledgerOf(harness, root.id);
+		expect(after.rounds).toHaveLength(before.rounds.length);
+		expect(after.operations).toHaveLength(before.operations.length);
+		expect(after.currentRound).toBe(before.currentRound);
+		expect(after.version).toBe(before.version);
+		expect(after.activeOpKey).toBeUndefined();
+		expect(await transcript(harness, root.id)).toContain("accepts no new work");
+
+		// Clean up: the retried cancel closes the task.
+		await (await root.submit({ type: "input", content: `CLOSE ${MAIN_SENTINEL}` }, context)).wait(context);
+		await harness.waitForIdle(context);
+		expect((await ledgerOf(harness, root.id)).status).toBe("cancelled");
 	}, 60000);
 });

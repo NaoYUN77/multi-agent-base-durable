@@ -168,7 +168,9 @@ const runtime = await openProbe({
 			model: { provider: "faux", modelId: "faux-1" },
 			childInstructions: "You are the child agent of the recovery check.",
 			// The verification barriers: kill exactly at the named window, once.
-			beforeSubmit: async () => {
+			// The pre-submit barriers park/kill at the true window: after the
+			// cancellation gate, immediately before the submission.
+			atSubmit: async () => {
 				if (killWhen === "pre-submit" && !barrierFired) {
 					barrierFired = true;
 					killNow();
