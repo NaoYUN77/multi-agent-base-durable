@@ -20,6 +20,9 @@
 //              nothing (the ledger version must not move).
 // Boundary 7 — the delegation omitted `taskId`: the derived business id must
 //              survive the interruption unchanged.
+// Boundary 8 — a *revision* round's intent is committed and its submission does
+//              not exist yet (the revision's pre-submit barrier): the replay
+//              makes exactly one submission for round 2, never a round 3.
 
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -281,5 +284,43 @@ describe("TASK-003 cross-process recovery", () => {
 		expect(after?.status).toBe("awaiting_review");
 		expect(after?.rounds).toHaveLength(1);
 		expect(after?.taskId).toBe(derivedId);
+	}, 90_000);
+	it("makes exactly one round-2 submission after a kill at the revision's pre-submit barrier (boundary 8)", async () => {
+		const databasePath = join(directory, "recover-8.sqlite");
+
+		// Round 1 completes and waits for review.
+		const first = await runRunner(["--db", databasePath, "--request-id", "run-8a", "--input", "DELEGATE"]);
+		expect(first.code).toBe(0);
+		const round1 = await readLedgerTask(databasePath);
+		expect(round1?.status).toBe("awaiting_review");
+		expect(round1?.rounds).toHaveLength(1);
+		const round1Evidence = round1?.rounds[0]?.evidence.length;
+		const childBefore = round1?.childConversationId;
+
+		// The revision's intent is committed; its submission does not exist yet.
+		const killed = await runRunner(["--db", databasePath, "--request-id", "run-8b", "--input", "REVISE", "--kill-when", "pre-submit"]);
+		expect(killed.code).not.toBe(0);
+		const mid = await readLedgerTask(databasePath);
+		expect(mid?.status).toBe("revising");
+		expect(mid?.rounds).toHaveLength(2);
+		expect(mid?.rounds[1]?.kind).toBe("revision");
+		expect(mid?.rounds[1]?.feedback).toBe("again");
+		expect(mid?.rounds[1]?.opKey).toMatch(/^revise:/);
+		expect(mid?.rounds[1]?.settledAt).toBeUndefined();
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:2"%'])).toHaveLength(0);
+
+		// Restart: exactly one submission for round 2, and no round 3.
+		const resumed = await runRunner(["--db", databasePath, "--request-id", "run-8c", "--input", "RESUME"]);
+		expect(resumed.code).toBe(0);
+		const after = await readLedgerTask(databasePath);
+		expect(after?.status).toBe("awaiting_review");
+		expect(after?.rounds).toHaveLength(2);
+		expect(after?.childConversationId).toBe(childBefore);
+		expect(after?.rounds[1]?.settledAt).toBeDefined();
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:2"%'])).toHaveLength(1);
+		expect(readRows(databasePath, "SELECT id FROM submissions WHERE request_id LIKE ?", ['%"multiagent-round:task-smoke:3"%'])).toHaveLength(0);
+		// Round 1's evidence and the review records are untouched.
+		expect(after?.rounds[0]?.evidence.length).toBe(round1Evidence);
+		expect(after?.reviews).toEqual(round1?.reviews);
 	}, 90_000);
 });

@@ -52,7 +52,8 @@ running ──► awaiting_review ──► accepted           （终态）
 4. **证据只来自库**：程序从子会话 Entry/Task/Submission 提取（含 `byTaskId`、`toolCallId`、`data.diagnostics`），参数摘要按定义脱敏（长字符串 → `<string:N>`），分页必须完整否则显式失败；最终答案取 `settled.answer`，空答案即失败。模型从不自述 ID 或成功状态。
 5. **台账事件显式持久化**在 Document 内（`events`/`reviews`/`operations`），不依赖默认 revision 策略。
 6. **只读取证不走 Harness**：`multiagent:inspect` 用裸 SQLite `readOnly` 连接 + **Chord 公开 `apply`** 重建文档值，不迁移、不重整 running 任务、不创建 root；遇到非法 op 显式失败。
-7. **取消是持久化屏障**：`task_cancel` 先写取消意图（此后不再启动新轮次、不再提交、`failRound` 不写 failed），再 abort 子会话，再确认子会话无活跃任务，最后落 `cancelled`；无法确认空闲时如实报告且保留意图。
+7. **取消是持久化屏障 + 与提交准入共享执行权**：`task_cancel` 先写取消意图（此后不再启动新轮次、不再提交、`failRound` 让位并交回执行权），再 abort 子会话，**只在没有任何轮次持有执行权且子会话无活跃任务时**才落 `cancelled`；否则保留意图并报告 `cancel pending`。执行权从 claim 一直持有到该轮 outcome/fail commit，持有者任务已 terminal 时视为陈旧并回收。
+8. **审阅与返工都必须指名目标轮次**：`task_review.round`、`task_revise.round` 均为必填，且在 claim/写入的同一个 commit 内与 `currentRound` 核对；陈旧请求被拒且不改动任何记录（不消耗返工额度）。
 
 ## 验收对照（AC-01 ~ AC-10）
 
@@ -62,11 +63,11 @@ running ──► awaiting_review ──► accepted           （终态）
 | 02 | provider 实际请求捕获（faux `FauxResponseFactory`）：主哨兵不进子请求、分发材料可见 |
 | 03 | `conversation.agent()` 解析断言主/子工具集；未授权已注册工具与未知工具均被拒并留 error 证据 |
 | 04 | ledger 证据与真实 entry 逐字段比对；轮次边界；截断标识；`task_evidence` 全文取回与三类越权拒绝 |
-| 05 | 返工闭环 + 幂等 + 非法转换 + `revision_limit` → failed + **并发委派/并发返工各只有一个赢家** + 必填轮次的陈旧审阅拒绝 |
-| 06 | 终态后执行拒绝、历史可读、新任务新上下文、**取消屏障（含返工在途并发取消与全局中止）** |
-| 07 | 真实子进程 SIGKILL **七个边界**（子会话建立/提交在途、awaiting_review 未审阅、返工意图已落账但提交未完成、本地安全工具执行中、**pre-submit 屏障**、**post-outcome 收据重放**、**省略 taskId 的派生 ID 稳定性**）+ inspect 前后字节与逻辑记录一致 |
+| 05 | 返工闭环 + 幂等 + 非法转换 + `revision_limit` → failed + **并发委派/并发返工各只有一个赢家** + **审阅与返工都必填目标轮次、陈旧请求被拒且不改动记录** |
+| 06 | 终态后执行拒绝、历史可读、新任务新上下文、**取消屏障（含返工在途并发取消、全局中止、以及"取消完成后被 park 的轮次永不提交"的准入测试）** |
+| 07 | 真实子进程 SIGKILL **八个边界**（子会话建立/提交在途、awaiting_review 未审阅、返工意图已落账但提交在途、本地安全工具执行中、首轮 **pre-submit 屏障**、**返工 pre-submit 屏障**、**post-outcome 收据重放**、**省略 taskId 的派生 ID 稳定性**）+ inspect 前后字节与逻辑记录一致 |
 | 08 | 主/子真实压缩（`conversation.compact`）：有效上下文改变、旧 Entry 仍可读、台账/证据仍准确 |
-| 09 | `npm run typecheck` + `npm test`（121 passed，含 87 既有）+ 改动范围核对 |
+| 09 | `npm run typecheck` + `npm test`（125 passed，含 87 既有）+ 改动范围核对 |
 | 10 | 真实 DeepSeek 主子同模型闭环一次成功，且 CLI 的程序侧验收校验通过（见验证报告 §6） |
 
 ## 交付命令

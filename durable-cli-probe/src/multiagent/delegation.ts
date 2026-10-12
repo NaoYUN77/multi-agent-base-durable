@@ -142,12 +142,27 @@ export async function runDelegationRound(
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
 		const settled = doc.rounds.find((round) => round.requestId === requestId && round.settledAt !== undefined);
 		if (settled !== undefined) return { receipt: settled, child: doc.childConversationId } as const;
-		if (doc.cancelRequested !== undefined) return { error: `task ${input.taskId} is being cancelled` } as const;
+		if (doc.cancelRequested !== undefined) {
+			releaseRound(doc, input.opKey);
+			return { error: `task ${input.taskId} is being cancelled` } as const;
+		}
 		if (doc.status === "failed" || doc.status === "accepted" || doc.status === "cancelled") {
 			return { error: `task ${input.taskId} is ${doc.status}` } as const;
 		}
-		if (doc.activeOpKey !== input.opKey) {
+		if (doc.activeOpKey !== undefined && doc.activeOpKey !== input.opKey) {
 			return { error: `task ${input.taskId} round ${input.round} is held by another operation` } as const;
+		}
+		if (doc.activeOpKey === undefined) {
+			// The right was released (an abandoned attempt). This operation still
+			// owns the round, so it re-takes the right; a released right never means
+			// "someone else may run this round".
+			const own = doc.rounds.find((round) => round.requestId === requestId);
+			if (own === undefined || own.opKey !== input.opKey) {
+				return { error: `task ${input.taskId} round ${input.round} is not this operation's round` } as const;
+			}
+			doc.activeOpKey = input.opKey;
+			doc.activeRound = input.round;
+			doc.activeToolTaskId = String(api.taskId);
 		}
 		return { ok: true } as const;
 	}, callContext);
@@ -165,27 +180,44 @@ export async function runDelegationRound(
 	}
 
 	// ── Stage 1: child conversation, created once and reused forever ────────
-	const childId = await api.commit(async (tx) => {
-		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
-		if (doc.mainConversationId === undefined) doc.mainConversationId = api.conversationId;
-		if (doc.createdAt === 0) doc.createdAt = Date.now();
-		if (doc.childConversationId !== undefined) return doc.childConversationId;
-		const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
-		const record = existing ?? (await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } }));
-		// The child starts as a copy of the main agent, so the management
-		// extension is removed and the child-side one is added by hand: the
-		// delegated tool must resolve, and nothing else may.
-		await configure(tx, record.id, {
-			extensions: { remove: [host.mainExtension], add: [host.childExtension] },
-			instructions: host.childInstructions,
-			tools: input.childToolObjects,
-			modelTools: input.childToolObjects,
-			model: input.model,
-		});
-		doc.childConversationId = record.id;
-		doc.childTools = input.childToolObjects.map((tool) => tool.name);
-		return record.id;
-	}, callContext);
+	// The same gate as Stage 0 applies here: a cancel that landed between the two
+	// commits must not be followed by a freshly created child conversation.
+	let childId: ConversationId;
+	try {
+		childId = await api.commit(async (tx) => {
+			const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
+			if (doc.cancelRequested !== undefined) throw new Error(`task ${input.taskId} is being cancelled`);
+			if (doc.activeOpKey !== input.opKey) throw new Error(`task ${input.taskId} round ${input.round} is held by another operation`);
+			if (doc.mainConversationId === undefined) doc.mainConversationId = api.conversationId;
+			if (doc.createdAt === 0) doc.createdAt = Date.now();
+			if (doc.childConversationId !== undefined) return doc.childConversationId;
+			const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+			const record = existing ?? (await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } }));
+			// The child starts as a copy of the main agent, so the management
+			// extension is removed and the child-side one is added by hand: the
+			// delegated tool must resolve, and nothing else may.
+			await configure(tx, record.id, {
+				extensions: { remove: [host.mainExtension], add: [host.childExtension] },
+				instructions: host.childInstructions,
+				tools: input.childToolObjects,
+				modelTools: input.childToolObjects,
+				model: input.model,
+			});
+			doc.childConversationId = record.id;
+			doc.childTools = input.childToolObjects.map((tool) => tool.name);
+			return record.id;
+		}, callContext);
+	} catch (error) {
+		return {
+			ok: false,
+			childConversationId: undefined,
+			submissionId: undefined,
+			answerText: undefined,
+			answerEntryId: undefined,
+			extraction: undefined,
+			error: `round ${input.round} stopped before the child conversation: ${(error as Error).message}`,
+		};
+	}
 
 	// The round record itself was written by the claim commit; if it is missing,
 	// the reservation is inconsistent and nothing may be submitted.
@@ -197,7 +229,19 @@ export async function runDelegationRound(
 		callContext,
 	);
 	if (!recorded) {
-		return await failRound(api, callContext, input, "the round's reservation is missing; nothing was submitted");
+		await api.commit(async (tx) => {
+			const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
+			releaseRound(doc, input.opKey);
+		}, callContext);
+		return {
+			ok: false,
+			childConversationId: childId,
+			submissionId: undefined,
+			answerText: undefined,
+			answerEntryId: undefined,
+			extraction: undefined,
+			error: "the round's reservation is missing; nothing was submitted",
+		};
 	}
 
 	// ── Stage 2: the verification barrier, then the submission ──────────────
@@ -206,7 +250,13 @@ export async function runDelegationRound(
 	// A cancel that arrived after the reservation must stop the submission.
 	const blocked = await api.commit(async (tx) => {
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
-		if (doc.cancelRequested !== undefined) return `task ${input.taskId} is being cancelled`;
+		if (doc.cancelRequested !== undefined) {
+			// Abandon the round and hand the execution right back: a cancel that is
+			// already pending must be able to close the task without waiting for a
+			// round that will never submit.
+			releaseRound(doc, input.opKey);
+			return `task ${input.taskId} is being cancelled`;
+		}
 		if (doc.activeOpKey !== input.opKey) return `task ${input.taskId} round ${input.round} is held by another operation`;
 		return undefined;
 	}, callContext);
@@ -242,6 +292,12 @@ export async function runDelegationRound(
 		// behind the operator's back. The round stays unsettled, the execution
 		// right stays held, and a resume or a cancel decides what happens next.
 		if (settled.status === "unanswered" && settled.reason === "aborted") {
+			// Hand the execution right back: the round is abandoned, a resume may
+			// re-claim it, and a pending cancel must be able to close the task.
+			await api.commit(async (tx) => {
+				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
+				releaseRound(doc, input.opKey);
+			}, callContext);
 			return {
 				ok: false,
 				childConversationId: childId,
@@ -278,6 +334,8 @@ export async function runDelegationRound(
 			};
 		}
 		if (doc.cancelRequested !== undefined) {
+			// Abandon the round and hand the right back so the cancel can close.
+			releaseRound(doc, input.opKey);
 			return {
 				ok: false as const,
 				childConversationId: childId,
@@ -352,7 +410,12 @@ async function failRound(api: ToolExecutionApi, callContext: Context, input: Rou
 	const applied = await api.commit(async (tx) => {
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
 		if (doc.status === "failed" || doc.status === "accepted" || doc.status === "cancelled") return { applied: false, reason: doc.status };
-		if (doc.cancelRequested !== undefined) return { applied: false, reason: "cancelling" };
+		if (doc.cancelRequested !== undefined) {
+			// Yield to the cancel: no failure write, and the execution right goes
+			// back so the cancel's finish phase can close the task.
+			releaseRound(doc, input.opKey);
+			return { applied: false, reason: "cancelling" };
+		}
 		if (doc.activeOpKey !== input.opKey) return { applied: false, reason: "right-lost" };
 		releaseRound(doc, input.opKey);
 		try {

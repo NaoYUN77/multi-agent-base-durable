@@ -62,7 +62,7 @@ const MAIN_USER_INPUT = [
 	TASK_REQUEST,
 	"验收要求：工具证据里 text_stats 的 text 参数必须是完整素材本身，marker 为 \"MATERIAL\"，",
 	`且计数必须等于素材中子串 MATERIAL 的实际出现次数（${EXPECTED_COUNT}）。`,
-	'审阅时 task_review 必须带 round（用委派报告里的轮次号）；证据满足就 accept，不满足就 reject 并说明差在哪里。',
+	'审阅时 task_review 必须带 round；返工时 task_revise 也必须带 round（都取委派报告里的轮次号）。证据满足就 accept，不满足就 reject 并说明差在哪里。',
 	"最后用中文给出结论。",
 ].join("\n");
 

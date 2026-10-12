@@ -29,6 +29,7 @@ import {
 	type EntryId,
 	type Extension,
 	type ModelRef,
+	type TaskId,
 	type ToolExecutionApi,
 	type ToolRegistration,
 	type ToolExecutionResult,
@@ -39,6 +40,7 @@ import { entryText } from "./evidence.ts";
 import {
 	canRevise,
 	claimRound,
+	clearStaleRight,
 	ExecutionRightError,
 	isTerminal,
 	MAX_REVISIONS,
@@ -239,6 +241,7 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 			`Reuses the same sub-agent conversation. At most ${MAX_REVISIONS} revisions per task; a further rejection fails the task.`,
 		parameters: Type.Object({
 			taskId: Type.String({ description: "The business task id from task_delegate." }),
+			round: Type.Number({ description: "The round this feedback is about (from the delegation report). Required." }),
 			task: Type.String({ description: "The revised instruction for the sub-agent." }),
 			feedback: Type.String({ description: "What was wrong and what to change, from your review." }),
 		}),
@@ -260,6 +263,16 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 					return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}, not revisable.` };
 				}
 				if (doc.childConversationId === undefined) return { round: 0, childTools: [], error: `task ${args.taskId} has no sub-agent conversation yet.` };
+				// Stale feedback: a revision must name the round it is about. Feedback
+				// derived from an older result must not be applied to a newer one, and
+				// must not consume a revision.
+				if (args.round !== doc.currentRound) {
+					return {
+						round: 0,
+						childTools: [],
+						error: `stale revision: task ${args.taskId} is at round ${doc.currentRound}, not ${args.round}; re-read with task_status.`,
+					};
+				}
 				if (doc.activeOpKey !== undefined) {
 					return {
 						round: 0,
@@ -453,38 +466,60 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 				if (handle !== undefined) await handle.abort(callContext);
 			}
 
-			const finished = await api.commit(async (tx) => {
-				const doc = await tx.doc(TaskLedgerDoc, api.conversationId, args.taskId, { taskId: args.taskId, model: options.model });
-				if (isTerminal(doc.status)) {
-					// Honest reporting: a task that ended as something else was not
-					// cancelled by this call, and that is not a success.
-					if (doc.status === "cancelled") return { text: `task ${args.taskId} is already cancelled.`, ok: true as const };
-					return { text: `cancel did not apply: task ${args.taskId} already ended as ${doc.status}.`, ok: false as const };
-				}
-				if (doc.cancelRequested === undefined) return { text: `cancel intent for task ${args.taskId} is missing.`, ok: false as const };
-				// No hidden child work: every task of the child conversation must be
-				// terminal before the task itself becomes terminal.
-				if (childConversationId !== undefined) {
-					const live: string[] = [];
-					let cursor: Cursor | undefined;
-					for (let pages = 0; pages < 100; pages++) {
-						const page = await tx.scanTasks({ conversationId: childConversationId }, 100, cursor);
-						for (const task of page.items) {
-							if (task.state.status !== "terminal") live.push(`${task.id}:${task.state.status}`);
+			// The finish phase is the cancellation's admission control: it closes the
+			// task only once no round holds the execution right (a round that holds it
+			// may still submit) and the child has no live work. While either is true
+			// the intent stays and the task stays non-terminal, so no submission can
+			// ever follow a cancelled task.
+			let finished: { text: string; ok: boolean } = { text: "", ok: false };
+			for (let attempt = 0; attempt < 100; attempt++) {
+				finished = await api.commit(async (tx) => {
+					const doc = await tx.doc(TaskLedgerDoc, api.conversationId, args.taskId, { taskId: args.taskId, model: options.model });
+					if (isTerminal(doc.status)) {
+						// Honest reporting: a task that ended as something else was not
+						// cancelled by this call, and that is not a success.
+						if (doc.status === "cancelled") return { text: `task ${args.taskId} is already cancelled.`, ok: true };
+						return { text: `cancel did not apply: task ${args.taskId} already ended as ${doc.status}.`, ok: false };
+					}
+					if (doc.cancelRequested === undefined) return { text: `cancel intent for task ${args.taskId} is missing.`, ok: false };
+					// A round still holding the execution right may submit at any moment.
+					// The right is only meaningful while its holder task runs: an aborted
+					// or finished holder leaves a stale right that must not block the
+					// cancel forever.
+					if (doc.activeOpKey !== undefined) {
+						const holderId = doc.activeToolTaskId === undefined ? Number.NaN : Number(doc.activeToolTaskId);
+						const holder = Number.isFinite(holderId) ? await tx.task(holderId as TaskId) : undefined;
+						if (holder !== undefined && holder.state.status !== "terminal") {
+							return { text: `cancel pending: round ${doc.activeRound} still holds the execution right.`, ok: false, retry: true };
 						}
-						if (page.next === undefined) break;
-						cursor = page.next;
+						clearStaleRight(doc);
 					}
-					if (live.length > 0) {
-						return { text: `cancel incomplete: child work still live (${live.join(", ")}); the intent is kept.`, ok: false as const };
+					// No hidden child work: every task of the child conversation must be
+					// terminal before the task itself becomes terminal.
+					if (childConversationId !== undefined) {
+						const live: string[] = [];
+						let cursor: Cursor | undefined;
+						for (let pages = 0; pages < 100; pages++) {
+							const page = await tx.scanTasks({ conversationId: childConversationId }, 100, cursor);
+							for (const task of page.items) {
+								if (task.state.status !== "terminal") live.push(`${task.id}:${task.state.status}`);
+							}
+							if (page.next === undefined) break;
+							cursor = page.next;
+						}
+						if (live.length > 0) {
+							return { text: `cancel pending: child work still live (${live.join(", ")}).`, ok: false, retry: true };
+						}
 					}
-				}
-				const reason = doc.cancelRequested.reason ?? "cancelled_by_main";
-				recordTransition(doc, "cancelled", Date.now(), { opKey: doc.cancelRequested.opKey, round: doc.currentRound, reason });
-				doc.failure = { reason: "cancelled", detail: reason, at: Date.now() };
-				return { text: `task ${args.taskId} cancelled (${reason}).`, ok: true as const };
-			}, callContext);
-			return { output: [{ type: "text", text: finished.text }], isError: finished.ok === false };
+					const reason = doc.cancelRequested.reason ?? "cancelled_by_main";
+					recordTransition(doc, "cancelled", Date.now(), { opKey: doc.cancelRequested.opKey, round: doc.currentRound, reason });
+					doc.failure = { reason: "cancelled", detail: reason, at: Date.now() };
+					return { text: `task ${args.taskId} cancelled (${reason}).`, ok: true };
+				}, callContext);
+				if (finished.ok || !("retry" in finished) || finished.retry !== true) break;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			return { output: [{ type: "text", text: `${finished.text}${finished.ok ? "" : " The intent is kept; call task_cancel again once the round stops."}` }], isError: finished.ok === false };
 		},
 	});
 

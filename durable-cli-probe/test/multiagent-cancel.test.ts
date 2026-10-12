@@ -90,7 +90,7 @@ const router: FauxResponseFactory = (request) => {
 		// while it is in flight.
 		return fauxAssistantMessage(
 			[
-				fauxToolCall("task_revise", { taskId: "task-cancel", task: `ROUND-TWO count ${MAT}`, feedback: "again" }, { id: "race-revise" }),
+				fauxToolCall("task_revise", { taskId: "task-cancel", round: 1, task: `ROUND-TWO count ${MAT}`, feedback: "again" }, { id: "race-revise" }),
 				fauxToolCall("task_cancel", { taskId: "task-cancel", reason: "changed my mind" }, { id: "race-cancel" }),
 			],
 			{ stopReason: "toolUse" },
@@ -98,7 +98,7 @@ const router: FauxResponseFactory = (request) => {
 	}
 	if (textOf().includes("AFTER-CANCEL-OPS")) {
 		return fauxAssistantMessage(
-			[fauxToolCall("task_revise", { taskId: "task-cancel", task: "again", feedback: "again" }, { id: "after-revise" })],
+			[fauxToolCall("task_revise", { taskId: "task-cancel", round: 1, task: "again", feedback: "again" }, { id: "after-revise" })],
 			{ stopReason: "toolUse" },
 		);
 	}

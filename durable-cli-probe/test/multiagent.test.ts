@@ -133,7 +133,7 @@ const router: FauxResponseFactory = (request) => {
 				[
 					fauxToolCall(
 						"task_revise",
-						{ taskId: "task-alpha", task: `ROUND-TWO count the marker in ${MATERIAL_ALPHA}`, feedback: "report the marker count too" },
+						{ taskId: "task-alpha", round: 1, task: `ROUND-TWO count the marker in ${MATERIAL_ALPHA}`, feedback: "report the marker count too" },
 						{ id: "call-revise-1" },
 					),
 				],
@@ -141,6 +141,9 @@ const router: FauxResponseFactory = (request) => {
 			);
 		}
 		if (toolName === "task_revise" && resultText.includes("task-alpha round 2 settled")) {
+			// Leave the task at `awaiting_review` when the test wants to probe a
+			// stale request against a live round.
+			if (stopAfterRound2) return fauxAssistantMessage([fauxText("MAIN-PAUSED-AT-ROUND-2")]);
 			return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-alpha", decision: "accept", round: 2 }, { id: "call-accept-1" })], {
 				stopReason: "toolUse",
 			});
@@ -170,7 +173,7 @@ const router: FauxResponseFactory = (request) => {
 	// ── The main side: a fresh user turn. ───────────────────────────────────
 	if (textOf().includes("POST-TERMINAL")) {
 		return fauxAssistantMessage(
-			[fauxToolCall("task_revise", { taskId: "task-alpha", task: "do it again", feedback: "again" }, { id: "call-post-terminal" })],
+			[fauxToolCall("task_revise", { taskId: "task-alpha", round: 2, task: "do it again", feedback: "again" }, { id: "call-post-terminal" })],
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -183,6 +186,26 @@ const router: FauxResponseFactory = (request) => {
 	if (textOf().includes("STALE-REVIEW")) {
 		return fauxAssistantMessage(
 			[fauxToolCall("task_review", { taskId: "task-alpha", decision: "accept", round: 1 }, { id: "call-stale" })],
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (textOf().includes("PAUSE-FLOW")) {
+		stopAfterRound2 = true;
+		return fauxAssistantMessage(
+			[
+				fauxToolCall(
+					"task_delegate",
+					{ taskId: "task-alpha", task: `ROUND-ONE count the marker in ${MATERIAL_ALPHA}`, childTools: ["text_stats"] },
+					{ id: "call-delegate-alpha" },
+				),
+			],
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (textOf().includes("STALE-REVISE")) {
+		// Feedback derived from round 1, arriving after round 2 has settled.
+		return fauxAssistantMessage(
+			[fauxToolCall("task_revise", { taskId: "task-alpha", round: 1, task: "old feedback", feedback: "old" }, { id: "call-stale-revise" })],
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -205,8 +228,12 @@ const router: FauxResponseFactory = (request) => {
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
+/** When set, the script stops after round 2 settles instead of accepting it. */
+let stopAfterRound2 = false;
+
 function resetScript(): void {
 	requests.length = 0;
+	stopAfterRound2 = false;
 }
 
 async function openMultiagent(databasePath: string): Promise<ProbeRuntime> {
@@ -589,6 +616,31 @@ describe("TASK-003 multiagent lifecycle", () => {
 		const ledger = await readLedger(runtime.harness, root.id, "task-empty");
 		expect(ledger.status).toBe("failed");
 		expect(ledger.failure?.reason).toBe("empty_answer");
+	}, 20000);
+
+	it("refuses feedback aimed at a round that has already moved on (AC-05)", async () => {
+		runtime = await openMultiagent(databasePath);
+		const root = await openRoot(runtime);
+		runtime.harness.resume();
+		// Run the lifecycle up to round 2 settled, but leave it unreviewed.
+		await (await root.submit({ type: "input", content: `PAUSE-FLOW ${MAIN_SENTINEL}`, requestId: "main-alpha" }, context)).wait(context);
+		await runtime.harness.waitForIdle(context);
+		const before = await readLedger(runtime.harness, root.id, "task-alpha");
+		expect(before.status).toBe("awaiting_review");
+		expect(before.currentRound).toBe(2);
+
+		// A stale revision for round 1 must not consume a revision or move anything.
+		await (await root.submit({ type: "input", content: `STALE-REVISE ${MAIN_SENTINEL}`, requestId: "main-stale-revise" }, context)).wait(context);
+		await runtime.harness.waitForIdle(context);
+		const after = await readLedger(runtime.harness, root.id, "task-alpha");
+		expect(after.rounds).toHaveLength(before.rounds.length);
+		expect(after.operations).toHaveLength(before.operations.length);
+		expect(after.version).toBe(before.version);
+		expect(after.currentRound).toBe(before.currentRound);
+		const entries = await allEntries(root);
+		const text = flattenMessages(entries.flatMap((entry) => entry.model ?? []));
+		if (!text.includes("stale revision")) console.error("STALE-REVISE tail:", text.slice(-700));
+		expect(text).toContain("stale revision");
 	}, 20000);
 
 	it("refuses to cancel a terminal task and keeps its history readable (AC-06)", async () => {

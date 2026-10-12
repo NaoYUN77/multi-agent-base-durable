@@ -157,6 +157,8 @@ export type TaskLedgerState = {
 	activeOpKey?: string;
 	/** The round that right is for. */
 	activeRound?: number;
+	/** The durable tool task that holds the right; a terminal holder means a stale right. */
+	activeToolTaskId?: string;
 	/** Persistent cancellation intent: no new work may start until the cancel completes. */
 	cancelRequested?: CancelRequest;
 	readonly failure?: TaskFailure;
@@ -297,6 +299,7 @@ type ClaimDraft = {
 	readonly taskId: string;
 	activeOpKey?: string;
 	activeRound?: number;
+	activeToolTaskId?: string;
 	currentRound: number;
 	rounds: RoundRecord[];
 	operations: OperationBinding[];
@@ -330,6 +333,7 @@ export function claimRound(
 	if (taken) throw new ExecutionRightError(doc.taskId, `round ${claim.round} is already claimed`);
 	doc.activeOpKey = claim.opKey;
 	doc.activeRound = claim.round;
+	doc.activeToolTaskId = claim.toolTaskId;
 	// The claimed round is the task's current round from the moment it is
 	// reserved: a settled round and a running round are the same round.
 	doc.currentRound = claim.round;
@@ -364,7 +368,15 @@ export function releaseRound(doc: ClaimDraft, opKey: string): boolean {
 	if (doc.activeOpKey !== opKey) return false;
 	doc.activeOpKey = undefined;
 	doc.activeRound = undefined;
+	doc.activeToolTaskId = undefined;
 	return true;
+}
+
+/** Drop a right whose holder task is gone (a stale right from an aborted call). */
+export function clearStaleRight(doc: ClaimDraft): void {
+	doc.activeOpKey = undefined;
+	doc.activeRound = undefined;
+	doc.activeToolTaskId = undefined;
 }
 
 /** Mutable shape of the ledger draft, for the transition helpers. */
@@ -377,6 +389,7 @@ type LedgerDraft = {
 	version: number;
 	activeOpKey?: string;
 	activeRound?: number;
+	activeToolTaskId?: string;
 };
 
 /**
@@ -409,6 +422,7 @@ export function recordTransition(
 	if (to !== "revising") {
 		doc.activeOpKey = undefined;
 		doc.activeRound = undefined;
+		doc.activeToolTaskId = undefined;
 	}
 	if (isTerminal(to)) doc.terminalAt = at;
 }

@@ -78,8 +78,8 @@ const router: FauxResponseFactory = (request) => {
 			// Two revisions for the same round, in one message.
 			return fauxAssistantMessage(
 				[
-					fauxToolCall("task_revise", { taskId: "task-race", task: `ROUND-TWO A ${MAT}`, feedback: "A" }, { id: "race-revise-a" }),
-					fauxToolCall("task_revise", { taskId: "task-race", task: `ROUND-TWO B ${MAT}`, feedback: "B" }, { id: "race-revise-b" }),
+					fauxToolCall("task_revise", { taskId: "task-race", round: 1, task: `ROUND-TWO A ${MAT}`, feedback: "A" }, { id: "race-revise-a" }),
+					fauxToolCall("task_revise", { taskId: "task-race", round: 1, task: `ROUND-TWO B ${MAT}`, feedback: "B" }, { id: "race-revise-b" }),
 				],
 				{ stopReason: "toolUse" },
 			);
@@ -209,7 +209,9 @@ describe("TASK-003 concurrency and global stop", () => {
 		expect(round2.feedback === "A" || round2.feedback === "B").toBe(true);
 		const entries = await root.entries({ order: "ascending" }, 200, undefined, context);
 		const text = flatten(entries.items.flatMap((entry) => entry.model ?? []));
-		expect(text).toContain("already executing under another operation");
+		// The loser is refused program-side: either because the round is already
+		// executing, or because its target round is now stale.
+		expect(/already executing under another operation|stale revision/.test(text)).toBe(true);
 	}, 30000);
 
 	it("closes a fresh task as cancelled when a delegation races a cancellation (AC-06)", async () => {

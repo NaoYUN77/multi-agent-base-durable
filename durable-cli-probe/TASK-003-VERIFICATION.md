@@ -8,7 +8,8 @@
 |---|---|---|---|
 | 首轮 | `c6fcd6be9279176a001c7d1d2545b01bca27a2cd` | 不通过（6×P1 + 2×P2） | 操作绑定、取消、只读 inspect、提示加载、字段补全、测试修正 |
 | 二轮 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | 不通过（5 项：并发预留、取消屏障、已结算重放、delta 解码、pre-submit 边界） | 见 §10 |
-| 本轮 | 见 PR 正文 HEAD | 待审阅 | — |
+| 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11 |
+| 本轮 | `a41f6a6`（实现提交，完整 SHA 见 PR 正文；其上仅有一个清理提交） | 待审阅 | — |
 
 **结论口径修正**：二轮审阅指出上一版报告把 AC-05/06/07 写成"通过"不成立——当时的实现里并发调用可同时占用同一轮次、取消没有持久化屏障、已结算轮次的原操作重放会再次执行 outcome 逻辑、`revising-intent` kill 点实际发生在 submission 之后、inspect 的 delta 解释会读错合法 op。本报告据实修订：**上一轮的 AC-05/06/07 结论作废**，本轮按新实现与新测试重新给出结论（§3）。
 
@@ -19,7 +20,7 @@
 | 被测 commit | 见 PR #10 正文（`workbuddy/issue-9-multiagent-lifecycle` 分支 HEAD，完整 SHA） |
 | 底座（本地 Pi checkout） | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`（未改动） |
 | 环境 | Windows，Node `v22.22.2` |
-| 自动化检查 | `npm run typecheck` 退出 0；`npm test` **121 passed**（87 既有 + 34 新增，12 个文件） |
+| 自动化检查 | `npm run typecheck` 退出 0；`npm test` **125 passed**（87 既有 + 38 新增，13 个文件） |
 
 ## 2. Ownership 实测（Issue 标注的未知边界）
 
@@ -37,9 +38,9 @@
 | AC-02 | 通过 | 子请求按**子指令标记**（`pi.system.sections`）独立识别；子请求不含主哨兵；beta 子请求不含 alpha 材料与子答案 |
 | AC-03 | 通过 | `conversation.agent()`：主 6 工具、子白名单；未授权与未知工具被拒且留 error 证据；`runtime.reports` 为空 |
 | AC-04 | 通过 | 证据与真实 entry 逐字段一致；**捕获的父请求**含 `entry/byTask/call/error/kind`；轮次边界；151 次调用跨页；脱敏摘要；截断全文取回；三类越权拒绝；空答案 → `failed(empty_answer)` |
-| AC-05 | **通过（本轮重证）** | 并发委派/并发返工各只有一个赢家（各留 1 条绑定、1 轮、1 submission）；重复委派拒绝；陈旧审阅拒绝；同消息两次 accept 只落 1 条；`revision_limit` → failed。上一轮结论作废，见 §10-1 |
-| AC-06 | **通过（本轮重证）** | 终态拒绝后续操作；取消先落意图、abort 子会话、确认无活跃子任务再终态；取消期间 `failRound` 不抢写 failed；全局中止不算失败且可随后取消。上一轮结论作废，见 §10-2 |
-| AC-07 | **通过（本轮重证）** | 七个 unclean stop 边界（含 pre-submit 屏障与 post-outcome 收据）；inspect 前后文件字节与逻辑记录一致。上一轮结论作废，见 §10-3 |
+| AC-05 | **通过（三轮重证）** | 并发委派/并发返工各只有一个赢家；重复委派拒绝；**审阅与返工都必填目标轮次**，陈旧请求被拒且不改动轮次/绑定/version；同消息两次 accept 只落 1 条；`revision_limit` → failed。二轮结论作废，见 §11-2 |
+| AC-06 | **通过（三轮重证）** | 终态拒绝后续操作；取消先落意图、abort 子会话、确认无活跃子任务再终态；**取消与提交准入由执行权协议协调**（被 park 的轮次在取消完成后永不提交，首轮与返工各 1 项测试）；取消期间 `failRound` 让位并交回执行权；全局中止不算失败且可随后取消。二轮结论作废，见 §11-1 |
+| AC-07 | **通过（三轮重证）** | **八个** unclean stop 边界（含首轮 pre-submit、**返工 pre-submit**、post-outcome 收据、省略 taskId 的派生 ID）；inspect 前后文件字节与逻辑记录一致。二轮结论作废，见 §11-3 |
 | AC-08 | 通过 | 主/子真实压缩：有效上下文消息数 5→2 且含摘要、被压缩原文从 context 消失；旧 entry 可读；台账/审阅/证据引用不变 |
 | AC-09 | 通过 | `npm run typecheck` 0；`npm test` 121 passed；改动范围核对 |
 | AC-10 | 通过（样例链路） | 真实 DeepSeek 闭环 exit 0，程序侧验收校验与提示加载校验均通过（§6）。**单次运行，不构成概率保证** |
@@ -54,9 +55,22 @@
 | 2 | round 已 settled 未审阅 | review 落**同一轮**：rounds=1、reviews=1、子会话不变 |
 | 3 | 子会话收到返工任务 | 重放恢复 **round 2**：rounds=2、round 2 submission 恰 1 条、**round 3 submission 数 = 0** |
 | 4 | 工具 `pauseMs` 睡眠期间（`pi.tool` 为 `running`、无 tool-result） | round 1 结算、tool-result **恰 1 条**、无 running 的 `pi.tool` |
-| 5 | **`beforeSubmit` 屏障**（意图已落账、submit 尚未发生） | kill 时该 requestId 的 submission **0 条**；重启后**恰 1 条**、round 结算 |
+| 5 | **`beforeSubmit` 屏障**（首轮：意图已落账、submit 尚未发生） | kill 时该 requestId 的 submission **0 条**；重启后**恰 1 条**、round 结算 |
 | 6 | **`afterOutcome` 屏障**（结果已落账、父 tool-result 未落账） | 重放返回持久化收据：rounds=1、submission 仍 1 条、**version 与 events 完全不变**；随后 review 仍可验收 |
 | 7 | 省略 `taskId` 的委派 + 中断 | 派生 ID（`task-<toolTaskId>`）在重启前后一致；1 文档、1 子会话、该 ID 的 round 1 submission 恰 1 条 |
+| 8 | **返工的 `beforeSubmit` 屏障**（round 2 意图已落账、其 submission 尚未发生） | kill 时 round 2 的 submission **0 条**、status=revising、round 2 记录含 feedback 与 opKey；重启后 round 2 submission **恰 1 条**、**无 round 3**、round 1 证据与审阅记录不变 |
+
+## 4b. 取消与提交准入（三轮新增）
+
+`multiagent-cancel-admission.test.ts`（单进程确定性，2 项）：
+
+1. 某一轮被 park 在**验证屏障**（意图已落账、尚未提交），此时执行权由该轮持有；
+2. 同一条消息里的取消运行到结束（记下意图、abort 子会话、完成阶段检查）；
+3. 释放屏障——若没有协议，该轮此刻就会提交。
+
+断言的安全性质：**该轮的任何 submission 都不出现**（取消运行期间、释放之后、任务关闭之后各检查一次），最终 `cancelled`、子会话无活跃任务；首轮与返工各一项。
+
+为什么是单进程：底座 `Harness.open` 会把**存活中的 `running` 任务重整并接管执行**，因此第二个进程打开同一数据库不是"协调"，而是"接管/续跑"。真实的准入竞态发生在同一进程内的并行工具调用之间，这也正是本测试驱动的场景；跨进程语义由恢复边界（§4）覆盖。
 
 ## 5. 只读检查（inspect）
 
@@ -105,6 +119,8 @@ operation delegate:12:call_00_My16HqMZB4t1qwQBBcL64500 kind=delegate task=12 cal
 operation review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443 kind=review task=36 call=… round=1 decision=accept
 ```
 
+**运行历史**：`multiagent-smoke3.sqlite`、`multiagent-smoke4.sqlite`、`multiagent-smoke5.sqlite` 三次成功（均在实现提交上、程序侧校验通过）。
+
 **历史失败记录（保留）**：首版代码（`c6fcd6b`）的 `multiagent-smoke.sqlite` 中，子 Agent 把任务描述里的「文本 MATERIAL」当字面量，`text_stats` 收到 `text="MATERIAL"`、`count=1`，主模型仍 accept。修复：任务文本显式给出素材并要求传完整素材 + CLI 增加程序侧验收校验（`marker`、`text` 长度、`count`、`chars`）。该旧库不再作为 AC-10 证据。
 
 ## 7. CLI 行为核验
@@ -139,3 +155,10 @@ operation review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443 kind=review task=36 call=�
 4. **P1 已结算轮次的原操作重放** → `runDelegationRound` Stage 0 先查"该 requestId 的轮次是否已结算"，是则直接返回**持久化收据**（submission/answer entry/answer text/evidence），不再 submit、不再 transition；outcome commit 前校验 `activeOpKey`，权利已失则不改任何状态。测试：恢复边界 6（version 与 events 完全不变）。
 5. **P2 inspect 手写 delta 解释错误** → 删除自写 applier，改用 **Chord 公开 `apply`**；`["r", value]` 等所有合法 op 由定义方处理。测试：注入合法 `s` op 能正确读出；非法 op 退出 1。
 6. **P1 AC-07 缺 pre-submit 边界** → 在 `runDelegationRound` 的意图 commit 之后、`handle.submit` 之前设置 **`beforeSubmit` 验证屏障**；恢复边界 5 在该屏障 kill，并断言 kill 时该 requestId 的 submission **0 条**、重启后**恰 1 条**；另加边界 6（post-outcome 收据）与边界 7（省略 `taskId` 的派生 ID 稳定性）。
+
+## 11. 三轮审阅的逐条回应（本轮实现）
+
+1. **P1 取消与提交仍分离；Stage1 缺检查** → 引入**执行权协议**：轮次从 claim 起一直持有 `activeOpKey`（记录持有者 `activeToolTaskId`），直到 outcome/fail commit 才交回；`task_cancel` 的完成阶段**只在没有轮次持有执行权、且子会话无活跃任务时才落终态**，否则保留意图并报告 `cancel pending`（工具内做有界重试）；Stage 0/Stage 1 与 submit 前检查都在**各自的 commit 内**校验取消意图与执行权，任何被拒出口都**交回执行权**；`failRound` 遇到取消意图时**让位并交回执行权**（否则 abort 产生的 unanswered 会把任务写成 failed）；被中止（`unanswered/aborted`）的提交同样交回执行权。持有者任务已 terminal 时该权利视为陈旧并回收（避免永久阻塞）。测试：`multiagent-cancel-admission.test.ts` 两项（首轮/返工各一）。
+2. **P1 `task_revise` 无目标轮次** → `round` 改为**必填**，在 claim 的同一个 commit 内校验 `args.round === currentRound`，陈旧反馈被拒且**不消耗返工额度、不改动 rounds/operations/version**；已绑定操作的重放仍返回原绑定。测试：`multiagent.test.ts`「refuses feedback aimed at a round that has already moved on」；并发返工的败者现在也以"陈旧/已被占用"被拒（`multiagent-concurrency.test.ts`）。
+3. **P2 返工 pre-submit 未实测** → 新增恢复边界 8：先完成首轮并合法发起返工，在**round 2 的 `beforeSubmit` 屏障**kill，直接只读确认 `status=revising`、round 2 记录（含 feedback、opKey）存在、round 2 submission **0 条**；重启后 round 2 submission **恰 1 条**、无 round 3、round 1 证据与审阅记录不变。原首轮 pre-submit 测试保留。
+4. **报告口径** → 本报告与本 PR 正文改用**完整 SHA**，并区分实现提交（`1bcddc5…`）与其后的清理提交（`3baeccf…`）；本轮实现提交的完整 SHA 见 PR 正文，不再使用"见 HEAD"。

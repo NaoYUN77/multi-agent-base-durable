@@ -76,7 +76,9 @@ const router: FauxResponseFactory = (request) => {
 			return fauxAssistantMessage([fauxToolCall("task_review", { taskId: "task-gamma", decision: "reject", reason: "not enough", round }, { id: `call-reject-${requests.length}` })], { stopReason: "toolUse" });
 		}
 		if (toolName === "task_review" && resultText.includes("rejected")) {
-			return fauxAssistantMessage([fauxToolCall("task_revise", { taskId: "task-gamma", task: `redo ${TASK}`, feedback: "redo it" }, { id: `call-revise-${requests.length}` })], { stopReason: "toolUse" });
+			// The revision must name the round it is about: read it from the review.
+			const reviewed = Number(/round (\d+) rejected/.exec(resultText)?.[1] ?? "1");
+			return fauxAssistantMessage([fauxToolCall("task_revise", { taskId: "task-gamma", round: reviewed, task: `redo ${TASK}`, feedback: "redo it" }, { id: `call-revise-${requests.length}` })], { stopReason: "toolUse" });
 		}
 		if (toolName === "task_review" && resultText.includes("failed")) {
 			return fauxAssistantMessage([fauxText("MAIN-DONE-FAILED")]);
@@ -91,7 +93,7 @@ const router: FauxResponseFactory = (request) => {
 		return fauxAssistantMessage([fauxText("MAIN-DONE")]);
 	}
 	if (textOf().includes("AFTER-FAILED")) {
-		return fauxAssistantMessage([fauxToolCall("task_revise", { taskId: "task-gamma", task: "one more", feedback: "one more" }, { id: "call-after-failed" })], { stopReason: "toolUse" });
+		return fauxAssistantMessage([fauxToolCall("task_revise", { taskId: "task-gamma", round: 3, task: "one more", feedback: "one more" }, { id: "call-after-failed" })], { stopReason: "toolUse" });
 	}
 	return fauxAssistantMessage([fauxToolCall("task_delegate", { taskId: "task-gamma", task: `count ${TASK}`, childTools: ["text_stats"] }, { id: "call-delegate-gamma" })], { stopReason: "toolUse" });
 };
@@ -163,7 +165,7 @@ describe("TASK-003 revision limit and evidence retrieval", () => {
 		// The main conversation recorded the refusals it received.
 		const entries = await root.entries({}, 1000, undefined, context);
 		const flat = entries.items.flatMap((entry) => entry.model ?? []).map((message) => JSON.stringify(message)).join("\n");
-		expect(/accepts nothing further|not revisable/.test(flat)).toBe(true);
+		expect(/accepts nothing further|not revisable|stale revision/.test(flat)).toBe(true);
 
 		// AC-02 from the provider side: no child request saw the main sentinel.
 		const childRequests = requests.filter((request) => !request.includes(MAIN_SENTINEL));

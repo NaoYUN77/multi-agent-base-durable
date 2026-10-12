@@ -14,6 +14,7 @@
 //             and answers; the main agent finishes with text (no review).
 //   REVIEW    the main agent accepts `task-smoke`'s current round.
 //   REVISE    the main agent sends a revision and finishes.
+//   CANCEL    the main agent cancels `task-smoke`.
 //   RESUME    nothing is submitted: the process opens the database, resumes
 //             whatever was interrupted, waits for idle, and reports the ledger.
 //             This is how a restart continues an interrupted round on its own.
@@ -32,11 +33,16 @@
 //                       committed and NO submission exists yet
 //   after-outcome       at the barrier after the round's outcome is committed
 //                       and before the parent tool result exists
+//   wait-for-file       hold at the round's verification barrier until
+//                       `--release-file <path>` exists, then continue: the
+//                       cancellation-coordination test drives this from another
+//                       process and proves no submission can follow a cancel
 //
 // `--no-task-id` makes the delegation omit `taskId`, so the derived business id
 // (from the tool task) is what recovery has to keep stable.
 
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import type { Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { context, openProbe, openRoot } from "../../src/runtime.ts";
@@ -61,6 +67,7 @@ const requestId = parseArg("request-id");
 const input = parseArg("input") ?? "DELEGATE";
 const killWhen = parseArg("kill-when");
 const omitTaskId = process.argv.includes("--no-task-id");
+const releaseFile = parseArg("release-file");
 /** The verification barriers must fire once, not on every round. */
 let barrierFired = false;
 if (databasePath === undefined || requestId === undefined) {
@@ -123,9 +130,14 @@ const router: FauxResponseFactory = (request) => {
 	}
 	if (textOf().includes("REVISE")) {
 		return fauxAssistantMessage(
-			[fauxToolCall("task_revise", { taskId: "task-smoke", task: `${REVISION_MARK} count ${MAT}`, feedback: "again" }, { id: "runner-revise" })],
+			[fauxToolCall("task_revise", { taskId: "task-smoke", round: 1, task: `${REVISION_MARK} count ${MAT}`, feedback: "again" }, { id: "runner-revise" })],
 			{ stopReason: "toolUse" },
 		);
+	}
+	if (textOf().includes("CANCEL")) {
+		return fauxAssistantMessage([fauxToolCall("task_cancel", { taskId: "task-smoke", reason: "driver cancel" }, { id: "runner-cancel" })], {
+			stopReason: "toolUse",
+		});
 	}
 	if (textOf().includes("REVIEW")) {
 		return fauxAssistantMessage(
@@ -154,10 +166,18 @@ const runtime = await openProbe({
 			model: { provider: "faux", modelId: "faux-1" },
 			childInstructions: "You are the child agent of the recovery check.",
 			// The verification barriers: kill exactly at the named window, once.
-			beforeSubmit: () => {
+			beforeSubmit: async () => {
 				if (killWhen === "pre-submit" && !barrierFired) {
 					barrierFired = true;
 					killNow();
+				}
+				if (killWhen === "wait-for-file" && releaseFile !== undefined) {
+					// Hold the round exactly at the "intent committed, no submission
+					// yet" point until the driver releases it.
+					const deadline = Date.now() + 60_000;
+					while (!existsSync(releaseFile) && Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 10));
+					}
 				}
 			},
 			afterOutcome: () => {
