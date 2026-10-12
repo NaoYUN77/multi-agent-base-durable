@@ -1,3 +1,5 @@
+> 历史探索记录：保留早期研究背景，不作为当前实现或验收合同。当前协作规范见 ../WORKFLOW.md；TASK-003 见 ../TASK-003-multiagent-lifecycle.md 与 ../../durable-cli-probe/TASK-003-VERIFICATION.md。
+
 # Pi Durable 探索记录
 
 ## 当前判断
