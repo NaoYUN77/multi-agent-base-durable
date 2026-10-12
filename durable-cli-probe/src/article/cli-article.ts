@@ -38,6 +38,7 @@ import { createNotionClient, pinnedFetch } from "../notion/client.ts";
 import { createNotionWriteExtension, NOTION_WRITE_TOOL_NAME } from "../notion/article-tool.ts";
 import { ArticleInputError, parseArticleInput, type ArticleInput } from "./contract.ts";
 import { ARTICLE_SPEC_RELATIVE_PATH, ArticleSpecError, buildAnalysisPrompt, loadArticleSpec } from "./spec.ts";
+import { describeScopeProblem, toolResultsOfSubmission } from "./submission-results.ts";
 import { context, openProbe, openRoot, type ProbeRuntime, type ProviderKind } from "../runtime.ts";
 import { notionPinIpFromEnv } from "../notion/runtime.ts";
 
@@ -213,18 +214,32 @@ async function main(): Promise<void> {
 		console.log(`[article] submission=${requestId} status=${settled.status}`);
 
 		const entries = await allEntries(root);
-		const kinds = entries.map((entry) => entry.kind);
-		const toolResultIds = entries.filter((entry) => entry.kind === "pi.tool-result").map((entry) => entry.id);
-		console.log(`[article] transcript kinds: ${kinds.join(", ")}`);
-		console.log(`[article] tool-result entries: ${toolResultIds.join(", ") || "(none)"}`);
+		console.log(`[article] transcript kinds: ${entries.map((entry) => entry.kind).join(", ")}`);
 
-		if (toolResultIds.length === 0) {
-			// No tool call means no page. Say so plainly rather than reporting success.
-			console.log(`[article] FAIL: the model did not call ${NOTION_WRITE_TOOL_NAME}; no page was created.`);
+		// Scope the results to *this* submission. Reading every `pi.tool-result` in
+		// the conversation would let a run that did nothing borrow an earlier run's
+		// success, and would let an earlier failure poison a later one.
+		const scoped = toolResultsOfSubmission(entries, {
+			status: settled.status,
+			entry: settled.entry,
+			answer: settled.answer,
+		});
+
+		if ("problem" in scoped) {
+			console.log(`[article] FAIL: cannot locate this submission's results — ${describeScopeProblem(scoped.problem)}.`);
+			failed = true;
+		} else if (scoped.results.length === 0) {
+			// No tool call in this submission means no page. Say so plainly rather
+			// than reporting success.
+			console.log(
+				`[article] FAIL: the model did not call ${NOTION_WRITE_TOOL_NAME} during this submission; no page was created.`,
+			);
 			failed = true;
 		} else {
-			// Report every tool result, and treat any error result as a failure.
-			for (const id of toolResultIds) {
+			console.log(`[article] tool-result entries (this submission): ${scoped.results.map((entry) => entry.id).join(", ")}`);
+			// Report every result of this submission, and treat any error as a failure.
+			for (const scopedEntry of scoped.results) {
+				const id = scopedEntry.id;
 				const entry = await root.commit((tx) => tx.entry(ToolResultEntry, id as never), context);
 				const text = toolResultText(entry as { model?: readonly { role?: string; content?: unknown }[] });
 				const isError = (entry as { model?: readonly { isError?: unknown }[] })?.model?.[0]?.isError === true;

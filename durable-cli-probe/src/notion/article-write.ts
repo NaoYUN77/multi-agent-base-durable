@@ -44,6 +44,15 @@ export interface ArticleWriteResult {
 }
 
 /**
+ * What an operator should do when a create's outcome is unknown.
+ *
+ * Shared so the error raised here and the refusal the tool returns on a repeat
+ * call say the same thing — the two paths are the same situation.
+ */
+export const INDETERMINATE_GUIDANCE =
+	"页面可能已创建。请先核查父页面下是否已出现该文章，再决定是否重跑；不要直接换 requestId 重试。";
+
+/**
  * Raised when the write's outcome cannot be determined.
  *
  * The distinction matters: a determinate failure means "nothing was written, a
@@ -59,8 +68,7 @@ export class ArticleWriteIndeterminateError extends Error {
 		this.name = "ArticleWriteIndeterminateError";
 		this.code = code;
 		this.status = status;
-		this.guidance =
-			"页面可能已创建。请先核查父页面下是否已出现该文章，再决定是否重跑；不要直接换 requestId 重试。";
+		this.guidance = INDETERMINATE_GUIDANCE;
 	}
 }
 
@@ -149,10 +157,13 @@ export interface ReadBackMismatch {
 /** The result of re-reading a created page. */
 export interface ReadBackReport {
 	readonly pageId: string;
+	readonly expectedTitle: string;
 	readonly title: string;
+	readonly titleMatches: boolean;
 	readonly expectedBlocks: number;
 	readonly actualBlocks: number;
 	readonly mismatches: readonly ReadBackMismatch[];
+	/** True only when the title *and* every block match. */
 	readonly matches: boolean;
 }
 
@@ -225,17 +236,23 @@ function titleOf(page: unknown): string {
 }
 
 /**
- * Re-fetch a created page and compare it against the blocks that were sent.
+ * Re-fetch a created page and compare it against what was sent.
  *
- * Compares block-by-block on `type` plus concatenated text. A page that is
- * missing a paragraph, has an extra one, or whose heading levels differ will not
- * match. That is the point: this is the check that turns "the API returned 200"
- * into "the page says what it was supposed to say".
+ * Compares the title property and then every block on `type` plus concatenated
+ * text. A page that is missing a paragraph, has an extra one, whose heading
+ * levels differ, or whose title was changed will not match. That is the point:
+ * this is the check that turns "the API returned 200" into "the page says what it
+ * was supposed to say".
+ *
+ * The title is compared explicitly because it lives in a property rather than in
+ * the children, so a block-only comparison would pass for a page titled anything
+ * at all.
  */
 export async function readBackArticlePage(
 	client: Client,
 	pageId: string,
 	expectedChildren: readonly unknown[],
+	expectedTitle: string,
 ): Promise<ReadBackReport> {
 	let page: unknown;
 	try {
@@ -254,12 +271,17 @@ export async function readBackArticlePage(
 		if (expected !== actualSignature) mismatches.push({ index, expected, actual: actualSignature });
 	}
 
+	const title = titleOf(page);
+	const titleMatches = title === expectedTitle;
+
 	return {
 		pageId,
-		title: titleOf(page),
+		expectedTitle,
+		title,
+		titleMatches,
 		expectedBlocks: expectedChildren.length,
 		actualBlocks: actual.length,
 		mismatches,
-		matches: mismatches.length === 0,
+		matches: titleMatches && mismatches.length === 0,
 	};
 }

@@ -705,27 +705,53 @@ also authorises writing under it. There is no fallback between them.
 | Kind | Proves |
 | --- | --- |
 | `npm run typecheck` | types line up |
-| `npm test` (44 article tests) | validation rejects bad input before any request; rendered blocks carry the original text unchanged; failures are classified determinate vs indeterminate; a create is attempted exactly once; a content mismatch is reported as failure |
+| `npm test` (57 article tests) | validation rejects bad input before any request; rendered blocks carry the original text unchanged; failures are classified determinate vs indeterminate; a create is attempted exactly once per processing; a content or title mismatch is reported as failure; tool results are scoped to their own submission |
 | faux + real Notion | the write and read-back path works against the live API |
-| deepseek + real Notion | a real model can read the spec and produce a conforming reply — **not run here**, see limitations |
+| deepseek + real Notion | a real model reads the spec and produces a conforming tool call |
 
 The read-back is the acceptance check, not the create's status code. A `200` from
-`pages.create` proves a page exists; `readBackArticlePage` re-fetches it, extracts
-every block's text, and compares it against what was sent. A mismatch is returned
-as `isError`, so "the page exists" cannot be mistaken for "the page is right".
+`pages.create` proves a page exists; `readBackArticlePage` re-fetches it, compares
+the title property *and* every block's text against what was sent, and reports a
+mismatch as `isError`. "The page exists" cannot be mistaken for "the page is right".
+
+### Two guards that are not about replay
+
+`replay: "unsafe"` governs what Durable does when *recovering* a call. It says
+nothing about a model that issues the same call twice in one turn, or calls again
+after an uncertain result. The tool therefore keeps its own per-processing state:
+
+- a processing creates **at most one page**; later calls reuse the existing page;
+- while a create is in flight, a concurrent call is refused;
+- after an **uncertain** outcome (500/503/transport) the tool refuses to create
+  again and tells the caller to check the parent page first;
+- after a read-back failure or mismatch, the known page is reported and **not**
+  recreated;
+- only a **determinate** failure (nothing was written) leaves the tool able to try
+  again.
+
+The CLI scopes its report the same way: it looks only at the tool results committed
+between the current submission's input entry and its answer entry, so a run that
+does nothing cannot borrow an earlier run's success, and an earlier failure cannot
+poison a later one.
 
 ### Limitations
 
-- **The real-model path is not verified.** `DEEPSEEK_API_KEY` was not available in
-  this environment, so `--provider deepseek` was never executed. A faux run proves
-  the wiring; it says nothing about whether a real model produces a conforming
-  reply. Do not read the faux result as model evidence.
+- **The real-model path was exercised, and it is fragile to prompt wording.** The
+  first `--provider deepseek` run *failed*: the model produced a fully conforming
+  analysis but emitted it as text instead of calling the tool (`stopReason=stop`).
+  The run correctly failed and wrote nothing; the cause was the spec's wording
+  ("you *may* be asked to call a tool"), fixed in `906655c`. Treat
+  `prompts/article-analysis.md` as behaviour, not documentation — changing it
+  changes what the model does, and it should be reviewed as such.
 - **One request per article.** An article rendering to more than 100 blocks, or a
   payload over 500KB, is rejected before writing rather than appended in batches.
-- **No exactly-once guarantee.** Replaying a completed `requestId` does not create
-  a second page (verified), but an interrupted create can leave a page that the
+- **No exactly-once guarantee across processes.** Within one processing the guards
+  above hold. Across processes, an interrupted create can still leave a page the
   probe does not know about; `ArticleWriteIndeterminateError` says so rather than
   guessing.
-- **Only the rendered block sequence is compared.** Formatting attributes such as
-  colour or annotations are not asserted.
+- **Interruption recovery is not exercised.** The tool declares `unsafe`, and
+  Durable's handling of that is covered by the pinned source, but this probe has
+  never crashed mid-write to observe it.
+- **Only the title and the block sequence are compared.** Formatting attributes
+  such as colour or annotations are not asserted.
 

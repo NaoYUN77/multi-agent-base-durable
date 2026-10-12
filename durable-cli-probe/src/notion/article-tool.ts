@@ -30,6 +30,7 @@ import { ArticleAnalysisError, parseArticleAnalysis, type ArticleInput } from ".
 import { ArticleRenderError, renderArticleBlocks, toCreatePageParameters } from "./article-blocks.ts";
 import {
 	ArticleWriteIndeterminateError,
+	INDETERMINATE_GUIDANCE,
 	createArticlePage,
 	readBackArticlePage,
 	type ArticleWriteStats,
@@ -102,6 +103,35 @@ const emptyDetails = (): NotionWriteDetails => ({
 });
 
 /**
+ * How far one article's processing has got.
+ *
+ * `replay: "unsafe"` only governs what Durable does when *recovering* a call. It
+ * does nothing about a model that issues the same call twice in one turn, or that
+ * calls again after an uncertain result — both of which would create a second
+ * page. This state is what stops that: a processing creates at most one page, and
+ * once a page exists every later call reuses it instead of creating another.
+ *
+ * `idle` is the only state a create may start from, so a determinate failure
+ * (nothing was written) legitimately allows a retry, while an uncertain or
+ * already-created outcome does not.
+ */
+type AttemptState =
+	| { readonly kind: "idle" }
+	/** A create is in flight. Blocks a concurrent second call. */
+	| { readonly kind: "running" }
+	/** A page exists — created by this processing. Later calls reuse it. */
+	| {
+			readonly kind: "created";
+			readonly pageId: string;
+			readonly pageUrl: string | undefined;
+			/** False when the read-back could not run or did not match. */
+			readonly verified: boolean;
+			readonly text: string;
+	  }
+	/** The create's outcome is unknown. Creating again could duplicate a page. */
+	| { readonly kind: "indeterminate"; readonly message: string };
+
+/**
  * Build the tool.
  *
  * Failure handling is deliberate: a validation or render failure means nothing
@@ -111,6 +141,30 @@ const emptyDetails = (): NotionWriteDetails => ({
  */
 export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 	const { client, parentPageId, article } = options;
+
+	// One processing, one page. Shared by every call this tool instance serves.
+	let state: AttemptState = { kind: "idle" };
+
+	/** Report an existing page rather than creating another one. */
+	const reuse = (current: Extract<AttemptState, { kind: "created" }>): ToolExecutionResult<NotionWriteDetails> => {
+		const text = [
+			`复用本次处理已创建的页面（未重复创建）：${current.pageId}`,
+			current.text,
+		].join("\n");
+		return {
+			output: [{ type: "text" as const, text }],
+			isError: !current.verified,
+			details: {
+				action: "write_article",
+				pageId: current.pageId,
+				pageUrl: current.pageUrl ?? "",
+				blockCount: 0,
+				paragraphCount: article.paragraphs.length,
+				readBackMatches: current.verified,
+				readBackMismatches: 0,
+			},
+		};
+	};
 
 	return defineTool({
 		name: NOTION_WRITE_TOOL_NAME,
@@ -124,6 +178,36 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 		replay: "unsafe",
 		outputLimits: WRITE_TOOL_OUTPUT_LIMITS,
 		async execute(args): Promise<ToolExecutionResult<NotionWriteDetails>> {
+			// ── 0. Guard: one processing creates at most one page ───────────────
+			// Checked before anything else, so a second call in the same turn (or a
+			// call after an uncertain result) cannot reach `pages.create`.
+			if (state.kind === "created") return reuse(state);
+			if (state.kind === "indeterminate") {
+				return {
+					output: [
+						{
+							type: "text" as const,
+							text: `拒绝重复创建：${state.message}\n${INDETERMINATE_GUIDANCE}`,
+						},
+					],
+					isError: true,
+					details: { ...emptyDetails(), paragraphCount: article.paragraphs.length },
+					diagnostics: [
+						{ severity: "error" as const, code: "create_refused_indeterminate", message: state.message },
+					],
+				};
+			}
+			if (state.kind === "running") {
+				return {
+					output: [{ type: "text" as const, text: "该文章的写入正在进行中，拒绝并发调用。" }],
+					isError: true,
+					details: { ...emptyDetails(), paragraphCount: article.paragraphs.length },
+					diagnostics: [
+						{ severity: "error" as const, code: "create_in_flight", message: "a create is already running" },
+					],
+				};
+			}
+
 			// ── 1. Validate the model's reply against the article ───────────────
 			let analysis;
 			try {
@@ -177,6 +261,9 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			}
 
 			// ── 3. Create ──────────────────────────────────────────────────────
+			// Marked before the await so a second call arriving while this one is in
+			// flight sees `running` rather than starting a create of its own.
+			state = { kind: "running" };
 			let created;
 			try {
 				created = await createArticlePage(
@@ -186,6 +273,8 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 				);
 			} catch (error) {
 				if (error instanceof ArticleWriteIndeterminateError) {
+					// A page may exist. Remember that, so no later call creates another.
+					state = { kind: "indeterminate", message: error.message };
 					return {
 						output: [
 							{
@@ -200,6 +289,8 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 						],
 					};
 				}
+				// Determinate: nothing was written, so a later attempt is legitimate.
+				state = { kind: "idle" };
 				const message = error instanceof NotionRequestError ? `${error.info.code}: ${error.info.message}` : String(error);
 				return {
 					output: [{ type: "text" as const, text: `Write failed: ${message}. Nothing was written.` }],
@@ -210,27 +301,34 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			}
 
 			// ── 4. Read back and compare ───────────────────────────────────────
-			// A 200 from create proves a page exists, not that it holds the right
-			// blocks. The read-back is the actual acceptance check.
+			// A 200 from create proves a page exists, not that it says the right
+			// thing. The read-back is the actual acceptance check, and it covers the
+			// title as well as the blocks.
 			let readBack;
 			try {
-				readBack = await readBackArticlePage(client, created.pageId, rendered.children);
+				readBack = await readBackArticlePage(client, created.pageId, rendered.children, rendered.title);
 			} catch (error) {
 				const message = error instanceof NotionRequestError ? error.info.message : String(error);
+				const text = `Page created (${created.pageId}) but read-back failed: ${message}. Verify manually; not creating another.`;
+				// A page exists, so this processing must not create a second one.
+				state = {
+					kind: "created",
+					pageId: created.pageId,
+					pageUrl: created.pageUrl,
+					verified: false,
+					text,
+				};
 				return {
-					output: [
-						{
-							type: "text" as const,
-							text: `Page created (${created.pageId}) but read-back failed: ${message}. Verify manually.`,
-						},
-					],
+					output: [{ type: "text" as const, text }],
 					isError: true,
 					details: {
-						...emptyDetails(),
+						action: "write_article",
 						pageId: created.pageId,
 						pageUrl: created.pageUrl ?? "",
 						blockCount: rendered.blockCount,
 						paragraphCount: rendered.paragraphCount,
+						readBackMatches: false,
+						readBackMismatches: 0,
 					},
 					diagnostics: [{ severity: "error" as const, code: "readback_failed", message }],
 				};
@@ -239,9 +337,10 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			const summaryLines = [
 				`created page ${created.pageId}`,
 				`url: ${created.pageUrl ?? "(not reported)"}`,
+				`title: ${readBack.titleMatches ? "matches" : `MISMATCH (expected ${JSON.stringify(readBack.expectedTitle)}, got ${JSON.stringify(readBack.title)})`}`,
 				`blocks: ${rendered.blockCount}  paragraphs: ${rendered.paragraphCount}`,
 				`original chars: ${rendered.originalChars}  analysis chars: ${rendered.analysisChars}`,
-				`read-back: ${readBack.matches ? "matches" : `MISMATCH (${readBack.mismatches.length})`}`,
+				`read-back: ${readBack.matches ? "matches" : `MISMATCH (${readBack.mismatches.length} blocks)`}`,
 			];
 			if (!readBack.matches) {
 				for (const mismatch of readBack.mismatches.slice(0, 5)) {
@@ -251,9 +350,19 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			}
 			const text = summaryLines.join("\n");
 
+			// The page exists from here on. A later call reuses this result instead
+			// of creating another, whether or not the read-back matched.
+			state = {
+				kind: "created",
+				pageId: created.pageId,
+				pageUrl: created.pageUrl,
+				verified: readBack.matches,
+				text,
+			};
+
 			return {
 				output: [{ type: "text" as const, text }],
-				// A content mismatch is a failure even though the page exists.
+				// A content or title mismatch is a failure even though the page exists.
 				isError: !readBack.matches,
 				details: {
 					action: "write_article",
@@ -262,7 +371,7 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 					blockCount: rendered.blockCount,
 					paragraphCount: rendered.paragraphCount,
 					readBackMatches: readBack.matches,
-					readBackMismatches: readBack.mismatches.length,
+					readBackMismatches: readBack.mismatches.length + (readBack.titleMatches ? 0 : 1),
 				},
 				...(readBack.matches
 					? {}
@@ -270,8 +379,10 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 							diagnostics: [
 								{
 									severity: "error" as const,
-									code: "readback_mismatch",
-									message: `page content differs from what was sent (${readBack.mismatches.length} blocks)`,
+									code: readBack.titleMatches ? "readback_mismatch" : "readback_title_mismatch",
+									message: readBack.titleMatches
+										? `page content differs from what was sent (${readBack.mismatches.length} blocks)`
+										: `page title differs: expected ${JSON.stringify(readBack.expectedTitle)}, got ${JSON.stringify(readBack.title)}`,
 								},
 							],
 						}),

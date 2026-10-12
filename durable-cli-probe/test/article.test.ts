@@ -26,6 +26,7 @@ import {
 	type ArticleInput,
 } from "../src/article/contract.ts";
 import { articleSpecPath, buildAnalysisPrompt, loadArticleSpec, ArticleSpecError } from "../src/article/spec.ts";
+import { describeScopeProblem, toolResultsOfSubmission } from "../src/article/submission-results.ts";
 import {
 	ArticleRenderError,
 	NOTION_MAX_BLOCKS_PER_REQUEST,
@@ -468,20 +469,33 @@ describe("article write", () => {
 // ─────────────────────────────────────────────────────────────── read-back
 
 describe("read-back verification", () => {
-	it("matches when the stored blocks equal the sent blocks", async () => {
+	it("matches when the stored title and blocks equal what was sent", async () => {
 		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
 		const { client } = clientOver({ children: echoChildren(rendered.children), pageTitle: SAMPLE.title });
-		const report = await readBackArticlePage(client, "page-created-1", rendered.children);
+		const report = await readBackArticlePage(client, "page-created-1", rendered.children, rendered.title);
 		expect(report.matches).toBe(true);
+		expect(report.titleMatches).toBe(true);
 		expect(report.title).toBe(SAMPLE.title);
 		expect(report.actualBlocks).toBe(rendered.children.length);
+	});
+
+	it("fails when the page title differs, even though every block matches", async () => {
+		// The title lives in a property, not in the children, so a block-only
+		// comparison would call this page correct.
+		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
+		const { client } = clientOver({ children: echoChildren(rendered.children), pageTitle: "WRONG TITLE" });
+		const report = await readBackArticlePage(client, "page-created-1", rendered.children, rendered.title);
+		expect(report.titleMatches).toBe(false);
+		expect(report.matches).toBe(false);
+		expect(report.expectedTitle).toBe(SAMPLE.title);
+		expect(report.title).toBe("WRONG TITLE");
 	});
 
 	it("detects a block that is missing from the page", async () => {
 		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
 		const short = echoChildren(rendered.children).slice(0, -1);
-		const { client } = clientOver({ children: short });
-		const report = await readBackArticlePage(client, "page-created-1", rendered.children);
+		const { client } = clientOver({ children: short, pageTitle: SAMPLE.title });
+		const report = await readBackArticlePage(client, "page-created-1", rendered.children, rendered.title);
 		expect(report.matches).toBe(false);
 		expect(report.mismatches.length).toBeGreaterThan(0);
 	});
@@ -491,9 +505,169 @@ describe("read-back verification", () => {
 		const tampered = echoChildren(rendered.children);
 		const last = tampered[tampered.length - 1] as { paragraph: { rich_text: { plain_text: string }[] } };
 		last.paragraph.rich_text = last.paragraph.rich_text.map((item) => ({ plain_text: `${item.plain_text} 改动` }));
-		const { client } = clientOver({ children: tampered });
-		const report = await readBackArticlePage(client, "page-created-1", rendered.children);
+		const { client } = clientOver({ children: tampered, pageTitle: SAMPLE.title });
+		const report = await readBackArticlePage(client, "page-created-1", rendered.children, rendered.title);
 		expect(report.matches).toBe(false);
+	});
+});
+
+describe("one processing creates at most one page", () => {
+	/** A client whose children echo whatever the tool sent, so read-back matches. */
+	function happyClient() {
+		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
+		return { rendered, ...clientOver({ children: echoChildren(rendered.children), pageTitle: SAMPLE.title }) };
+	}
+
+	it("reuses the created page when the tool is called twice in one processing", async () => {
+		const { client, requests } = happyClient();
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+
+		const first = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		const second = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+
+		expect(first.isError).toBeFalsy();
+		expect(second.isError).toBeFalsy();
+		// The second call must not reach the API at all.
+		expect(requests.filter((r) => r.method === "POST")).toHaveLength(1);
+		expect(second.details).toMatchObject({ pageId: first.details?.pageId });
+		expect(JSON.stringify(second.output)).toContain("未重复创建");
+	});
+
+	it("refuses a concurrent second call while the first create is in flight", async () => {
+		// Delay the create so the second call arrives while `running` is set.
+		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const { requests, fetchImpl } = fakeNotion({
+			children: echoChildren(rendered.children),
+			pageTitle: SAMPLE.title,
+		});
+		const slowFetch = (async (url: string, init: never) => {
+			if ((init as { method?: string }).method === "POST") await gate;
+			return fetchImpl(url, init);
+		}) as unknown as typeof globalThis.fetch;
+		const client = createNotionClient(
+			{ token: "ntn_test_token", version: "2026-03-11", baseUrl: "https://api.notion.com", pageId: undefined },
+			{ fetch: slowFetch, maxRetries: 0 },
+		);
+
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+		const inFlight = tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		// The first call has reached its `await`; the guard must already be set.
+		await Promise.resolve();
+		const concurrent = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(concurrent.isError).toBe(true);
+		expect(JSON.stringify(concurrent.output)).toContain("正在进行中");
+
+		release?.();
+		await inFlight;
+		expect(requests.filter((r) => r.method === "POST")).toHaveLength(1);
+	});
+
+	it("refuses to create again after an uncertain outcome, and says to check first", async () => {
+		const { client, requests } = clientOver({
+			create: { status: 503, json: { object: "error", status: 503, code: "service_unavailable", message: "saved but no response" } },
+		});
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+
+		const first = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(first.isError).toBe(true);
+		expect(JSON.stringify(first.output)).toContain("可能已创建");
+
+		const second = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(second.isError).toBe(true);
+		expect(JSON.stringify(second.output)).toContain("拒绝重复创建");
+		expect(JSON.stringify(second.output)).toContain("核查");
+		// Only the first call ever reached the API.
+		expect(requests.filter((r) => r.method === "POST")).toHaveLength(1);
+	});
+
+	it("does not create again after a read-back failure, and reports the known page", async () => {
+		// Create succeeds; the children list is empty, so the read-back mismatches.
+		const { client, requests } = clientOver({ children: [], pageTitle: SAMPLE.title });
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+
+		const first = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(first.isError).toBe(true);
+
+		const second = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(second.isError).toBe(true);
+		expect(second.details).toMatchObject({ pageId: "page-created-1" });
+		expect(JSON.stringify(second.output)).toContain("未重复创建");
+		expect(requests.filter((r) => r.method === "POST")).toHaveLength(1);
+	});
+
+	it("allows a retry after a determinate failure, because nothing was written", async () => {
+		const { client, requests } = clientOver({
+			create: { status: 400, json: { object: "error", status: 400, code: "validation_error", message: "bad body" } },
+		});
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+		const first = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(first.isError).toBe(true);
+		// A second attempt is legitimate here: the first provably wrote nothing.
+		await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(requests.filter((r) => r.method === "POST")).toHaveLength(2);
+	});
+
+	it("reports the title mismatch through the tool as an error", async () => {
+		const rendered = renderArticleBlocks(SAMPLE, parseArticleAnalysis(analysisFor(3), 3));
+		const { client } = clientOver({ children: echoChildren(rendered.children), pageTitle: "WRONG TITLE" });
+		const tool = createNotionWriteArticleTool({ client, parentPageId: "p", article: SAMPLE });
+		const result = await tool.execute({ paragraphs: analysisFor(3).paragraphs } as never, {} as never, {} as never);
+		expect(result.isError).toBe(true);
+		expect(result.details).toMatchObject({ readBackMatches: false });
+		expect(JSON.stringify(result.output)).toContain("title: MISMATCH");
+	});
+});
+
+describe("scoping tool results to one submission", () => {
+	const entries = [
+		{ id: 1, kind: "pi.user" },
+		{ id: 2, kind: "pi.system" },
+		{ id: 3, kind: "pi.assistant" },
+		{ id: 4, kind: "pi.tool-result" }, // belongs to submission A
+		{ id: 5, kind: "pi.assistant" },
+		{ id: 6, kind: "pi.user" }, // submission B starts here
+		{ id: 7, kind: "pi.assistant" },
+	];
+
+	it("returns only the results committed between this submission's input and its answer", () => {
+		const scoped = toolResultsOfSubmission(entries, { status: "done", entry: 6, answer: 7 });
+		expect("results" in scoped && scoped.results.map((entry) => entry.id)).toEqual([]);
+
+		const earlier = toolResultsOfSubmission(entries, { status: "done", entry: 1, answer: 5 });
+		expect("results" in earlier && earlier.results.map((entry) => entry.id)).toEqual([4]);
+	});
+
+	it("does not let a later run borrow an earlier run's success", () => {
+		// Run B settled `done` but called no tool. A must not be consulted.
+		const scoped = toolResultsOfSubmission(entries, { status: "done", entry: 6, answer: 7 });
+		expect("results" in scoped).toBe(true);
+		expect("results" in scoped && scoped.results).toHaveLength(0);
+	});
+
+	it("does not let an earlier failure poison a later success", () => {
+		const withFailure = [{ id: 1, kind: "pi.user" }, { id: 2, kind: "pi.tool-result" }, { id: 3, kind: "pi.user" }, { id: 4, kind: "pi.tool-result" }, { id: 5, kind: "pi.assistant" }];
+		const later = toolResultsOfSubmission(withFailure, { status: "done", entry: 3, answer: 5 });
+		expect("results" in later && later.results.map((entry) => entry.id)).toEqual([4]);
+	});
+
+	it("reports a problem instead of guessing when the submission did not settle done", () => {
+		const scoped = toolResultsOfSubmission(entries, { status: "unanswered", entry: 6, answer: 7 });
+		expect("problem" in scoped && scoped.problem.reason).toBe("not_done");
+	});
+
+	it("reports a problem when the boundaries are missing from the transcript", () => {
+		expect("problem" in toolResultsOfSubmission(entries, { status: "done", entry: 99, answer: 7 })).toBe(true);
+		expect("problem" in toolResultsOfSubmission(entries, { status: "done", entry: 6 })).toBe(true);
+	});
+
+	it("locates the original results when a completed requestId is replayed", () => {
+		// A replay returns the same submission record, so the same range applies.
+		const scoped = toolResultsOfSubmission(entries, { status: "done", entry: 1, answer: 5 });
+		expect("results" in scoped && scoped.results.map((entry) => entry.id)).toEqual([4]);
 	});
 });
 
