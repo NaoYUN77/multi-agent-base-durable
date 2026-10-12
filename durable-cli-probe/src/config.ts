@@ -17,6 +17,16 @@ export const NOTION_BASE_URL = "https://api.notion.com";
 /** Environment variable names. Keys live in the environment, never in source. */
 export const NOTION_TOKEN_ENV = "NOTION_TOKEN";
 export const NOTION_PAGE_ID_ENV = "NOTION_PAGE_ID";
+/**
+ * Destination page for article writes (Issue #3).
+ *
+ * Deliberately a different variable from `NOTION_PAGE_ID`: the read target and
+ * the write target are different risks. Sharing one variable would mean that
+ * pointing the probe at a page to read it also authorises writing under it.
+ * There is no fallback between them — a missing write target is an error, never
+ * an implicit search for "some page that looks right".
+ */
+export const NOTION_ARTICLE_PARENT_PAGE_ID_ENV = "NOTION_ARTICLE_PARENT_PAGE_ID";
 
 /** A resolved Notion configuration with no secret in a printable position. */
 export interface NotionConfig {
@@ -92,6 +102,30 @@ export function requirePageId(config: NotionConfig, override?: string): string {
 		throw new NotionConfigError(
 			NOTION_PAGE_ID_ENV,
 			"Pass a page id as the first argument, or export NOTION_PAGE_ID.",
+		);
+	}
+	return value.trim();
+}
+
+/** The article-write parent page id from the environment, or `undefined`. Never throws. */
+export function notionArticleParentPageIdFromEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const value = env[NOTION_ARTICLE_PARENT_PAGE_ID_ENV];
+	return value === undefined || value.trim() === "" ? undefined : value.trim();
+}
+
+/**
+ * The parent page an article write must target.
+ *
+ * Throws when unset rather than falling back to `NOTION_PAGE_ID`: writing under
+ * whatever page happened to be configured for reading is exactly the mistake the
+ * separate variable exists to prevent.
+ */
+export function requireArticleParentPageId(override?: string, env: NodeJS.ProcessEnv = process.env): string {
+	const value = override ?? notionArticleParentPageIdFromEnv(env);
+	if (value === undefined || value.trim() === "") {
+		throw new NotionConfigError(
+			NOTION_ARTICLE_PARENT_PAGE_ID_ENV,
+			"Set the dedicated article-write parent page, e.g. export NOTION_ARTICLE_PARENT_PAGE_ID='<32-hex page id>'.",
 		);
 	}
 	return value.trim();

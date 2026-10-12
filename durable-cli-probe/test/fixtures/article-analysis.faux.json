@@ -1,0 +1,32 @@
+{
+  "_comment": "Deterministic stand-in for a real model's reply, used only by --provider faux. It must satisfy the same contract a real reply does: one entry per paragraph, paragraphId covering 1..N. It deliberately includes a summary that is NOT a copy of the original text, so a test can tell the two apart.",
+  "analysis": {
+    "paragraphs": [
+      {
+        "paragraphId": 1,
+        "summary": "以一次四小时的故障复盘切入：没人能说清三个月前那次变更改了什么，变更记录散落在多个互不相通的载体里。",
+        "roleInArticle": "提供具体场景，把抽象问题落到一次真实事故上，为下文的归因做铺垫。"
+      },
+      {
+        "paragraphId": 2,
+        "summary": "否定了「记性差」和「文档没写好」这两种常见归因，指出根因是操作过程没有被记录和复现，因而事后不可检验。",
+        "roleInArticle": "提出全文的核心论点，并把它与前一段的现象区分开：问题在流程而非个人。"
+      },
+      {
+        "paragraphId": 3,
+        "summary": "给出正面例证：另一个团队把每次发布写进脚本仓库，半年后回滚只需检出旧 tag 并执行一条命令，十分钟内完成且无需理解当初的动机。",
+        "roleInArticle": "用具体案例支撑前一段的论点，展示被记录的操作在事后能带来什么。"
+      },
+      {
+        "paragraphId": 4,
+        "summary": "引入限定条件：一次性的探索性排查不值得代码化，否则仓库会退化成无人阅读的垃圾场。",
+        "roleInArticle": "转折并收窄论点的适用范围，避免前文被读成「一切都该写脚本」的绝对主张。"
+      },
+      {
+        "paragraphId": 5,
+        "summary": "给出可操作的判断标准：看操作是否会重复、是否需要审计、出错代价是否高，而不是看它能否被写成脚本。",
+        "roleInArticle": "收束全文，把前一段的限定转化为一条可用于实际决策的准则。"
+      }
+    ]
+  }
+}

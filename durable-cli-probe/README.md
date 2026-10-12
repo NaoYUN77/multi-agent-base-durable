@@ -649,3 +649,109 @@ export NOTION_PIN_IP=208.103.161.2   # optional; omit for normal DNS
 - No sub-agents, RAG, MCP, OAuth, Telegram/Feishu, Notion UI automation, or write operations, per the task.
 - No git commit was made.
 
+---
+
+## 17. Issue #3: writing an article to Notion
+
+TASK-002 could only read. This adds the first write path, and with it the first
+place where a mistake is not free.
+
+### What it adds
+
+| Path | Role |
+| --- | --- |
+| `prompts/article-analysis.md` | The processing spec. Loaded at runtime by `src/article/spec.ts`, which throws if it is missing or blank — a spec that exists while the code ignores it is worse than none. |
+| `src/article/contract.ts` | The input contract and the model-reply contract, plus their validators. |
+| `src/notion/article-blocks.ts` | Renders an article into explicit Notion blocks. |
+| `src/notion/article-write.ts` | The `pages.create` wrapper, the failure classifier, and the read-back comparison. |
+| `src/notion/article-tool.ts` | The `notion_write_article` tool, registered as the `notion-write` extension. |
+| `src/article/cli-article.ts` | `npm run article:probe`. |
+
+### Three decisions worth stating
+
+**The write is a separate tool, not a fourth action on `notion_read`.** The read
+tool's guarantee is "three actions, all GETs, safe to replay". Adding a write
+action would silently remove that guarantee for every existing caller. A second
+tool keeps the contracts independent and lets a conversation be granted one
+without the other.
+
+**The model cannot choose what is written or where.** Its parameters carry only
+per-paragraph `summary` and `roleInArticle`. The article's original text and the
+destination page id come from the closure, built from the input file and from
+`NOTION_ARTICLE_PARENT_PAGE_ID`. A bad reply can fail the run; it cannot relocate
+or rewrite content.
+
+**`replay: "unsafe"`.** Durable only reruns a recovered call when the stored and
+current policies are both `"safe"` (`packages/durable/src/harness/tool.ts:170`).
+A create is not idempotent, so an interrupted call must surface as an
+interruption, not repeat. The SDK's own retry policy is left alone: reading
+`Client.js`'s `canRetry` shows 429/529 retried for every method, but 500/503 only
+for GET/DELETE — so a POST is never silently repeated.
+
+### Configuration
+
+```bash
+export NOTION_ARTICLE_PARENT_PAGE_ID='<32-hex page id>'   # required, no fallback
+npm run article:probe -- --provider faux --input test/fixtures/article-sample.json \
+  --db ./data/article-probe.sqlite --request-id article-1
+```
+
+`NOTION_ARTICLE_PARENT_PAGE_ID` is deliberately separate from `NOTION_PAGE_ID`.
+Sharing one variable would mean that pointing the probe at a page to *read* it
+also authorises writing under it. There is no fallback between them.
+
+### Verification, and what each kind proves
+
+| Kind | Proves |
+| --- | --- |
+| `npm run typecheck` | types line up |
+| `npm test` (57 article tests) | validation rejects bad input before any request; rendered blocks carry the original text unchanged; failures are classified determinate vs indeterminate; a create is attempted exactly once per processing; a content or title mismatch is reported as failure; tool results are scoped to their own submission |
+| faux + real Notion | the write and read-back path works against the live API |
+| deepseek + real Notion | a real model reads the spec and produces a conforming tool call |
+
+The read-back is the acceptance check, not the create's status code. A `200` from
+`pages.create` proves a page exists; `readBackArticlePage` re-fetches it, compares
+the title property *and* every block's text against what was sent, and reports a
+mismatch as `isError`. "The page exists" cannot be mistaken for "the page is right".
+
+### Two guards that are not about replay
+
+`replay: "unsafe"` governs what Durable does when *recovering* a call. It says
+nothing about a model that issues the same call twice in one turn, or calls again
+after an uncertain result. The tool therefore keeps its own per-processing state:
+
+- a processing creates **at most one page**; later calls reuse the existing page;
+- while a create is in flight, a concurrent call is refused;
+- after an **uncertain** outcome (500/503/transport) the tool refuses to create
+  again and tells the caller to check the parent page first;
+- after a read-back failure or mismatch, the known page is reported and **not**
+  recreated;
+- only a **determinate** failure (nothing was written) leaves the tool able to try
+  again.
+
+The CLI scopes its report the same way: it looks only at the tool results committed
+between the current submission's input entry and its answer entry, so a run that
+does nothing cannot borrow an earlier run's success, and an earlier failure cannot
+poison a later one.
+
+### Limitations
+
+- **The real-model path was exercised, and it is fragile to prompt wording.** The
+  first `--provider deepseek` run *failed*: the model produced a fully conforming
+  analysis but emitted it as text instead of calling the tool (`stopReason=stop`).
+  The run correctly failed and wrote nothing; the cause was the spec's wording
+  ("you *may* be asked to call a tool"), fixed in `906655c`. Treat
+  `prompts/article-analysis.md` as behaviour, not documentation — changing it
+  changes what the model does, and it should be reviewed as such.
+- **One request per article.** An article rendering to more than 100 blocks, or a
+  payload over 500KB, is rejected before writing rather than appended in batches.
+- **No exactly-once guarantee across processes.** Within one processing the guards
+  above hold. Across processes, an interrupted create can still leave a page the
+  probe does not know about; `ArticleWriteIndeterminateError` says so rather than
+  guessing.
+- **Interruption recovery is not exercised.** The tool declares `unsafe`, and
+  Durable's handling of that is covered by the pinned source, but this probe has
+  never crashed mid-write to observe it.
+- **Only the title and the block sequence are compared.** Formatting attributes
+  such as colour or annotations are not asserted.
+
