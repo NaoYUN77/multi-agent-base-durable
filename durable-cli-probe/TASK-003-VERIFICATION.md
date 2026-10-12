@@ -10,8 +10,8 @@
 | 二轮 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | 不通过（5 项：并发预留、取消屏障、已结算重放、delta 解码、pre-submit 边界） | 见 §10 |
 | 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11（实现提交 `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`） |
 | 四轮 | `29839b75ecc5`（`bb544b1` + 文档提交） | 不通过（2×P2：准入测试的握手/窗口、AC-10 证据归属） | 见 §12（实现提交 `202005f750b06dd507a52acc86ce3db5621274bb`） |
-| 五轮 | `ca0748d77305`（`202005f` + 文档提交） | 不通过（1×P1 + 1×P2：为可观察性删弱了生产准入、屏障仍非真正窗口） | 见 §13 |
-| 本轮 | 见 PR 正文（本轮实现提交，完整 SHA；其后的文档提交只改报告与 spec） | 待审阅 | — |
+| 五轮 | `ca0748d77305`（`202005f` + 文档提交） | 不通过（1×P1 + 1×P2：为可观察性删弱了生产准入、屏障仍非真正窗口） | 见 §13（实现提交 `433b319b2c8a0f628b8eececa642d76ba9b41d36`） |
+| 本轮 | `433b319b2c8a0f628b8eececa642d76ba9b41d36`（实现提交，完整 SHA；其后的文档提交只改报告与 spec） | 待审阅 | — |
 
 **结论口径修正**：二轮审阅指出上一版报告把 AC-05/06/07 写成"通过"不成立——当时的实现里并发调用可同时占用同一轮次、取消没有持久化屏障、已结算轮次的原操作重放会再次执行 outcome 逻辑、`revising-intent` kill 点实际发生在 submission 之后、inspect 的 delta 解释会读错合法 op。本报告据实修订：**上一轮的 AC-05/06/07 结论作废**，本轮按新实现与新测试重新给出结论（§3）。
 
@@ -19,7 +19,7 @@
 
 | 项 | 值 |
 |---|---|
-| 被测 commit | `202005f750b06dd507a52acc86ce3db5621274bb`（本轮实现提交，完整 SHA） |
+| 被测 commit | `433b319b2c8a0f628b8eececa642d76ba9b41d36`（本轮实现提交，完整 SHA） |
 | 底座（本地 Pi checkout） | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`（未改动） |
 | 环境 | Windows，Node `v22.22.2` |
 | 自动化检查 | `npm run typecheck` 退出 0；`npm test` **127 passed**（87 既有 + 40 新增，13 个文件） |
@@ -108,19 +108,19 @@
 | smoke5 | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900` | `…/multiagent-smoke5.sqlite` | `multiagent-smoke-5` | `text_stats` | entry 26 / `call_00_EFsnEnDx9sYfvFLCeSQ47497` | `delegate:12:call_00_Rfg0ehv8y3n9pCJr6EsN7216` | `review:36:call_00_MJstmlEwilC7ZyT9Ol234894` | accepted |
 | **smoke6（本轮）** | `202005f750b06dd507a52acc86ce3db5621274bb` | `C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke6.sqlite` | `multiagent-smoke-6` | `text_stats` | entry 26 / `call_00_CnbswNXfgLWBJKIjEYCh2872`（chars=41, count=2, error=false） | `delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416` | `review:40:call_00_25rRWjS1RvZs4zsWsXN10026` | accepted |
 
-smoke6 命令与输出（末尾两行为程序侧校验）：
+smoke7（本轮）命令与输出（末尾两行为程序侧校验）：
 
 ```
 DEEPSEEK_API_KEY=…（本机已有配置，未出现在命令/日志/库中）
 npm run multiagent:probe -- --provider deepseek \
-  --db C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke6.sqlite \
-  --request-id multiagent-smoke-6
+  --db C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke7.sqlite \
+  --request-id multiagent-smoke-7
 …
 ── prompts verified: main.md and sub.md are the installed instructions ──
 ── verified: entry 26 counted MATERIAL in the material (count=2) ──
 ```
 
-smoke6 的只读 inspect（`multiagent:inspect --db <同一库> --task-id task-smoke`）：
+smoke7 的只读 inspect（`multiagent:inspect --db <同一库> --task-id task-smoke`）：
 
 ```
 task: task-smoke
@@ -129,20 +129,20 @@ version: 2
 main conversation: 1
 child conversation: 14
 model: {"provider":"deepseek","modelId":"deepseek-flash"}
-child tools: text_stats
+child tools: text_stats, text_check
 current round: 1
 
 round 1 (initial) requestId=multiagent-round:task-smoke:1
   submissionId: 21
   answerEntryId: 28
-  evidence entry=26 kind=pi.tool-result tool=text_stats byTask=25 call=call_00_CnbswNXfgLWBJKIjEYCh2872 error=false truncated=false
+  evidence entry=26 kind=pi.tool-result tool=text_stats byTask=25 call=call_00_s0JYPRU1l7vAT9KX038b8110 error=false truncated=false
   evidence entry=28 kind=pi.assistant tool=- byTask=- call=- error=false truncated=false
 
-review round 1: accept -> accepted (from awaiting_review) op=review:40:call_00_25rRWjS1RvZs4zsWsXN10026
-event running -> awaiting_review round=1 op=delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416
-event awaiting_review -> accepted round=1 op=review:40:call_00_25rRWjS1RvZs4zsWsXN10026
-operation delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416 kind=delegate task=12 call=… round=1
-operation review:40:call_00_25rRWjS1RvZs4zsWsXN10026 kind=review task=40 call=… round=1 decision=accept
+review round 1: accept -> accepted (from awaiting_review) op=review:36:call_00_VsGQwp66b2knqNSQXosS5485
+event running -> awaiting_review round=1 op=delegate:12:call_00_OD6fQ7S6nqVI66mDuYBs6740
+event awaiting_review -> accepted round=1 op=review:36:call_00_VsGQwp66b2knqNSQXosS5485
+operation delegate:12:call_00_OD6fQ7S6nqVI66mDuYBs6740 kind=delegate task=12 call=… round=1
+operation review:36:call_00_VsGQwp66b2knqNSQXosS5485 kind=review task=36 call=… round=1 decision=accept
 ```
 
 **历史失败记录（保留）**：smoke1（首版代码 `c6fcd6b`）中，子 Agent 把任务描述里的「文本 MATERIAL」当字面量，`text_stats` 收到 `text="MATERIAL"`、`count=1`，主模型仍 accept。修复：任务文本显式给出素材并要求传完整素材 + CLI 增加程序侧验收校验（`marker`、`text` 长度、`count`、`chars`）。该次运行不再作为 AC-10 证据。
@@ -159,7 +159,7 @@ operation review:40:call_00_25rRWjS1RvZs4zsWsXN10026 kind=review task=40 call=�
 
 ## 8. 未执行的验证 / 限制
 
-- **真实运行**：smoke1 误验收（作废）+ smoke3/4/5/6 四次成功（每次的记录见 §6，各次的 SHA/DB/requestId/标识独立）；**仅 deepseek-flash、单任务**。
+- **真实运行**：smoke1 误验收（作废）+ smoke3/4/5/6/7 五次成功（每次的记录见 §6，各次的 SHA/DB/requestId/标识独立）；**仅 deepseek-flash、单任务**。
 - **真实分支只覆盖 accept**：返工/失败/取消/并发由确定性测试（faux）覆盖，未用真实模型演练。
 - 压缩测试收窄 `compaction.keepRecentTokens` 为 48（默认 20000）；默认阈值下未另行实测。
 - **未实测**：并行/递归委派、后台 Agent（Issue 非目标）；多主会话共享子会话；跨机器恢复；超 500 页证据（会显式报错）。
@@ -198,3 +198,4 @@ operation review:40:call_00_25rRWjS1RvZs4zsWsXN10026 kind=review task=40 call=�
 1. **P1 为可观察性删弱了生产准入** → **恢复** `task_delegate` / `task_revise` 在**新 claim 之前**的 `cancelRequested` 拒绝（位置在已绑定重放分支之后；重放路径不变），并保留 Stage 0/1 的执行权与终态守卫。取消意图因此重新成为"新工作的屏障"：取消期间新操作不 claim、不写绑定/轮次、不推进 `currentRound`/`version`、不消耗返工额度。**不再靠删弱生产检查来让测试进入窗口**：改为测试侧**受控 wrapper 延迟取消的启动**，让轮次先 park 到窗口内再开始取消。新增确定性测试：意图已落账 → 新 `task_revise` 被拒且 `rounds`/`operations`/`currentRound`/`version` 全部不变。
 2. **P2 屏障仍非真正窗口** → 新增第二个屏障 **`atSubmit`**，位于**取消闸口之后**、`handle.submit` 之前，正是评审所指的间隙。新测试在该窗口 park（并断言此时意图尚未记录），随后启动取消 → 仍 `cancel pending`；释放后该轮**确实提交**，但取消终态之前其提交被中止/结算，且**终态之后 submission 数不再增加**、子会话无活跃任务——即评审要求的"取消终态之后没有新提交或活跃子工作"。原有前 gate 用例保留。
 3. **文档口径** → 不再声称"屏障在取消闸口之前"却"覆盖闸口已过"：报告与 PR 明确区分两个屏障与各自的覆盖窗口（§4b 表格）。
+4. **本轮真实运行** → 因实现再次变更，在 `433b319…` 上重跑 **smoke7**（exit 0，`prompts verified` + `verified: entry 26 … count=2`），其标识见 §6；smoke6 归入上一轮的记录。
