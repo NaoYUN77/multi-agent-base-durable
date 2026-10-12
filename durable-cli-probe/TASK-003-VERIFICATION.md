@@ -8,8 +8,9 @@
 |---|---|---|---|
 | 首轮 | `c6fcd6be9279176a001c7d1d2545b01bca27a2cd` | 不通过（6×P1 + 2×P2） | 操作绑定、取消、只读 inspect、提示加载、字段补全、测试修正 |
 | 二轮 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | 不通过（5 项：并发预留、取消屏障、已结算重放、delta 解码、pre-submit 边界） | 见 §10 |
-| 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11 |
-| 本轮 | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`（实现提交；其后的文档提交只改本报告与本 spec，不含代码） | 待审阅 | — |
+| 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11（实现提交 `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`） |
+| 四轮 | `29839b75ecc5`（`bb544b1` + 文档提交） | 不通过（2×P2：准入测试的握手/窗口、AC-10 证据归属） | 见 §12（实现提交 `202005f750b06dd507a52acc86ce3db5621274bb`） |
+| 本轮 | `202005f750b06dd507a52acc86ce3db5621274bb`（实现提交，完整 SHA；其后的文档提交只改报告与 spec） | 待审阅 | — |
 
 **结论口径修正**：二轮审阅指出上一版报告把 AC-05/06/07 写成"通过"不成立——当时的实现里并发调用可同时占用同一轮次、取消没有持久化屏障、已结算轮次的原操作重放会再次执行 outcome 逻辑、`revising-intent` kill 点实际发生在 submission 之后、inspect 的 delta 解释会读错合法 op。本报告据实修订：**上一轮的 AC-05/06/07 结论作废**，本轮按新实现与新测试重新给出结论（§3）。
 
@@ -17,7 +18,7 @@
 
 | 项 | 值 |
 |---|---|
-| 被测 commit | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`（本轮实现提交，完整 SHA） |
+| 被测 commit | `202005f750b06dd507a52acc86ce3db5621274bb`（本轮实现提交，完整 SHA） |
 | 底座（本地 Pi checkout） | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`（未改动） |
 | 环境 | Windows，Node `v22.22.2` |
 | 自动化检查 | `npm run typecheck` 退出 0；`npm test` **125 passed**（87 既有 + 38 新增，13 个文件） |
@@ -60,17 +61,17 @@
 | 7 | 省略 `taskId` 的委派 + 中断 | 派生 ID（`task-<toolTaskId>`）在重启前后一致；1 文档、1 子会话、该 ID 的 round 1 submission 恰 1 条 |
 | 8 | **返工的 `beforeSubmit` 屏障**（round 2 意图已落账、其 submission 尚未发生） | kill 时 round 2 的 submission **0 条**、status=revising、round 2 记录含 feedback 与 opKey；重启后 round 2 submission **恰 1 条**、**无 round 3**、round 1 证据与审阅记录不变 |
 
-## 4b. 取消与提交准入（三轮新增）
+## 4b. 取消与提交准入（三轮引入，四轮改为可观察的握手）
 
-`multiagent-cancel-admission.test.ts`（单进程确定性，2 项）：
+设计：**取消意图只在唯一的准入闸口被检查**——Stage 2 的第二次准入，紧邻 `handle.submit`。更早的阶段（claim、Stage 0、Stage 1、第一次准入）只查**执行权**与**终态**，因此持有执行权的轮次总能走到该闸口（可被观察），而"取消已完成"必然意味着任务已终态，所有路径都会拒绝。`beforeSubmit` 验证屏障就位于闸口**之前**，覆盖"闸口已过、提交未发"的窗口。
 
-1. 某一轮被 park 在**验证屏障**（意图已落账、尚未提交），此时执行权由该轮持有；
-2. 同一条消息里的取消运行到结束（记下意图、abort 子会话、完成阶段检查）；
-3. 释放屏障——若没有协议，该轮此刻就会提交。
+`multiagent-cancel-admission.test.ts`（2 项，首轮与返工各一，含显式 enter/release 握手）：
 
-断言的安全性质：**该轮的任何 submission 都不出现**（取消运行期间、释放之后、任务关闭之后各检查一次），最终 `cancelled`、子会话无活跃任务；首轮与返工各一项。
-
-为什么是单进程：底座 `Harness.open` 会把**存活中的 `running` 任务重整并接管执行**，因此第二个进程打开同一数据库不是"协调"，而是"接管/续跑"。真实的准入竞态发生在同一进程内的并行工具调用之间，这也正是本测试驱动的场景；跨进程语义由恢复边界（§4）覆盖。
+1. 同一条消息里发出委派与取消（并行工具调用；同一会话的 inbox 会把第二个提交排队，因此这是唯一能让取消与 park 中的轮次并发的配置）；
+2. 轮次到达屏障后**握手信号 `entered` 触发**，证明它确实处于准入窗口内（而不是"没进入 hook 也照样通过"）；
+3. 在 park 期间断言：执行权仍被该轮持有（`activeOpKey` 匹配 `delegate:`/`revise:`）、`cancelRequested` 已记录、状态非终态、该轮 submission **0 条**，且取消的结果文本为 **`cancel pending`**（工具返回与终态明确区分）；
+4. 释放屏障 → 该轮到达第二次准入，看到意图后拒绝提交（并交回执行权）；
+5. 再次调用取消 → 终态 `cancelled`；断言该轮 submission 始终为 0、子会话无活跃任务；返工用例另断言 round 1 的 submission 数、证据数与审阅记录逐项不变。
 
 ## 5. 只读检查（inspect）
 
@@ -85,15 +86,29 @@
 
 ## 6. 真实 DeepSeek smoke（AC-10）
 
+每次运行独立记录：**被测 SHA 是该次运行时工作区的实现提交**，各次的绝对 DB 路径、requestId 与实际标识互不相同（同名 ID `1/14/21/26/28` 只说明库结构相同，不表示同一次运行）。
+
+| # | 被测实现提交 | 绝对 DB 路径 | requestId | 子工具白名单 | 工具结果 entry / call | delegate op | review op | 结果 |
+|---|---|---|---|---|---|---|---|---|
+| smoke1（作废） | `c6fcd6be9279176a001c7d1d2545b01bca27a2cd` | `C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke.sqlite` | `multiagent-smoke-1` | `text_stats` | entry 26 / `call_00_cPpGGch8tNmQ7ggLLsOZ7399`（`text="MATERIAL"`, count=1，**误验收**） | — | — | 已作废（见下） |
+| smoke3 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | `…/multiagent-smoke3.sqlite` | `multiagent-smoke-3` | `text_stats, text_check` | entry 26 / `call_00_d3WIELqu4dq7VRAICe3Y9269`（chars=41, count=2） | `delegate:12:call_00_l29wjVahqU1xiy4B6qGX5325` | `review:36:call_00_HTZnIEWf8puDJxjzHs6p4025` | accepted |
+| smoke4 | `1bcddc54e1c5d090fedb8f49898f21dec903b73b` | `…/multiagent-smoke4.sqlite` | `multiagent-smoke-4` | `text_stats, text_check` | entry 26 / `call_00_twrCOisUpegCNlNWgK5K8393` | `delegate:12:call_00_My16HqMZB4t1qwQBBcL64500` | `review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443` | accepted |
+| smoke5 | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900` | `…/multiagent-smoke5.sqlite` | `multiagent-smoke-5` | `text_stats` | entry 26 / `call_00_EFsnEnDx9sYfvFLCeSQ47497` | `delegate:12:call_00_Rfg0ehv8y3n9pCJr6EsN7216` | `review:36:call_00_MJstmlEwilC7ZyT9Ol234894` | accepted |
+| **smoke6（本轮）** | `202005f750b06dd507a52acc86ce3db5621274bb` | `C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke6.sqlite` | `multiagent-smoke-6` | `text_stats` | entry 26 / `call_00_CnbswNXfgLWBJKIjEYCh2872`（chars=41, count=2, error=false） | `delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416` | `review:40:call_00_25rRWjS1RvZs4zsWsXN10026` | accepted |
+
+smoke6 命令与输出（末尾两行为程序侧校验）：
+
 ```
 DEEPSEEK_API_KEY=…（本机已有配置，未出现在命令/日志/库中）
 npm run multiagent:probe -- --provider deepseek \
-  --db C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke4.sqlite \
-  --request-id multiagent-smoke-4
+  --db C:/Users/l/.workbuddy-ai/issue9-work/multiagent-smoke6.sqlite \
+  --request-id multiagent-smoke-6
+…
+── prompts verified: main.md and sub.md are the installed instructions ──
+── verified: entry 26 counted MATERIAL in the material (count=2) ──
 ```
 
-退出码 **0**，末尾打印 `── prompts verified: main.md and sub.md are the installed instructions ──` 与 `── verified: entry 26 counted MATERIAL in the material (count=2) ──`。
-`multiagent:inspect -- --db <同一库> --task-id task-smoke` 读回（原文摘录）：
+smoke6 的只读 inspect（`multiagent:inspect --db <同一库> --task-id task-smoke`）：
 
 ```
 task: task-smoke
@@ -102,26 +117,23 @@ version: 2
 main conversation: 1
 child conversation: 14
 model: {"provider":"deepseek","modelId":"deepseek-flash"}
-child tools: text_stats, text_check
+child tools: text_stats
 current round: 1
 
 round 1 (initial) requestId=multiagent-round:task-smoke:1
   submissionId: 21
   answerEntryId: 28
-  evidence entry=26 kind=pi.tool-result tool=text_stats byTask=25 call=call_00_twrCOisUpegCNlNWgK5K8393 error=false truncated=false
-    args={text:<string:41>,marker:"MATERIAL"}
+  evidence entry=26 kind=pi.tool-result tool=text_stats byTask=25 call=call_00_CnbswNXfgLWBJKIjEYCh2872 error=false truncated=false
   evidence entry=28 kind=pi.assistant tool=- byTask=- call=- error=false truncated=false
 
-review round 1: accept -> accepted (from awaiting_review) op=review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443
-event running -> awaiting_review round=1 op=delegate:12:call_00_My16HqMZB4t1qwQBBcL64500
-event awaiting_review -> accepted round=1 op=review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443
-operation delegate:12:call_00_My16HqMZB4t1qwQBBcL64500 kind=delegate task=12 call=… round=1
-operation review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443 kind=review task=36 call=… round=1 decision=accept
+review round 1: accept -> accepted (from awaiting_review) op=review:40:call_00_25rRWjS1RvZs4zsWsXN10026
+event running -> awaiting_review round=1 op=delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416
+event awaiting_review -> accepted round=1 op=review:40:call_00_25rRWjS1RvZs4zsWsXN10026
+operation delegate:12:call_00_Ua4iL1PyYGQbNIlo9qep3416 kind=delegate task=12 call=… round=1
+operation review:40:call_00_25rRWjS1RvZs4zsWsXN10026 kind=review task=40 call=… round=1 decision=accept
 ```
 
-**运行历史**：`multiagent-smoke3.sqlite`、`multiagent-smoke4.sqlite`、`multiagent-smoke5.sqlite` 三次成功（均在实现提交上、程序侧校验通过）。
-
-**历史失败记录（保留）**：首版代码（`c6fcd6b`）的 `multiagent-smoke.sqlite` 中，子 Agent 把任务描述里的「文本 MATERIAL」当字面量，`text_stats` 收到 `text="MATERIAL"`、`count=1`，主模型仍 accept。修复：任务文本显式给出素材并要求传完整素材 + CLI 增加程序侧验收校验（`marker`、`text` 长度、`count`、`chars`）。该旧库不再作为 AC-10 证据。
+**历史失败记录（保留）**：smoke1（首版代码 `c6fcd6b`）中，子 Agent 把任务描述里的「文本 MATERIAL」当字面量，`text_stats` 收到 `text="MATERIAL"`、`count=1`，主模型仍 accept。修复：任务文本显式给出素材并要求传完整素材 + CLI 增加程序侧验收校验（`marker`、`text` 长度、`count`、`chars`）。该次运行不再作为 AC-10 证据。
 
 ## 7. CLI 行为核验
 
@@ -135,7 +147,7 @@ operation review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443 kind=review task=36 call=�
 
 ## 8. 未执行的验证 / 限制
 
-- **真实运行**：首版 1 次（误验收，作废）+ 修复后 2 次成功（`multiagent-smoke3.sqlite`、`multiagent-smoke4.sqlite`）；**仅 deepseek-flash、单任务**。
+- **真实运行**：smoke1 误验收（作废）+ smoke3/4/5/6 四次成功（每次的记录见 §6，各次的 SHA/DB/requestId/标识独立）；**仅 deepseek-flash、单任务**。
 - **真实分支只覆盖 accept**：返工/失败/取消/并发由确定性测试（faux）覆盖，未用真实模型演练。
 - 压缩测试收窄 `compaction.keepRecentTokens` 为 48（默认 20000）；默认阈值下未另行实测。
 - **未实测**：并行/递归委派、后台 Agent（Issue 非目标）；多主会话共享子会话；跨机器恢复；超 500 页证据（会显式报错）。
@@ -162,3 +174,9 @@ operation review:36:call_00_ZrdpEvBKzt9UpBHpugKJ2443 kind=review task=36 call=�
 2. **P1 `task_revise` 无目标轮次** → `round` 改为**必填**，在 claim 的同一个 commit 内校验 `args.round === currentRound`，陈旧反馈被拒且**不消耗返工额度、不改动 rounds/operations/version**；已绑定操作的重放仍返回原绑定。测试：`multiagent.test.ts`「refuses feedback aimed at a round that has already moved on」；并发返工的败者现在也以"陈旧/已被占用"被拒（`multiagent-concurrency.test.ts`）。
 3. **P2 返工 pre-submit 未实测** → 新增恢复边界 8：先完成首轮并合法发起返工，在**round 2 的 `beforeSubmit` 屏障**kill，直接只读确认 `status=revising`、round 2 记录（含 feedback、opKey）存在、round 2 submission **0 条**；重启后 round 2 submission **恰 1 条**、无 round 3、round 1 证据与审阅记录不变。原首轮 pre-submit 测试保留。
 4. **报告口径** → 本报告与本 PR 正文改用**完整 SHA**，并区分实现提交（`1bcddc5…`）与其后的清理提交（`3baeccf…`）；本轮实现提交的完整 SHA 见 PR 正文，不再使用"见 HEAD"。
+
+## 12. 四轮审阅的逐条回应（本轮实现）
+
+1. **P2 准入测试没有握手、屏障不在闸口之后** → ① 把取消意图的检查**收敛到唯一的准入闸口**（Stage 2 第二次准入，紧邻 `handle.submit`）：claim、Stage 0、Stage 1、第一次准入只查执行权与终态，因此持有执行权的轮次**总能到达该闸口**，不会因为并发的取消而在更早阶段被拒绝（这也修掉了"测试可能只证明取消先到"的漏洞）；② `beforeSubmit` 屏障移到闸口**之前**，正好覆盖"闸口已过、提交未发"的窗口；③ 测试改为**显式 enter/release 握手**：先等 `entered` 触发（证明真的进入了窗口），在 park 期间断言执行权被持有、意图已记录、状态非终态、该轮 submission 为 0，并断言取消的返回是 **`cancel pending`**（不再把工具返回与取消终态混称完成），随后释放并断言**仍然 0 条 submission**，最后重试取消得到终态 `cancelled`；首轮与返工各一项。④ 每个拒绝出口（Stage 1、两次准入、failRound、abort、reservation 缺失）都交回执行权，保证 pending 的取消最终能关闭。
+2. **P2 AC-10 证据归属** → §6 改为**逐次分列**：每次运行的被测 SHA、绝对 DB、requestId、子工具白名单、工具结果 entry/call、delegate op、review op 全部独立记录；smoke4/5/6 的 call/op 标识互不相同（已核对）；smoke1 的误验收保留为历史失败记录。本轮以 **smoke6**（在 `202005f…` 上运行）作为 AC-10 证据。
+3. **计数同步** → 全文改为 125 tests / 13 文件、八个恢复边界、四次成功运行；历史条目注明其所属提交。
