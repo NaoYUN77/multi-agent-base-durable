@@ -9,7 +9,7 @@
 | 首轮 | `c6fcd6be9279176a001c7d1d2545b01bca27a2cd` | 不通过（6×P1 + 2×P2） | 操作绑定、取消、只读 inspect、提示加载、字段补全、测试修正 |
 | 二轮 | `321dc5f45b1fa659b1fdda5292dbc93c7fe32994` | 不通过（5 项：并发预留、取消屏障、已结算重放、delta 解码、pre-submit 边界） | 见 §10 |
 | 三轮 | `3baeccf13cb0d84722502b068499d39c7df6efd7`（含实现提交 `1bcddc54e1c5d090fedb8f49898f21dec903b73b` 与清理提交） | 不通过（3 项：取消与提交准入、revise 陈旧保护、返工 pre-submit 边界） | 见 §11 |
-| 本轮 | `a41f6a6`（实现提交，完整 SHA 见 PR 正文；其上仅有一个清理提交） | 待审阅 | — |
+| 本轮 | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`（实现提交；其后的文档提交只改本报告与本 spec，不含代码） | 待审阅 | — |
 
 **结论口径修正**：二轮审阅指出上一版报告把 AC-05/06/07 写成"通过"不成立——当时的实现里并发调用可同时占用同一轮次、取消没有持久化屏障、已结算轮次的原操作重放会再次执行 outcome 逻辑、`revising-intent` kill 点实际发生在 submission 之后、inspect 的 delta 解释会读错合法 op。本报告据实修订：**上一轮的 AC-05/06/07 结论作废**，本轮按新实现与新测试重新给出结论（§3）。
 
@@ -17,7 +17,7 @@
 
 | 项 | 值 |
 |---|---|
-| 被测 commit | 见 PR #10 正文（`workbuddy/issue-9-multiagent-lifecycle` 分支 HEAD，完整 SHA） |
+| 被测 commit | `bb544b1f3bf46fc8a3416097a1a72ded76c4c900`（本轮实现提交，完整 SHA） |
 | 底座（本地 Pi checkout） | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`（未改动） |
 | 环境 | Windows，Node `v22.22.2` |
 | 自动化检查 | `npm run typecheck` 退出 0；`npm test` **125 passed**（87 既有 + 38 新增，13 个文件） |
