@@ -314,9 +314,24 @@ feat(notion): support paginated page content reads (#12)
 
 ## 11. 凭据与权限
 
-- 代码推送使用 **SSH key**（`git@github.com`）。
-- Issue / PR / 评论使用 **Personal Access Token**（HTTPS API）或已认证的 GitHub CLI。
-  - SSH key **无法**执行 Issue、PR 和评论操作——它们不是 git 对象。
+### 11.1 代码传输
+
+代码推送使用 **SSH key**（`git@github.com`）。
+
+SSH **仅用于 Git 传输**，不能作为 REST API 的认证凭据 ——
+Issue、PR 和评论不是 git 对象，`git push` 送不上去。
+
+### 11.2 Issue / PR / 评论
+
+Issue、PR 和评论使用 **GitHub UI、已认证的 GitHub API/连接器，或可用的 CLI**。
+
+**具体认证方式由所用工具决定。** 不同协作者可以使用不同的工具，
+不要求统一，也不要求执行者额外配置 Token。
+
+### 11.3 凭据保存（仅在使用 Token 时适用）
+
+以下要求只在使用 Token 时适用：
+
 - Token 存放于仓库之外的受保护路径，**权限设为仅本用户可读**。
 - Token **不得**出现在源码、commit、日志、Issue 或 PR 正文中。
 - 一旦凭据以明文形式泄露到任何持久位置，应**立即 revoke 并重建**。
