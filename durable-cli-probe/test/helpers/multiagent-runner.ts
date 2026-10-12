@@ -34,15 +34,17 @@
 //   after-outcome       at the barrier after the round's outcome is committed
 //                       and before the parent tool result exists
 //   wait-for-file       hold at the round's verification barrier until
-//                       `--release-file <path>` exists, then continue: the
-//                       cancellation-coordination test drives this from another
-//                       process and proves no submission can follow a cancel
+//                       `--release-file <path>` exists, then continue. Entering
+//                       the barrier writes `<release-file>.entered`, so a driver
+//                       can prove the round really is inside the admission
+//                       window (gate passed, submission not yet made) instead of
+//                       inferring it from concurrency.
 //
 // `--no-task-id` makes the delegation omit `taskId`, so the derived business id
 // (from the tool task) is what recovery has to keep stable.
 
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import type { Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { context, openProbe, openRoot } from "../../src/runtime.ts";
@@ -172,8 +174,10 @@ const runtime = await openProbe({
 					killNow();
 				}
 				if (killWhen === "wait-for-file" && releaseFile !== undefined) {
-					// Hold the round exactly at the "intent committed, no submission
-					// yet" point until the driver releases it.
+					// Handshake: prove we are inside the admission window (the gate has
+					// passed, the submission has not been made), then hold until the
+					// driver releases us.
+					writeFileSync(`${releaseFile}.entered`, "entered");
 					const deadline = Date.now() + 60_000;
 					while (!existsSync(releaseFile) && Date.now() < deadline) {
 						await new Promise((resolve) => setTimeout(resolve, 10));

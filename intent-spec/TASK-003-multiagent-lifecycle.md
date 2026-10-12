@@ -52,7 +52,8 @@ running ──► awaiting_review ──► accepted           （终态）
 4. **证据只来自库**：程序从子会话 Entry/Task/Submission 提取（含 `byTaskId`、`toolCallId`、`data.diagnostics`），参数摘要按定义脱敏（长字符串 → `<string:N>`），分页必须完整否则显式失败；最终答案取 `settled.answer`，空答案即失败。模型从不自述 ID 或成功状态。
 5. **台账事件显式持久化**在 Document 内（`events`/`reviews`/`operations`），不依赖默认 revision 策略。
 6. **只读取证不走 Harness**：`multiagent:inspect` 用裸 SQLite `readOnly` 连接 + **Chord 公开 `apply`** 重建文档值，不迁移、不重整 running 任务、不创建 root；遇到非法 op 显式失败。
-7. **取消是持久化屏障 + 与提交准入共享执行权**：`task_cancel` 先写取消意图（此后不再启动新轮次、不再提交、`failRound` 让位并交回执行权），再 abort 子会话，**只在没有任何轮次持有执行权且子会话无活跃任务时**才落 `cancelled`；否则保留意图并报告 `cancel pending`。执行权从 claim 一直持有到该轮 outcome/fail commit，持有者任务已 terminal 时视为陈旧并回收。
+7. **取消是持久化屏障 + 与提交准入共享执行权**：`task_cancel` 先写取消意图，再 abort 子会话，**只在没有任何轮次持有执行权且子会话无活跃任务时**才落 `cancelled`；否则保留意图并报告 `cancel pending`（工具内有界重试）。执行权从 claim 一直持有到该轮 outcome/fail commit；持有者任务已 terminal 时视为陈旧并回收；`failRound` 遇取消意图时让位并交回执行权；被中止的提交不算失败。
+   - **取消意图只在唯一的准入闸口被检查**（Stage 2 的第二次准入，紧邻 `handle.submit`）。轮次仍要经过 Stage 0/1 与第一次准入（只查执行权），因此持有权利的轮次总能到达该闸口并可被观察；而"取消已完成"意味着任务已终态，所有路径都会拒绝。`beforeSubmit` 验证屏障就位于这个闸口之前，使"闸口已过、提交未发"的窗口可被确定性复现。
 8. **审阅与返工都必须指名目标轮次**：`task_review.round`、`task_revise.round` 均为必填，且在 claim/写入的同一个 commit 内与 `currentRound` 核对；陈旧请求被拒且不改动任何记录（不消耗返工额度）。
 
 ## 验收对照（AC-01 ~ AC-10）

@@ -191,7 +191,6 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 					// receipt later, which `runDelegationRound` does by itself).
 					return { round: bound.round, childTools: granted.map((tool) => tool.name), error: undefined };
 				}
-				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${taskId} is being cancelled.` };
 				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${taskId} is ${doc.status}; it accepts nothing further.` };
 				if (doc.rounds.length > 0) return { round: 0, childTools: [], error: `task ${taskId} was already delegated; use task_revise or task_review.` };
 				if (doc.activeOpKey !== undefined) {
@@ -257,7 +256,6 @@ export function createMultiagentExtension(options: MultiagentExtensionOptions): 
 				if (bound !== undefined) {
 					return { round: bound.round, childTools: [...doc.childTools], error: undefined };
 				}
-				if (doc.cancelRequested !== undefined) return { round: 0, childTools: [], error: `task ${args.taskId} is being cancelled.` };
 				if (isTerminal(doc.status)) return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}; it accepts nothing further.` };
 				if (doc.status !== "awaiting_review" && doc.status !== "revising") {
 					return { round: 0, childTools: [], error: `task ${args.taskId} is ${doc.status}, not revisable.` };

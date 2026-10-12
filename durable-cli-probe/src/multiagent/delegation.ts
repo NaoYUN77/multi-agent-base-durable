@@ -142,10 +142,10 @@ export async function runDelegationRound(
 		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
 		const settled = doc.rounds.find((round) => round.requestId === requestId && round.settledAt !== undefined);
 		if (settled !== undefined) return { receipt: settled, child: doc.childConversationId } as const;
-		if (doc.cancelRequested !== undefined) {
-			releaseRound(doc, input.opKey);
-			return { error: `task ${input.taskId} is being cancelled` } as const;
-		}
+		// The cancel intent is deliberately NOT checked here: it is enforced at the
+		// single boundary that gates the submission (Stage 2, second admission), so
+		// a round that holds the right always reaches that boundary and can be
+		// observed. A *completed* cancel is terminal, which every path here refuses.
 		if (doc.status === "failed" || doc.status === "accepted" || doc.status === "cancelled") {
 			return { error: `task ${input.taskId} is ${doc.status}` } as const;
 		}
@@ -180,13 +180,15 @@ export async function runDelegationRound(
 	}
 
 	// ── Stage 1: child conversation, created once and reused forever ────────
-	// The same gate as Stage 0 applies here: a cancel that landed between the two
-	// commits must not be followed by a freshly created child conversation.
+	// This stage checks the execution right only. A cancel cannot have completed
+	// while this round holds the right, so a child cannot be created *after* a
+	// completed cancel; the cancel intent itself is enforced at the single
+	// boundary that gates the submission (Stage 2, second admission), which also
+	// keeps that boundary reachable for observation.
 	let childId: ConversationId;
 	try {
 		childId = await api.commit(async (tx) => {
 			const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
-			if (doc.cancelRequested !== undefined) throw new Error(`task ${input.taskId} is being cancelled`);
 			if (doc.activeOpKey !== input.opKey) throw new Error(`task ${input.taskId} round ${input.round} is held by another operation`);
 			if (doc.mainConversationId === undefined) doc.mainConversationId = api.conversationId;
 			if (doc.createdAt === 0) doc.createdAt = Date.now();
@@ -208,6 +210,10 @@ export async function runDelegationRound(
 			return record.id;
 		}, callContext);
 	} catch (error) {
+		await api.commit(async (tx) => {
+			const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
+			releaseRound(doc, input.opKey);
+		}, callContext);
 		return {
 			ok: false,
 			childConversationId: undefined,
@@ -244,23 +250,13 @@ export async function runDelegationRound(
 		};
 	}
 
-	// ── Stage 2: the verification barrier, then the submission ──────────────
-	if (host.beforeSubmit !== undefined) await host.beforeSubmit({ taskId: input.taskId, round: input.round, requestId });
-
-	// A cancel that arrived after the reservation must stop the submission.
-	const blocked = await api.commit(async (tx) => {
-		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
-		if (doc.cancelRequested !== undefined) {
-			// Abandon the round and hand the execution right back: a cancel that is
-			// already pending must be able to close the task without waiting for a
-			// round that will never submit.
-			releaseRound(doc, input.opKey);
-			return `task ${input.taskId} is being cancelled`;
-		}
-		if (doc.activeOpKey !== input.opKey) return `task ${input.taskId} round ${input.round} is held by another operation`;
-		return undefined;
-	}, callContext);
-	if (blocked !== undefined) {
+	// ── Stage 2: admission to the submission ────────────────────────────────
+	// First admission checks only the execution right: a round that holds the
+	// right may always reach its barrier, where a cancellation can observe it.
+	// The cancel intent itself is checked at the last moment, immediately before
+	// the submission (below), which is what actually gates the submit.
+	const blockedEarly = await admission(api, callContext, input, false);
+	if (blockedEarly !== undefined) {
 		return {
 			ok: false,
 			childConversationId: childId,
@@ -268,7 +264,28 @@ export async function runDelegationRound(
 			answerText: undefined,
 			answerEntryId: undefined,
 			extraction: undefined,
-			error: blocked,
+			error: blockedEarly,
+		};
+	}
+
+	// The verification barrier sits *inside* the admission window: the gate above
+	// has already passed and the submission below has not been made. The recovery
+	// and admission tests park the round here.
+	if (host.beforeSubmit !== undefined) await host.beforeSubmit({ taskId: input.taskId, round: input.round, requestId });
+
+	// Second admission, immediately before the submission: a cancel that landed
+	// while the round was parked stops it here. The execution right is what makes
+	// the cancel itself unable to close the task during that window.
+	const blockedLate = await admission(api, callContext, input, true);
+	if (blockedLate !== undefined) {
+		return {
+			ok: false,
+			childConversationId: childId,
+			submissionId: undefined,
+			answerText: undefined,
+			answerEntryId: undefined,
+			extraction: undefined,
+			error: blockedLate,
 		};
 	}
 
@@ -398,6 +415,29 @@ export async function runDelegationRound(
 
 	if (host.afterOutcome !== undefined) await host.afterOutcome({ taskId: input.taskId, round: input.round, requestId });
 	return outcome;
+}
+
+/**
+ * Submission admission for one round: the operation must still hold the
+ * execution right and no cancel may be pending. A refusal hands the right back,
+ * so a pending cancel can close the task without waiting for a round that will
+ * never submit.
+ */
+async function admission(
+	api: ToolExecutionApi,
+	callContext: Context,
+	input: RoundInput,
+	checkCancel: boolean,
+): Promise<string | undefined> {
+	return api.commit(async (tx) => {
+		const doc = await tx.doc(TaskLedgerDoc, api.conversationId, input.taskId, { taskId: input.taskId, model: input.model });
+		if (checkCancel && doc.cancelRequested !== undefined) {
+			releaseRound(doc, input.opKey);
+			return `task ${input.taskId} is being cancelled`;
+		}
+		if (doc.activeOpKey !== input.opKey) return `task ${input.taskId} round ${input.round} is held by another operation`;
+		return undefined;
+	}, callContext);
 }
 
 /**
