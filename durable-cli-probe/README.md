@@ -759,6 +759,8 @@ poison a later one.
 
 ## 18. TASK-004 — typecheck, lint, and the pinned Pi checkout
 
+第一版 CI 的能力、实际验证证据、保障边界和后续补充计划见 [CI 文档](docs/ci.md)。
+
 This section supersedes the manual `npm install --ignore-scripts` + `npm run link` dance in
 §3 for a from-scratch setup. One entry point now does all of it, in a fixed order, and CI runs
 exactly the same entry point (`.github/workflows/ci.yml`).
