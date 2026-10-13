@@ -1,9 +1,10 @@
 // TASK-005.1 test/agent-state.test.ts
 //
 // The shared state machine, its quota accounting, and the things that can only be
-// checked against a real harness and a real file: that a submission stops the
-// round, that the five documents survive a reopen, and that evidence from another
-// conversation is refused (AC-05, AC-03, AC-04).
+// checked against a real harness and a real file: that a settled structured answer
+// is the submission (and a tool call never is), that the five documents survive a
+// reopen, and that evidence from another conversation is refused (AC-05, AC-03,
+// AC-04).
 //
 // Evidence discipline: assertions are about what the harness persisted and how
 // many provider turns actually happened, never about what a tool printed.
@@ -21,7 +22,7 @@ import { RUN_CONFIG_SCHEMA_VERSION, validateRunConfig, validateTaskConfigSnapsho
 import { validateClarificationState } from "../src/agent/contracts/clarification.ts";
 import { validatePlan } from "../src/agent/contracts/plan.ts";
 import { assembleTaskResult, validateTaskResult, type PersistedEntryIndex } from "../src/agent/contracts/task-result.ts";
-import { createFinishTaskTool } from "../src/agent/tools/finish-task.ts";
+import { completeSubmission } from "../src/agent/state/finish.ts";
 import { QuotaError, businessStopReason, consume, initialQuotaState, isBusinessBudgetExhausted, quotaRemaining, resetRoundCounters } from "../src/agent/state/quota.ts";
 import {
 	IllegalTransitionError,
@@ -301,23 +302,47 @@ async function entriesOf(conversation: Conversation): Promise<EntryRecord[]> {
 	return [...page.items].reverse();
 }
 
-/** The tool result of one named call: what the model saw, and whether it failed. */
-function toolResultOf(entries: readonly EntryRecord[], toolName: string): { readonly text: string; readonly isError: boolean } | undefined {
-	for (const entry of entries) {
-		for (const message of entry.model ?? []) {
-			const typed = message as { role?: string; toolName?: string; content?: unknown; isError?: boolean };
-			if (typed.role !== "toolResult" || typed.toolName !== toolName) continue;
-			const parts = Array.isArray(typed.content) ? typed.content : [];
-			const text = parts
-				.map((part) => (typeof part === "object" && part !== null && "text" in part ? String((part as { text?: unknown }).text ?? "") : ""))
-				.join("\n");
-			return { text, isError: typed.isError === true };
+/** The answering assistant message's text, as persisted. */
+function assistantTextOf(entry: EntryRecord | undefined): string | undefined {
+	if (entry === undefined) return undefined;
+	const parts: string[] = [];
+	for (const message of entry.model ?? []) {
+		const typed = message as { role?: string; content?: unknown };
+		if (typed.role !== "assistant") continue;
+		if (typeof typed.content === "string") parts.push(typed.content);
+		else if (Array.isArray(typed.content)) {
+			for (const part of typed.content) {
+				if (typeof part === "object" && part !== null && "text" in part) parts.push(String((part as { text?: unknown }).text ?? ""));
+			}
 		}
 	}
-	return undefined;
+	return parts.length === 0 ? undefined : parts.join("\n");
 }
 
-describe("TASK-005.1 finish — a submission the round can actually honour (AC-05)", () => {
+/** The work contract a submission's final answer must carry. */
+const submissionWork = {
+	summary: "Revenue is 1,204 units, quoted from the material.",
+	findings: ["quoted verbatim"],
+	unresolved: [],
+	artifacts: [],
+};
+
+/** The completion the program actually accepts: the settled answer, read and validated. */
+function submissionOf(entries: readonly EntryRecord[], settled: { readonly status: "queued" | "placed" | "done" | "unanswered"; readonly answer?: unknown }) {
+	const answerEntryId = settled.status === "done" ? String(settled.answer) : undefined;
+	return completeSubmission({
+		settlement: settled,
+		...(answerEntryId === undefined ? {} : { answerEntryId }),
+		...(answerEntryId === undefined ? {} : { answerText: assistantTextOf(entries.find((entry) => String(entry.id) === answerEntryId)) }),
+	});
+}
+
+// Each suite below opens a real harness over a real SQLite file, which is an
+// order of magnitude slower than the pure checks above and can be stretched
+// several-fold when the whole suite runs in parallel. The default five-second
+// per-test budget is too tight for that, so the budget is stated explicitly
+// rather than left to the machine's load.
+describe("TASK-005.1 finish — the completion boundary is the settled answer (AC-05)", { timeout: 30_000 }, () => {
 	let directory: string;
 	let databasePath: string;
 
@@ -330,168 +355,125 @@ describe("TASK-005.1 finish — a submission the round can actually honour (AC-0
 		await rm(directory, { recursive: true, force: true });
 	});
 
-	it("ends the run when the submission is the only call its round can contain", async () => {
+	/** One submission whose final answer is `answerText`, read back through the boundary. */
+	const settleWithAnswer = async (answerText: string, requestId: string) => {
 		const runtime: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
-			fauxToolTurns: [[{ name: "finish_task", arguments: { summary: "Revenue is 1,204 units, quoted from the material.", findings: ["quoted verbatim"] } }]],
-			// Any further provider request would prove the round did not stop.
-			fauxRouter: () => {
-				throw new Error("the run must not make a second provider request");
-			},
-			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool()] })],
+			fauxResponses: [answerText],
+			extensions: [defineExtension({ name: "agent-finish", tools: [siblingTool] })],
 		});
 		try {
 			const root = await openRoot(runtime);
 			runtime.harness.resume();
-			const submission = await root.submit({ type: "input", content: "Verify the figure.", requestId: "finish-alone-1" }, context);
+			const submission = await root.submit({ type: "input", content: "Do the work and submit.", requestId }, context);
 			const settled = await submission.wait(context);
-
-			expect(settled.status).toBe("done");
-			if (settled.status !== "done" || settled.type !== "input") throw new Error("expected an input answer");
-
 			const entries = await entriesOf(root);
-			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
-			// The stop is structural: exactly one assistant turn (the one that asked
-			// to finish), and no further model request.
-			expect(assistantEntries).toHaveLength(1);
-			const result = toolResultOf(entries, "finish_task");
-			expect(result?.isError).toBe(false);
-			// The tool says the round is asking to end; it does not claim completion.
-			expect(result?.text).toContain("asking to end");
-			expect(result?.text).not.toContain("Finished");
-			// The model's work is persisted in the call it made.
-			expect(JSON.stringify(assistantEntries[0]?.model ?? [])).toContain("Revenue is 1,204 units, quoted from the material.");
-			// Real identifiers, for a reader reopening this database.
-			expect({ conversationId: root.id, submissionEntry: settled.entry, answer: settled.answer, assistant: assistantEntries.map((e) => e.id) }).toEqual({
-				conversationId: root.id,
-				submissionEntry: settled.entry,
-				answer: settled.answer,
-				assistant: assistantEntries.map((e) => e.id),
-			});
+			return { settled, entries, completed: submissionOf(entries, settled) };
 		} finally {
 			await runtime.close();
 		}
+	};
+
+	it("accepts a settled structured answer as the submission, bare or fenced", async () => {
+		const { settled, entries, completed } = await settleWithAnswer(JSON.stringify(submissionWork), "finish-answer-1");
+		expect(settled.status).toBe("done");
+		if (settled.status !== "done") return;
+
+		// The answering turn is the one that ended the run: a turn with no tool
+		// calls, which needs no cooperation from any sibling.
+		const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
+		expect(assistantEntries).toHaveLength(1);
+		expect(String(settled.answer)).toBe(String(assistantEntries[0]?.id));
+
+		expect(completed.ok).toBe(true);
+		if (completed.ok) {
+			expect(completed.value.answerEntryId).toBe(String(settled.answer));
+			expect(completed.value.work).toEqual(submissionWork);
+		}
+
+		// The same payload inside a fenced block is accepted too: the answer may
+		// carry a sentence, but the contract has to be in the block.
+		const fenced = ["Here is the result:", "```json", JSON.stringify(submissionWork), "```"].join("\n");
+		const wrapped = await settleWithAnswer(fenced, "finish-answer-fenced-1");
+		expect(wrapped.completed.ok).toBe(true);
+		if (wrapped.completed.ok) expect(wrapped.completed.value.work).toEqual(submissionWork);
 	});
 
-	it("works in a session that also has business tools: do the work, then submit alone", async () => {
+	it("settles but does not accept an answer that is not the work contract", async () => {
+		// Prose instead of a payload: settled, but nothing to accept.
+		const unparseable = await settleWithAnswer("I have finished the review.", "finish-answer-prose-1");
+		expect(unparseable.settled.status).toBe("done");
+		expect(unparseable.completed.ok).toBe(false);
+		if (!unparseable.completed.ok) expect(unparseable.completed.violations.map((item) => item.code)).toContain("submission_result_unparseable");
+
+		// Valid JSON, invalid contract (no summary): the run settled, the
+		// submission did not.
+		const invalid = await settleWithAnswer(JSON.stringify({ findings: ["quoted verbatim"] }), "finish-answer-invalid-1");
+		expect(invalid.settled.status).toBe("done");
+		expect(invalid.completed.ok).toBe(false);
+		if (!invalid.completed.ok) {
+			expect(invalid.completed.violations.map((item) => item.code)).toContain("submission_result_invalid");
+			expect(invalid.completed.violations.some((item) => item.path === "$.answer.summary")).toBe(true);
+		}
+
+		// And a model payload cannot smuggle runtime-owned fields into the answer.
+		const reserved = await settleWithAnswer(JSON.stringify({ ...submissionWork, status: "completed" }), "finish-answer-reserved-1");
+		expect(reserved.completed.ok).toBe(false);
+		if (!reserved.completed.ok) expect(reserved.completed.violations.map((item) => item.code)).toContain("reserved_field");
+	});
+
+	it("never treats a tool call as a submission, and no business call follows the answer", async () => {
+		// The shape that failed before: business work in early rounds, and a
+		// submission that must end the run by itself.
 		const runtime: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
 			fauxToolTurns: [
-				// Round 1: a business call, which does not ask to terminate.
 				[{ name: "sibling_noop", arguments: {} }],
-				// Round 2: the submission, alone. This is the round that ends the run.
-				[{ name: "finish_task", arguments: { summary: "Revenue is 1,204 units, quoted from the material.", findings: ["quoted verbatim"] } }],
+				[{ name: "sibling_noop", arguments: {} }],
 			],
-			// A third provider request would reach the router, which refuses to
-			// answer: the run must end on round 2.
+			fauxResponses: [JSON.stringify(submissionWork)],
+			// A further provider request — the only way to start a business call —
+			// would reach the router, which refuses.
 			fauxRouter: () => {
-				throw new Error("the run must not make a third provider request");
+				throw new Error("the run must not make a further provider request");
 			},
-			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool(), siblingTool] })],
+			extensions: [defineExtension({ name: "agent-finish", tools: [siblingTool] })],
 		});
 		try {
 			const root = await openRoot(runtime);
 			runtime.harness.resume();
-			const submission = await root.submit({ type: "input", content: "Use the sibling, then submit.", requestId: "finish-business-1" }, context);
+			const submission = await root.submit({ type: "input", content: "Work twice, then submit.", requestId: "finish-answer-business-1" }, context);
 			const settled = await submission.wait(context);
 			expect(settled.status).toBe("done");
+			if (settled.status !== "done") return;
 
 			const entries = await entriesOf(root);
-			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
-			// Two rounds: the business call, then the submission that ended the run.
-			expect(assistantEntries).toHaveLength(2);
-			const result = toolResultOf(entries, "finish_task");
-			expect(result?.isError).toBe(false);
-			expect(result?.text).toContain("asking to end");
-			expect(result?.text).not.toContain("Finished");
+			// Three turns: two business rounds, then the answer that ended the run.
+			// The business calls happened *before* the submission — that is what
+			// makes "no business call after the submission" a structural property
+			// rather than a request to the model.
+			expect(entries.filter((entry) => entry.kind === "pi.assistant")).toHaveLength(3);
+			const answerIndex = entries.findIndex((entry) => String(entry.id) === String(settled.answer));
+			expect(answerIndex).toBe(entries.length - 1);
+			const businessResults = entries.filter((entry) => entry.kind === "pi.tool-result");
+			expect(businessResults).toHaveLength(2);
+			expect(entries.slice(answerIndex + 1).filter((entry) => entry.kind === "pi.tool-result")).toHaveLength(0);
 
-			// Settled means settled: nothing else ran, and the transcript is stable.
+			const completed = submissionOf(entries, settled);
+			expect(completed.ok).toBe(true);
+			if (completed.ok) expect(completed.value.work).toEqual(submissionWork);
+
+			// Settled means settled: the transcript does not move afterwards.
 			const after = await entriesOf(root);
 			expect(after.map((entry) => `${entry.kind}#${entry.id}`)).toEqual(entries.map((entry) => `${entry.kind}#${entry.id}`));
 		} finally {
 			await runtime.close();
 		}
 	});
-
-	it("does not end the run when the submission shares its round with another call", async () => {
-		const runtime: ProbeRuntime = await openProbe({
-			databasePath,
-			provider: "faux",
-			fauxToolTurns: [
-				[
-					{ name: "finish_task", arguments: { summary: "Submitted next to a sibling call." } },
-					{ name: "sibling_noop", arguments: {} },
-				],
-			],
-			fauxResponses: ["Answer after the round that did not end."],
-			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool(), siblingTool] })],
-		});
-		try {
-			const root = await openRoot(runtime);
-			runtime.harness.resume();
-			const submission = await root.submit({ type: "input", content: "Verify, then also do the sibling.", requestId: "finish-competing-1" }, context);
-			const settled = await submission.wait(context);
-			expect(settled.status).toBe("done");
-
-			const entries = await entriesOf(root);
-			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
-			// The round did not end — the harness requires *every* call of the round
-			// to ask for it — so the run continued to a second round. The tool asked
-			// and said so; it never claimed the run had ended.
-			expect(assistantEntries).toHaveLength(2);
-			const result = toolResultOf(entries, "finish_task");
-			expect(result?.isError).toBe(false);
-			expect(result?.text).toContain("only call of the round");
-			expect(result?.text).not.toContain("Finished");
-		} finally {
-			await runtime.close();
-		}
-	});
 });
-describe("TASK-005.1 finish — an invalid submission is never a stop (AC-05)", () => {
-	let directory: string;
-	let databasePath: string;
-
-	beforeEach(async () => {
-		directory = await mkdtemp(join(tmpdir(), "agent-state-invalid-"));
-		databasePath = join(directory, "state.sqlite");
-	});
-
-	afterEach(async () => {
-		await rm(directory, { recursive: true, force: true });
-	});
-
-	it("refuses an empty summary and lets the round continue", async () => {
-		const runtime: ProbeRuntime = await openProbe({
-			databasePath,
-			provider: "faux",
-			fauxToolTurns: [[{ name: "finish_task", arguments: { summary: "" } }]],
-			fauxResponses: ["Answer after the refused submission."],
-			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool()] })],
-		});
-		try {
-			const root = await openRoot(runtime);
-			runtime.harness.resume();
-			const submission = await root.submit({ type: "input", content: "Submit an empty summary.", requestId: "finish-invalid-1" }, context);
-			const settled = await submission.wait(context);
-			expect(settled.status).toBe("done");
-
-			const entries = await entriesOf(root);
-			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
-			// The round continued past the refused submission.
-			expect(assistantEntries).toHaveLength(2);
-			const result = toolResultOf(entries, "finish_task");
-			expect(result?.isError).toBe(true);
-			expect(entries.filter((entry) => entry.kind === "pi.tool-result").length).toBeGreaterThanOrEqual(1);
-		} finally {
-			await runtime.close();
-		}
-	});
-});
-
-describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)", () => {
+describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)", { timeout: 30_000 }, () => {
 	let directory: string;
 	let databasePath: string;
 
@@ -504,24 +486,29 @@ describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)",
 		await rm(directory, { recursive: true, force: true });
 	});
 
-	it("keeps the settled round unchanged across a reopen", async () => {
+	it("keeps the settled submission unchanged across a reopen", async () => {
 		const first: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
-			fauxToolTurns: [[{ name: "finish_task", arguments: { summary: "Revenue is 1,204 units, quoted from the material." } }]],
+			fauxResponses: [JSON.stringify(submissionWork)],
 			fauxRouter: () => {
 				throw new Error("a reopen must not make a provider request");
 			},
-			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool()] })],
+			extensions: [defineExtension({ name: "agent-finish", tools: [siblingTool] })],
 		});
 		let before: readonly string[];
+		let beforeWork: unknown;
 		try {
 			const root = await openRoot(first);
 			first.harness.resume();
 			const submission = await root.submit({ type: "input", content: "Verify the figure.", requestId: "finish-reopen-1" }, context);
 			const settled = await submission.wait(context);
 			expect(settled.status).toBe("done");
-			before = (await entriesOf(root)).map((entry) => `${entry.kind}#${entry.id}`);
+			const entries = await entriesOf(root);
+			before = entries.map((entry) => `${entry.kind}#${entry.id}`);
+			const completed = submissionOf(entries, settled);
+			expect(completed.ok).toBe(true);
+			if (completed.ok) beforeWork = completed.value.work;
 		} finally {
 			await first.close();
 		}
@@ -537,17 +524,22 @@ describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)",
 		});
 		try {
 			const root = await openRoot(second);
-			const after = (await entriesOf(root)).map((entry) => `${entry.kind}#${entry.id}`);
-			// Same conversation, same entries in the same order: a settled round is
-			// not re-run and its outcome is not rewritten by the reopen.
-			expect(after).toEqual(before);
-			expect(after.filter((kind) => kind.startsWith("pi.assistant"))).toHaveLength(1);
+			const entries = await entriesOf(root);
+			// Same conversation, same entries in the same order: a settled run is not
+			// re-run and its outcome is not rewritten by the reopen.
+			expect(entries.map((entry) => `${entry.kind}#${entry.id}`)).toEqual(before);
+			expect(entries.filter((entry) => entry.kind === "pi.assistant")).toHaveLength(1);
+			// And the submission read back from the reopened database is the same one.
+			const answerEntry = entries.find((entry) => entry.kind === "pi.assistant");
+			const reread = completeSubmission({ settlement: { status: "done" }, answerEntryId: String(answerEntry?.id), answerText: assistantTextOf(answerEntry) });
+			expect(reread.ok).toBe(true);
+			if (reread.ok) expect(reread.value.work).toEqual(beforeWork);
 		} finally {
 			await second.close();
 		}
 	});
 });
-describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
+describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_000 }, () => {
 	let directory: string;
 	let databasePath: string;
 
@@ -589,7 +581,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 			assembledPrompt: "Check the supplied material only.",
 			skillVersion: "1.0.0",
 			skillHash: "a".repeat(64),
-			tools: [{ name: "finish_task", version: "1.0.0" }],
+			tools: [{ name: "text_check", version: "1.0.0" }],
 			model: "faux-faux-1",
 			budget: (validateRunConfig({
 				schemaVersion: RUN_CONFIG_SCHEMA_VERSION,
@@ -701,7 +693,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 			expect(after.config.snapshot?.model).toBe("faux-faux-1");
 			expect(after.config.snapshot?.configHash).toBe("b".repeat(64));
 			expect(after.config.snapshot?.budget.maxToolInvocationsPerRound).toBe(8);
-			expect(after.config.snapshot?.tools).toEqual([{ name: "finish_task", version: "1.0.0" }]);
+			expect(after.config.snapshot?.tools).toEqual([{ name: "text_check", version: "1.0.0" }]);
 			expect(after.result.result?.evidence).toEqual([{ entryId: "42", kind: "pi.tool-result", byTaskId: taskId, toolCallId: "call-1", toolName: "text_check" }]);
 			expect(after.result.result?.work).toEqual({
 				summary: "The figure matches.",
@@ -722,7 +714,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 		}
 	});
 });
-describe("TASK-005.1 documents — evidence attribution against real entries (AC-04)", () => {
+describe("TASK-005.1 documents — evidence attribution against real entries (AC-04)", { timeout: 30_000 }, () => {
 	let directory: string;
 	let databasePath: string;
 

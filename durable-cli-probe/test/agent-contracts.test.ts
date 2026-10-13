@@ -22,7 +22,7 @@ import { RUN_CONFIG_SCHEMA_VERSION, validateRunConfig, validateTaskConfigSnapsho
 import { TASK_RESULT_SCHEMA_VERSION, assembleTaskResult, validateModelWork, validateTaskResult, type PersistedEntryIndex } from "../src/agent/contracts/task-result.ts";
 import { TASK_SPEC_SCHEMA_VERSION, validateTaskBatch, validateTaskSpec } from "../src/agent/contracts/task-spec.ts";
 import { assertFieldOwner, modelForbiddenPaths, modelWritablePaths, ownerOf } from "../src/agent/state/authorization.ts";
-import { decideFinish, isRunEnded, isTerminateRequested } from "../src/agent/state/finish.ts";
+import { completeSubmission, isRunEnded, parseStructuredAnswer } from "../src/agent/state/finish.ts";
 import { AGENT_DOCUMENT_KINDS } from "../src/agent/contracts/documents.ts";
 
 /** A spec that passes, so each test can break exactly one thing. */
@@ -573,35 +573,69 @@ describe("TASK-005.1 contracts — document kinds", () => {
 	});
 });
 
-describe("TASK-005.1 contracts — the finish decision is a request, not a settlement (AC-05)", () => {
-	it("asks to end on valid work, whether or not the conversation could call something else", () => {
-		const alone = decideFinish({ roundMayHaveCompetitors: false, answerValidated: true });
-		expect(alone.kind).toBe("terminate");
-		if (alone.kind === "terminate") {
-			// The tool may say what it asked, and never that the run ended.
-			expect(alone.statement).toContain("asking to end");
-			expect(alone.statement).not.toContain("Finished");
-		}
+describe("TASK-005.1 contracts — the completion boundary is the settled answer (AC-05)", () => {
+	const work = { summary: "Revenue is 1,204 units.", findings: ["quoted verbatim"], unresolved: [], artifacts: [] };
 
-		// A session with business tools is a usable session, not a refused one.
-		const withBusinessTools = decideFinish({ roundMayHaveCompetitors: true, answerValidated: true });
-		expect(withBusinessTools.kind).toBe("terminate");
-		if (withBusinessTools.kind === "terminate") {
-			// And it says the round has to be finish_task's alone for that to hold.
-			expect(withBusinessTools.statement).toContain("only call of the round");
-			expect(withBusinessTools.statement).not.toContain("Finished");
+	it("reads the payload from a bare JSON answer and from a fenced block", () => {
+		const bare = parseStructuredAnswer(JSON.stringify(work));
+		expect(bare.ok).toBe(true);
+		if (bare.ok) expect(bare.value).toEqual(work);
+
+		const fenced = parseStructuredAnswer(`Here is the result:\n\`\`\`json\n${JSON.stringify(work)}\n\`\`\``);
+		expect(fenced.ok).toBe(true);
+		if (fenced.ok) expect(fenced.value).toEqual(work);
+	});
+
+	it("refuses prose, an empty answer and an unterminated fence", () => {
+		for (const text of ["I finished the review.", "", "```json\n{\"summary\":\"x\"}", "no payload here"]) {
+			const parsed = parseStructuredAnswer(text);
+			expect(parsed.ok).toBe(false);
+			if (!parsed.ok) expect(parsed.violations.map((item) => item.code)).toContain(text.trim() === "" ? "submission_answer_empty" : "submission_result_unparseable");
 		}
 	});
 
-	it("refuses work that failed its contract, and never asks to end on it", () => {
-		const decision = decideFinish({ roundMayHaveCompetitors: false, answerValidated: false });
-		expect(decision.kind).toBe("refuse");
-		if (decision.kind === "refuse") expect(decision.code).toBe("finish_answer_invalid");
+	it("accepts a submission only after the run settled with a valid answer", () => {
+		const settled = completeSubmission({ settlement: { status: "done" }, answerEntryId: "21", answerText: JSON.stringify(work) });
+		expect(settled.ok).toBe(true);
+		if (settled.ok) {
+			expect(settled.value.answerEntryId).toBe("21");
+			expect(settled.value.work).toEqual(work);
+		}
 	});
 
-	it("separates the request to end from the run having ended", () => {
-		expect(isTerminateRequested({ terminateRequested: true })).toBe(true);
-		// Only the settlement the program received says the run is over.
+	it("refuses a run that has not settled: a tool call is not a submission", () => {
+		for (const status of ["queued", "placed"] as const) {
+			const early = completeSubmission({ settlement: { status }, answerEntryId: "21", answerText: JSON.stringify(work) });
+			expect(early.ok).toBe(false);
+			if (!early.ok) expect(early.violations.map((item) => item.code)).toContain("submission_not_settled");
+		}
+		const unanswered = completeSubmission({ settlement: { status: "unanswered" } });
+		expect(unanswered.ok).toBe(false);
+		if (!unanswered.ok) expect(unanswered.violations.map((item) => item.code)).toContain("submission_unanswered");
+	});
+
+	it("refuses a settled answer that is unreadable, invalid, missing or carries reserved fields", () => {
+		const unreadable = completeSubmission({ settlement: { status: "done" }, answerEntryId: "21", answerText: "All done." });
+		expect(unreadable.ok).toBe(false);
+		if (!unreadable.ok) expect(unreadable.violations.map((item) => item.code)).toContain("submission_result_unparseable");
+
+		const invalid = completeSubmission({ settlement: { status: "done" }, answerEntryId: "21", answerText: JSON.stringify({ findings: ["x"] }) });
+		expect(invalid.ok).toBe(false);
+		if (!invalid.ok) {
+			expect(invalid.violations.map((item) => item.code)).toContain("submission_result_invalid");
+			expect(invalid.violations.some((item) => item.path === "$.answer.summary")).toBe(true);
+		}
+
+		const reserved = completeSubmission({ settlement: { status: "done" }, answerEntryId: "21", answerText: JSON.stringify({ ...work, status: "completed" }) });
+		expect(reserved.ok).toBe(false);
+		if (!reserved.ok) expect(reserved.violations.map((item) => item.code)).toContain("reserved_field");
+
+		const noAnswer = completeSubmission({ settlement: { status: "done" }, answerText: JSON.stringify(work) });
+		expect(noAnswer.ok).toBe(false);
+		if (!noAnswer.ok) expect(noAnswer.violations.map((item) => item.code)).toContain("submission_answer_missing");
+	});
+
+	it("separates a settled run from a run that is still going", () => {
 		expect(isRunEnded({ status: "done" })).toBe(true);
 		expect(isRunEnded({ status: "unanswered" })).toBe(true);
 		expect(isRunEnded({ status: "queued" })).toBe(false);

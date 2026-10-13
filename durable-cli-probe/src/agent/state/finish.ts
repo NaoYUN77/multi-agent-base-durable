@@ -1,123 +1,68 @@
 // TASK-005.1 src/agent/state/finish.ts
 //
-// The finish protocol: how a sub-agent's round ends on purpose, derived from the
-// locked source and encoded so a caller cannot get it wrong by accident.
+// The completion boundary: how a sub-agent's run ends, and what the program may
+// then treat as its submission.
 //
 // ── Source basis (pinned Pi `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f`) ────────
 //
 //   `packages/durable/src/harness/types.ts`
 //     `ToolControl = { addTools?: readonly string[]; terminate?: true; handoff?: string }`
-//     `ToolExecutionResult.control?: ToolControl`
-//     a tool returns its control on the result; nothing else can set it.
+//     `ToolExecutionResult.control?: ToolControl` — a tool returns its control on
+//     its result, and nothing else can set it.
 //
 //   `packages/durable/src/harness/generation.ts` → `finishToolRound`
-//     "Every call of the round, including those answered without a task, must ask
-//      to terminate."
-//       terminate = slots.length > 0 && slots.every((slot) => slot.taskId !== undefined
-//                && controls.get(slot.taskId)?.terminate === true)
-//     On terminate (or a handoff, or a queued reset) the boundary is applied as
-//     `"final"` and the run is ended:
-//       endRun(tx, live, runtime.taskId, { status: "done", answer: assistant })
-//     and no generation is created for a further model round — the only thing
-//     that may follow is a new run for *queued user inputs*.
+//     `terminate = slots.length > 0 && slots.every((slot) => slot.taskId !== undefined
+//                  && controls.get(slot.taskId)?.terminate === true)`
+//     `if (terminate || handoff !== undefined)` → `applyBoundary(…, "final", …)` and
+//     `endRun(…, { status: "done", answer: assistant })`; otherwise the run is
+//     handed to the next generation, i.e. **it continues**.
 //
-//   Consequences this module encodes:
-//     1. A round ends on purpose only when **every** call of that round asks to
-//        terminate. A `finish_task` call beside a call that does not terminate
-//        does not stop anything.
-//     2. The stop is the run ending, so the program learns it by awaiting the
-//        submission it already made (`Submission.wait`) — never by trusting that
-//        a tool called `finish_task` ran.
-//     3. `handoff` is the *reset* variant: it ends the run and starts a new one
-//        for the handoff content. That is how a question ends its round while the
-//        conversation stays open.
+//   `packages/durable/src/harness/generation.ts` → `answer`
+//     A final answer — an assistant turn with **no tool calls** — applies the
+//     `"final"` boundary and runs
+//     `endRun(tx, live, runtime.taskId, { status: "done", answer: entry.id })`.
 //
-// ── The alternative protocol, recorded for completeness ─────────────────────
+// ── Why the tool route is not this contract's completion boundary ─────────────
 //
-// If the run could not be stopped through `control.terminate`, the only sound
-// fallback is a schema-validated final answer plus `Submission.wait`: the run
-// ends when the model stops issuing tool calls and produces a final answer, and
-// the program settles on the submission. That is strictly weaker — it depends on
-// the model choosing to stop rather than on the run actually ending — so it is a
-// documented fallback, not the default, and never "make the prompt say stop".
-// With `control.terminate` available in the pinned source, the fallback is not
-// used here.
+// `control.terminate` takes effect only when **every** call of the round asks for
+// it, and a tool call cannot see its siblings. A `finish_task` call beside any
+// call that does not terminate is therefore silently ignored: the run continues,
+// a later round can still start business calls, and the only way to make the stop
+// happen is to ask the model to keep its submission alone in its round. That is a
+// request to the model, not a guarantee by the program — and "a valid submission
+// followed by more business work" is exactly what AC-05 forbids. Measured, not
+// assumed: `intent-spec/TASK-005.1-contracts.md` §7.3 records the run where the
+// first valid submission was followed by a second business call.
+//
+// (`handoff` does end the run unconditionally, but it also appends a reset entry
+// and moves the conversation head — a side effect on the child conversation that
+// this contract does not ask for, so it is not used either.)
+//
+// ── The chosen protocol: a structured final answer + the settlement ──────────
+//
+//   1. The model does its work with the tools it is authorized to call, over as
+//      many rounds as it needs.
+//   2. It submits by producing a final answer whose text is the work contract as
+//      JSON. The turn has no tool calls, so the harness applies the `"final"`
+//      boundary and ends the run. This needs no cooperation from a sibling: a
+//      turn with no tool calls has no siblings.
+//   3. The program awaits the settlement it already holds (`Submission.wait`).
+//      Only `done` counts: `queued`/`placed` are not settled, and `unanswered`
+//      has no answer to accept.
+//   4. Only then does the program read the answering entry and validate its
+//      payload — {@link completeSubmission}. **No tool call is ever a
+//      submission**: completion is defined after the run settled *and* the
+//      result validated, so "a finish call that has not terminated the run"
+//      cannot be mistaken for a successful one.
+//
+// The property AC-05 asks for then holds structurally rather than by prompt:
+// business calls happen before the submission, and the submission is the end of
+// the run.
 
-// ── The protocol this module settles on ──────────────────────────────────────
-//
-// A round of a sub-agent ends like this:
-//
-//   1. The model does its work with whatever business tools it is authorized to
-//      call — as many rounds as it needs.
-//   2. When it has something to submit, it calls `finish_task` with its own work
-//      and nothing else in that round.
-//   3. `finish_task` returns `control: { terminate: true }`. The harness ends the
-//      run at the final boundary **iff every call of the round asked to
-//      terminate** — so step 2's "and nothing else" is what makes it take effect.
-//   4. The program learns the run is over from the settlement of the submission
-//      it already made (`Submission.wait`), never from the tool having run.
-//
-// Why `finish_task` asks unconditionally instead of refusing when the conversation
-// is authorized to call other tools: a tool call cannot see its siblings'
-// controls, so "the authorized set contains more than finish_task" is not a fact
-// about this round — it is true of every usable sub-agent, and refusing on it
-// made the tool unusable in exactly the sessions that need it. What the tool can
-// do honestly is *ask* and say what it asked: the terminate is a request the
-// harness evaluates, and the tool's output never claims the run ended.
-//
-// The documented fallback, for a future Runtime that cannot rely on step 3: a
-// schema-validated final answer with no tool calls, settled the same way through
-// `Submission.wait`. It is strictly weaker (it depends on the model choosing to
-// stop rather than on the run actually ending), so it is a fallback — never
-// "make the prompt say stop".
-
-/** What the finish decision engine was asked. */
-export type FinishDecisionInput = {
-	/**
-	 * Whether the conversation may call tools other than `finish_task`. This is
-	 * **not** a statement about what this round contains — the tool cannot see its
-	 * siblings — it only decides how much the tool's own output may claim.
-	 */
-	readonly roundMayHaveCompetitors: boolean;
-	/** Did the model's submitted work pass the contract validation? */
-	readonly answerValidated: boolean;
-};
-
-export type FinishDecision =
-	/** Ask the harness to end the round. `statement` is all the tool may tell the model. */
-	| { readonly kind: "terminate"; readonly statement: string }
-	/** Refuse the call outright: no control, an error result. */
-	| { readonly kind: "refuse"; readonly code: string; readonly detail: string };
-
-/**
- * Decide what a finish call does. Pure, no IO, no documents touched.
- *
- * An unvalidated payload is refused: we never ask to end a round on work that
- * failed its contract, because the stop would then look like a settlement of
- * something that was never valid. A valid payload is always asked for, and the
- * statement is worded to the one thing the tool knows — that it asked.
- */
-export function decideFinish(input: FinishDecisionInput): FinishDecision {
-	if (!input.answerValidated) {
-		return { kind: "refuse", code: "finish_answer_invalid", detail: "the submitted work failed contract validation; the round was not asked to end" };
-	}
-	if (input.roundMayHaveCompetitors) {
-		return {
-			kind: "terminate",
-			statement:
-				"Submission recorded. This round is asking to end. The run ends only if every call of this round also asked to end, so if the run continues, call finish_task again as the only call of the round.",
-		};
-	}
-	return { kind: "terminate", statement: "Submission recorded. This round is asking to end; the run outcome is recorded after the submission settles." };
-}
-
-/**
- * Whether the round *asked* to end. This is a request predicate, and it is named
- * as one: a tool returning `terminate` is not the run having ended.
- */
-export function isTerminateRequested(input: { readonly terminateRequested: boolean }): boolean {
-	return input.terminateRequested;
-}
+import type { ContractValidation } from "../contracts/errors.ts";
+import { Violations } from "../contracts/validate.ts";
+import type { ModelWork } from "../contracts/task-result.ts";
+import { validateModelWork } from "../contracts/task-result.ts";
 
 /** The statuses a submission can report; only the last two are terminal. */
 export type RunSettlementStatus = "queued" | "placed" | "done" | "unanswered";
@@ -131,4 +76,122 @@ export type RunSettlementStatus = "queued" | "placed" | "done" | "unanswered";
  */
 export function isRunEnded(settlement: { readonly status: RunSettlementStatus }): boolean {
 	return settlement.status === "done" || settlement.status === "unanswered";
+}
+
+/** What the program accepted, once the run settled and its answer validated. */
+export type SettledSubmission = {
+	/** The assistant entry that answered: the evidence that a submission exists. */
+	readonly answerEntryId: string;
+	/** The model's validated work content, read from that entry's text. */
+	readonly work: ModelWork;
+};
+
+/**
+ * The facts a caller reads after a settlement and hands in. Pure input: nothing
+ * here touches the harness, so the completion rule stays a pure function of what
+ * persistence actually holds.
+ */
+export type SubmissionCompletionInput = {
+	/** The settlement `Submission.wait` returned. */
+	readonly settlement: { readonly status: RunSettlementStatus };
+	/** The entry that answered, when the settlement is `done`. */
+	readonly answerEntryId?: string;
+	/** The answering assistant message's text, exactly as persisted. */
+	readonly answerText?: string;
+};
+
+/**
+ * Extract the structured payload from a final answer.
+ *
+ * Two forms are accepted, both exact: the whole text is the JSON object, or the
+ * first fenced code block is. Nothing is guessed from surrounding prose — a model
+ * that wraps its answer in commentary must still put the contract inside one of
+ * them, and a payload that cannot be read is refused rather than partially
+ * interpreted. Performs no IO.
+ */
+export function parseStructuredAnswer(text: string): ContractValidation<unknown> {
+	const collect = new Violations();
+	const trimmed = text.trim();
+	if (trimmed === "") {
+		collect.add("submission_answer_empty", "$", "the final answer is empty");
+		return collect.finish(undefined as unknown as unknown);
+	}
+	const direct = tryParse(trimmed);
+	if (direct.ok) return { ok: true, value: direct.value };
+	const fenced = firstFence(trimmed);
+	if (fenced !== undefined) {
+		const parsed = tryParse(fenced);
+		if (parsed.ok) return { ok: true, value: parsed.value };
+	}
+	collect.add("submission_result_unparseable", "$", "the final answer is neither a JSON object nor a fenced JSON block");
+	return collect.finish(undefined as unknown as unknown);
+}
+
+function tryParse(text: string): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+	try {
+		return { ok: true, value: JSON.parse(text) as unknown };
+	} catch {
+		return { ok: false };
+	}
+}
+
+/** The contents of the first fenced block, when the text has one. */
+function firstFence(text: string): string | undefined {
+	const lines = text.split(/\r?\n/);
+	const start = lines.findIndex((line) => line.trimStart().startsWith("```"));
+	if (start === -1) return undefined;
+	const end = lines.findIndex((line, index) => index > start && line.trim() === "```");
+	if (end === -1) return undefined;
+	return lines
+		.slice(start + 1, end)
+		.join("\n")
+		.trim();
+}
+
+/**
+ * Complete a submission: the run must have settled with an answer, and that
+ * answer's payload must satisfy the work contract.
+ *
+ * This is the whole completion rule, and deliberately the only one. There is no
+ * branch for a tool call, because a tool call is not a submission — the round it
+ * happened in may not even have ended. The order is the contract: settle first,
+ * validate second, and only then is there something a reviewer can accept.
+ *
+ * Performs no IO: the caller reads the settlement and the answering entry and
+ * hands them in, so the rule is a pure function of persisted facts.
+ */
+export function completeSubmission(input: SubmissionCompletionInput): ContractValidation<SettledSubmission> {
+	const collect = new Violations();
+	if (!isRunEnded(input.settlement)) {
+		collect.add(
+			"submission_not_settled",
+			"$.settlement.status",
+			`the submission is ${input.settlement.status}; a run that has not settled has no submission`,
+		);
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	if (input.settlement.status !== "done") {
+		collect.add("submission_unanswered", "$.settlement.status", "the input settled without an answer, so there is nothing to accept");
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	if (input.answerEntryId === undefined || input.answerEntryId.trim() === "") {
+		collect.add("submission_answer_missing", "$.answerEntryId", "a settled submission must name the entry that answered it");
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	if (input.answerText === undefined) {
+		collect.add("submission_answer_missing", "$.answerText", "the answering entry's text was not read");
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	const parsed = parseStructuredAnswer(input.answerText);
+	if (!parsed.ok) {
+		for (const item of parsed.violations) collect.add(item.code, `$.answer${item.path.slice(1)}`, item.detail);
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	const work = validateModelWork(parsed.value);
+	if (!work.ok) {
+		collect.add("submission_result_invalid", "$.answer", "the final answer does not satisfy the work contract");
+		for (const item of work.violations) collect.add(item.code, `$.answer${item.path.slice(1)}`, item.detail);
+		return collect.finish(undefined as unknown as SettledSubmission);
+	}
+	return collect.finish({ answerEntryId: input.answerEntryId, work: work.value });
 }
