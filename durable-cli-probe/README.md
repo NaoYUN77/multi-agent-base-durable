@@ -838,8 +838,10 @@ sha256 of the bytes).
 `.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and `workflow_dispatch`.
 Two jobs on `ubuntu-latest`, named exactly `lint` and `typecheck`, each prepares the
 environment with `scripts/prepare.mjs` and then runs one command. Other v1 properties:
-`permissions: contents: read`, `concurrency` cancels superseded runs of the same ref,
-Node/npm pinned to 22.22.2, every action pinned to a full commit SHA (version in a comment),
+`permissions: contents: read`, `concurrency` cancels superseded runs of the same ref, Node pinned to
+**22.22.2** (npm is whatever that Node distribution ships — 10.9.7 — and neither version is assumed:
+the workflow's revision step and `prepare.mjs` both print `node --version` / `npm --version`, so every
+run records the pair it actually used), every action pinned to a full commit SHA (version in a comment),
 npm download cache keyed on the pinned Pi commit plus the app lockfile hash, and no
 `dist/` in the cache so a missing build can never be masked by a cache hit. No secrets, no
 `pull_request_target`, no `continue-on-error`, no path filters.
