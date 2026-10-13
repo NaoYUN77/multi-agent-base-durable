@@ -26,14 +26,16 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { Client } from "@notionhq/client";
-import { ArticleAnalysisError, parseArticleAnalysis, type ArticleInput } from "../article/contract.ts";
-import { ArticleRenderError, renderArticleBlocks, toCreatePageParameters } from "./article-blocks.ts";
+import { ArticleAnalysisError, parseArticleAnalysis, type ArticleAnalysis, type ArticleInput } from "../article/contract.ts";
+import { ArticleRenderError, renderArticleBlocks, toCreatePageParameters, type RenderedArticle } from "./article-blocks.ts";
 import {
 	ArticleWriteIndeterminateError,
 	INDETERMINATE_GUIDANCE,
 	createArticlePage,
 	readBackArticlePage,
+	type ArticleWriteResult,
 	type ArticleWriteStats,
+	type ReadBackReport,
 } from "./article-write.ts";
 import { NotionRequestError } from "./client.ts";
 
@@ -209,7 +211,7 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			}
 
 			// ── 1. Validate the model's reply against the article ───────────────
-			let analysis;
+			let analysis: ArticleAnalysis;
 			try {
 				analysis = parseArticleAnalysis({ paragraphs: args.paragraphs }, article.paragraphs.length);
 			} catch (error) {
@@ -223,7 +225,7 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			}
 
 			// ── 2. Render, rejecting anything a single request cannot carry ─────
-			let rendered;
+			let rendered: RenderedArticle;
 			try {
 				rendered = renderArticleBlocks(article, analysis);
 			} catch (error) {
@@ -264,7 +266,7 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			// Marked before the await so a second call arriving while this one is in
 			// flight sees `running` rather than starting a create of its own.
 			state = { kind: "running" };
-			let created;
+			let created: ArticleWriteResult;
 			try {
 				created = await createArticlePage(
 					client,
@@ -304,7 +306,7 @@ export function createNotionWriteArticleTool(options: NotionWriteToolOptions) {
 			// A 200 from create proves a page exists, not that it says the right
 			// thing. The read-back is the actual acceptance check, and it covers the
 			// title as well as the blocks.
-			let readBack;
+			let readBack: ReadBackReport;
 			try {
 				readBack = await readBackArticlePage(client, created.pageId, rendered.children, rendered.title);
 			} catch (error) {

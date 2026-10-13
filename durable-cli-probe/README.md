@@ -755,3 +755,82 @@ poison a later one.
 - **Only the title and the block sequence are compared.** Formatting attributes
   such as colour or annotations are not asserted.
 
+---
+
+## 18. TASK-004 — typecheck, lint, and the pinned Pi checkout
+
+This section supersedes the manual `npm install --ignore-scripts` + `npm run link` dance in
+§3 for a from-scratch setup. One entry point now does all of it, in a fixed order, and CI runs
+exactly the same entry point (`.github/workflows/ci.yml`).
+
+### 18.1 One preparation command
+
+```bash
+cd durable-cli-probe
+
+# From a fresh clone (nothing pre-existing):
+npm run pi:prepare
+
+# Or prove nothing pre-existing is relied upon first:
+npm run pi:prepare -- --clean
+```
+
+`scripts/prepare.mjs` runs, in order, and fails on the first step that does not hold:
+
+| # | step | what it guarantees |
+|---|---|---|
+| 1 | read `pi-pin.json` | one pinned identity for the upstream checkout |
+| 2 | prepare the checkout at the pinned commit | `git rev-parse HEAD` equals the pin; a dirty or mismatched checkout is a hard failure, never a silent rewrite |
+| 3 | `npm ci --ignore-scripts` (upstream, then app) | installs from the lockfiles, no lifecycle scripts |
+| 4 | `packages/chord` → `packages/ai` → `packages/durable` builds | the `dist/*.d.ts` the app's typecheck resolves |
+| 5 | `scripts/link-checkout.mjs` (unchanged from TASK-001) | the three names are symlinks into the checkout, one identity per package |
+| 6 | verification | SHA, package name, symlink target, and the existence of the built declarations |
+
+Two things it deliberately does **not** do: the upstream `npm run check` (it runs
+`biome check --write`, which rewrites files) and the upstream full `build` /
+`generate-models` (only the minimal chain above; `ai`'s `build:offline` reads the model data
+committed at the pinned commit instead of regenerating it).
+
+### 18.2 The two checks
+
+```bash
+npm run typecheck   # tsc --noEmit; strict, unchanged from TASK-001
+npm run lint        # biome lint .; read-only, never --write / --fix
+```
+
+`npm run lint` exits non-zero on a lint **error**; warnings do not fail it (the first version
+does not turn warnings into a gate — see §18.5). The Biome scope is `src/**/*.ts`,
+`test/**/*.ts`, `scripts/**/*.mjs` and `vitest.config.ts`, declared in `biome.json`; the Pi
+checkout, `node_modules`, `data/` (SQLite files) and any `dist/` are outside it by
+construction, not by an ignore list. `noExplicitAny` is set to `error`.
+
+### 18.3 Where the Pi version is pinned
+
+`durable-cli-probe/pi-pin.json` — the official repository URL, the full commit SHA, the three
+package names, and the minimal build chain. Local preparation and CI both read this one file.
+To move the pin, edit that file; everything else follows. Do not substitute a branch, a tag, or
+a registry version: the whole point is that a checkout, a local run and a CI run resolve to
+byte-identical code.
+
+### 18.4 CI
+
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and `workflow_dispatch`.
+Two jobs on `ubuntu-latest`, named exactly `lint` and `typecheck`, each prepares the
+environment with `scripts/prepare.mjs` and then runs one command. Other v1 properties:
+`permissions: contents: read`, `concurrency` cancels superseded runs of the same ref,
+Node/npm pinned to 22.22.2, every action pinned to a full commit SHA (version in a comment),
+npm download cache keyed on the pinned Pi commit plus the app lockfile hash, and no
+`dist/` in the cache so a missing build can never be masked by a cache hit. No secrets, no
+`pull_request_target`, no `continue-on-error`, no path filters.
+
+### 18.5 Common preparation failures
+
+| symptom | cause | what to do |
+|---|---|---|
+| `checkout revision conflict: pinned <A>, found <B>` | the checkout is on a different commit than `pi-pin.json` | move it aside or point `PI_CHECKOUT` at another clone; the script never rewrites a checkout for you |
+| `checkout has local modifications` | `git status --porcelain` in the checkout is not empty | commit, stash or discard inside the checkout; building on top of a dirty tree would hide the real revision |
+| `npm ci` aborts with `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]` | an agent/session guard on this machine requires confirmation before a process bulk-deletes; `npm ci` replaces an existing `node_modules` | approve the deletion in the UI, or remove `node_modules` yourself and re-run. A fresh clone has nothing to delete and never hits this |
+| `spawnSync`/`execSync` fail with `EBUSY` while `spawn` works | some Windows hosts refuse synchronous child-process creation to processes started from a node script | nothing to do: `prepare.mjs` uses async `spawn` on purpose |
+| `npm warn EBADENGINE ... @earendil-works/gondolin@0.12.0 requires node >=23.6.0` | the upstream workspace contains a package that wants a newer Node than the pinned 22.22.2 | informational only; the three packages this app uses build and typecheck on 22.22.2 |
+| `dist/index.d.ts is missing` during verification | the build step did not run or failed silently | re-run `npm run pi:prepare -- --clean` and read the build output |
+

@@ -28,8 +28,12 @@ function run(args: readonly string[], timeoutMs = 60_000): Promise<{ code: numbe
 		const child = spawn(NODE, args, { stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
-		child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-		child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdout += chunk.toString();
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
 		const timer = setTimeout(() => {
 			child.kill("SIGKILL");
 			reject(new Error(`timed out: ${stderr.slice(-300)}`));

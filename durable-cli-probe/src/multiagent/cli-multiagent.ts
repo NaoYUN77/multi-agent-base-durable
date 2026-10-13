@@ -156,7 +156,8 @@ function watchAndKill(databasePath: string, condition: string, intervalMs = 5): 
 	const require = createRequire(import.meta.url);
 	const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
 	const deadline = Date.now() + 120_000;
-	const poll = (): void => {
+	// `undefined`, not `void`: every early exit is `kill()`, which is `never`.
+	const poll = (): undefined => {
 		try {
 			const db = new DatabaseSync(databasePath, { readOnly: true });
 			try {

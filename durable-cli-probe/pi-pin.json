@@ -1,0 +1,21 @@
+{
+	"comment": "TASK-004: the single pinned identity of the upstream Pi checkout. Read by scripts/prepare.mjs (local) and by .github/workflows/ci.yml (CI, through the same script). Never replace the commit with a branch name, a tag, or a registry version.",
+	"repository": "https://github.com/earendil-works/pi.git",
+	"commit": "f44707e7f7190a8cc86ce105790c72c6b0f5fd5f",
+	"packages": [
+		{ "name": "@earendil-works/chord", "dir": "packages/chord" },
+		{ "name": "@earendil-works/pi-ai", "dir": "packages/ai" },
+		{ "name": "@earendil-works/pi-durable", "dir": "packages/durable" }
+	],
+	"build": [
+		{ "dir": "packages/chord", "script": "build" },
+		{ "dir": "packages/ai", "script": "build:offline" },
+		{ "dir": "packages/durable", "script": "build" }
+	],
+	"verified": {
+		"fetchedFromOfficialRemoteOn": "2026-10-13",
+		"node": "v22.22.2",
+		"npm": "10.9.7",
+		"note": "The commit was fetched by SHA from the repository above (git fetch --depth 1 origin <sha>), so CI can reproduce the exact same tree without a full clone."
+	}
+}
