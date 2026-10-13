@@ -9,22 +9,41 @@
 // first-class fields, appended in the same commit as the status transition they
 // belong to.
 //
-// Status machine (all transitions validated by `assertTransition`):
+// Status machine: the shared table in `src/agent/state/lifecycle.ts` now owns it
+// (TASK-005.1). This ledger's own diagram, for TASK-003 history, was:
 //
 //   running ──► awaiting_review ──► accepted
 //      │              │  └────────► revising ──► awaiting_review (max 2 rounds)
 //      │              └───────────► failed / cancelled
 //      └──────────────────────────► failed / cancelled
 //
+// The shared table keeps those edges and adds the TASK-005 ones (`planned`,
+// `awaiting_input`, and a revision round as `running` instead of `revising`).
 // `accepted`, `failed` and `cancelled` are terminal: the program refuses any
 // further execution or revision against a terminal task (contract §7), while
 // history and evidence stay readable.
 
 import type { ConversationId, EntryId, ModelRef } from "@earendil-works/pi-durable";
+import {
+	BUSINESS_TRANSITIONS,
+	IllegalTransitionError,
+	assertBusinessTransition,
+	isTerminalBusinessStatus,
+	type TaskBusinessStatus,
+} from "../agent/state/lifecycle.ts";
 import { defineDocFamily } from "@earendil-works/pi-durable";
 
-/** Business statuses of one task. Technical errors land in `failed`, never accepted. */
-export type TaskBusinessStatus = "running" | "awaiting_review" | "revising" | "accepted" | "failed" | "cancelled";
+/**
+ * Business statuses of one task.
+ *
+ * The transition table is the shared one (`src/agent/state/lifecycle.ts`), so the
+ * ledger, the TASK-005 contracts and every later component cannot disagree about
+ * which transitions exist. `revising` is the legacy label TASK-003 wrote; it is
+ * still accepted on read (an executing revision round *is* `running` in the new
+ * machine), which is why old documents need no data migration and why the
+ * existing multiagent regression suites keep passing unchanged.
+ */
+export type { TaskBusinessStatus };
 
 /** One delegation round: the initial execution or one revision. */
 export type RoundRecord = {
@@ -211,38 +230,32 @@ export const TaskLedgerDoc = defineDocFamily<TaskLedgerState, { readonly taskId:
 /** Maximum revision rounds per task (contract §8: one initial execution + two revisions). */
 export const MAX_REVISIONS = 2;
 
-/** Legal status transitions. A terminal status has no outgoing edge. */
-const TRANSITIONS: Readonly<Record<TaskBusinessStatus, readonly TaskBusinessStatus[]>> = {
-	running: ["awaiting_review", "failed", "cancelled"],
-	awaiting_review: ["revising", "accepted", "failed", "cancelled"],
-	revising: ["awaiting_review", "failed", "cancelled"],
-	accepted: [],
-	failed: [],
-	cancelled: [],
-};
+/**
+ * The shared transition table, re-exported for the ledger's callers. Terminal
+ * statuses have no outgoing edge, so `accepted`, `failed` and `cancelled` can
+ * never be resurrected — not by a new tool call, and not by a replay of an old
+ * one.
+ */
+export { BUSINESS_TRANSITIONS as TASK_BUSINESS_TRANSITIONS, IllegalTransitionError, isTerminalBusinessStatus };
 
+/** Terminal check for the ledger's callers, backed by the shared table. */
 export function isTerminal(status: TaskBusinessStatus): boolean {
-	return TRANSITIONS[status].length === 0;
+	return isTerminalBusinessStatus(status);
 }
 
-/** Thrown when a transition would violate the contract; the caller must not persist anything. */
-export class IllegalTransitionError extends Error {
-	readonly taskId: string;
-	readonly before: TaskBusinessStatus;
-	readonly after: TaskBusinessStatus;
-	constructor(taskId: string, before: TaskBusinessStatus, after: TaskBusinessStatus) {
-		super(`task ${taskId}: illegal transition ${before} -> ${after}`);
-		this.name = "IllegalTransitionError";
-		this.taskId = taskId;
-		this.before = before;
-		this.after = after;
-	}
-}
-
-/** Validate one transition, throwing `IllegalTransitionError` on violation. */
+/**
+ * Validate one transition, throwing `IllegalTransitionError` on violation. The
+ * ledger adds the task id to the shared error so a refusal is attributable.
+ */
 export function assertTransition(taskId: string, before: TaskBusinessStatus, after: TaskBusinessStatus): void {
-	if (before === after) throw new IllegalTransitionError(taskId, before, after);
-	if (!TRANSITIONS[before].includes(after)) throw new IllegalTransitionError(taskId, before, after);
+	try {
+		assertBusinessTransition(before, after);
+	} catch (error) {
+		if (error instanceof IllegalTransitionError) {
+			throw new IllegalTransitionError(before, after, `${error.detail}; task ${taskId}`);
+		}
+		throw error;
+	}
 }
 
 /**
@@ -419,7 +432,9 @@ export function recordTransition(
 	doc.status = to;
 	doc.version += 1;
 	// A task that is no longer executing a round holds no execution right.
-	if (to !== "revising") {
+	// `revising` is TASK-003's label for an executing revision round and `running`
+	// is TASK-005's: both keep the right, because a revision round still holds it.
+	if (to !== "revising" && to !== "running") {
 		doc.activeOpKey = undefined;
 		doc.activeRound = undefined;
 		doc.activeToolTaskId = undefined;
