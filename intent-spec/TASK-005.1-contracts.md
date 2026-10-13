@@ -180,8 +180,19 @@ run 继续，后续轮次仍可发起业务调用，唯一能让停止发生的�
 于是 AC-05 要的性质是**结构性**成立的，而不是靠提示词：业务调用发生在提交之前，提交就是 run 的结束。
 
 `completeSubmission` 的稳定拒绝码：`submission_not_settled` / `submission_unanswered` / `submission_answer_missing` /
-`submission_answer_empty` / `submission_result_unparseable` / `submission_result_invalid`
+`submission_answer_empty` / `submission_answer_ambiguous` / `submission_result_unparseable` / `submission_result_invalid`
 （后者同时转发 `validateModelWork` 的违规码，例如 `reserved_field`，路径前缀 `$.answer`）。
+
+**"唯一 fenced 块"是被检查的，不是被假定的。** `parseStructuredAnswer` 扫描**全部**围栏，
+而不是取第一对：
+
+- 恰好 1 个完整块 → 解析该块；块内 payload 非法 → `submission_result_unparseable`。
+- **多于 1 个完整块** → `submission_answer_ambiguous`（路径 `$`）。
+- 1 个完整块 + 1 个**未闭合**围栏 → 同样 `submission_answer_ambiguous`。
+
+取第一块会让模型自己的更正（第二块）被忽略，而它已被取代的草稿却被当成最终工作提交——
+这正是"不能通过实现悄悄改变约定"要避免的。歧义必须拒绝，不能猜。
+（此条为 Codex 第 4 轮 P2-1 的修复。）
 
 **不得自行 accepted**：标记接受仍是 Main 依据持久化证据的决定；`completeSubmission` 只回答"这个提交是否成立"。
 
@@ -195,9 +206,16 @@ run 继续，后续轮次仍可发起业务调用，唯一能让停止发生的�
 | 带 fenced 代码块的回答 | 同样被接受（正文可以包一层说明，但合同必须放进代码块） |
 | 散文回答 / 无效 JSON / 带 runtime 字段的回答 | run 结算为 `done`，但 `completeSubmission` 拒绝：`submission_result_unparseable` / `submission_result_invalid`（路径 `$.answer.summary`）/ `reserved_field` |
 | **工具调用不是提交**：两轮业务调用之后才回答 | **3 条 assistant**、2 条业务 tool-result，全部在回答之前；回答之后 **0** 条 tool-result；路由器若被调用即失败（没有第 4 次 provider 请求） |
-| 关闭后重开同一 SQLite | 条目序列完全一致，重开后重读回答得到同一份 `work`；重开期间任何 provider 请求都会让测试失败 |
+| 关闭后重开同一 SQLite | **保存真实 `submission.id`**；重开后 `harness.resume()` 启用调度并 `waitForIdle`；用公开入口 `harness.submission(id, context)` **重新取得同一提交并 `wait`**，按**实际** `settlement.answer` 读回答；条目序列、结算与回答身份不变；**显式断言 provider 调用数为 0** |
+
+> 重开用例此前只做只读调用，并用手写 `{status:"done"}` 代替真实结算——锁定 `types.ts` 的
+> `resume()` 注释明确"只读 viewer 从不启用调度"，因此该用例即使持久化或恢复调度有回归也照样通过。
+> 现版本启用调度、重取真实提交，并计数 provider 调用。
+> （此条为 Codex 第 4 轮 P2-2 的修复。计数器的**敏感性**已单独验证：重开后提交一个**新**输入
+> 会使计数 > 0，证明调度确实启用、计数器确实有效，故 `toBe(0)` 是有效断言而非静态检查。）
 
 纯函数层（`test/agent-contracts.test.ts`）：裸 JSON / fenced / 散文 / 空串 / 未闭合 fence 的解析；
+**歧义拒绝**——两个合法但不同的块、首合法次非法、完整块 + 未闭合围栏，均 `submission_answer_ambiguous`；
 `submission_not_settled`（`queued`/`placed`）、`submission_unanswered`、`submission_answer_missing`；
 以及 `isRunEnded` 只认 `done`/`unanswered`。
 
@@ -258,5 +276,5 @@ npm run agent:finish-evidence -- --db ./finish.sqlite --request-id my-run
 | AC-02 状态转换与额度耗尽 | 通过 | `lifecycle.ts` 转换表 + `decideRoundFailure`；`test/agent-state.test.ts` 的转换表/轮次失败/额度用例 |
 | AC-03 五类 Document 持久化 | 通过 | `test/agent-state.test.ts`：真实 SQLite 写入 → `close()` → 重开 → **整份 deepEqual** + 重校验 |
 | AC-04 字段分权与证据归属 | 通过 | 分权矩阵 + `verifyEvidenceAttribution`（含真实跨会话、跨轮次负例） |
-| AC-05 有效提交后停止（不再发生业务调用） | 通过 | 完成边界 = **结算后的结构化最终答案**：`isRunEnded` + `parseStructuredAnswer` + `completeSubmission`（§7.3）。真实 harness 用例证明：回答之后 **0** 条业务 tool-result、工具调用**不是**提交、无效/不可读/带 runtime 字段的回答不被接受；`npm run agent:finish-evidence` 可重复取证（`businessResultsAfterAnswer: 0`）。工具路线（`control.terminate`）为何不可用见 §7.2，附实测数据 |
+| AC-05 有效提交后停止（不再发生业务调用） | 通过 | 完成边界 = **结算后的结构化最终答案**：`isRunEnded` + `parseStructuredAnswer` + `completeSubmission`（§7.3）。真实 harness 用例证明：回答之后 **0** 条业务 tool-result、工具调用**不是**提交、无效/不可读/带 runtime 字段的回答不被接受；**回答必须恰好一个 fenced 块，歧义（多块/未闭合围栏）拒绝**；**重开用例保存真实 `submission.id`、启用调度、经 `harness.submission(id)` 重取真实结算，并断言 provider 调用为 0**。`npm run agent:finish-evidence` 可重复取证（`businessResultsAfterAnswer: 0`）。工具路线（`control.terminate`）为何不可用见 §7.2，附实测数据 |
 | 新确定性测试进入 CI | 通过 | `.github/workflows/ci.yml` 第三个 job `test` 跑完整 `npm test` |

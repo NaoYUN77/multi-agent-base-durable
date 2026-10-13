@@ -103,11 +103,17 @@ export type SubmissionCompletionInput = {
 /**
  * Extract the structured payload from a final answer.
  *
- * Two forms are accepted, both exact: the whole text is the JSON object, or the
- * first fenced code block is. Nothing is guessed from surrounding prose — a model
- * that wraps its answer in commentary must still put the contract inside one of
- * them, and a payload that cannot be read is refused rather than partially
- * interpreted. Performs no IO.
+ * Two forms are accepted, both exact: the whole text is the JSON object, or
+ * **exactly one** fenced code block is. Nothing is guessed from surrounding
+ * prose — a model that wraps its answer in commentary must still put the
+ * contract inside one of them, and a payload that cannot be read is refused
+ * rather than partially interpreted.
+ *
+ * "Exactly one" is checked, not assumed. A text carrying several fenced blocks,
+ * or a complete block beside an unclosed fence, does not say which block is the
+ * submission; taking the first would let a model's own correction — a second
+ * block — be ignored while its superseded draft is submitted. That case is
+ * refused with `submission_answer_ambiguous` instead. Performs no IO.
  */
 export function parseStructuredAnswer(text: string): ContractValidation<unknown> {
 	const collect = new Violations();
@@ -118,12 +124,24 @@ export function parseStructuredAnswer(text: string): ContractValidation<unknown>
 	}
 	const direct = tryParse(trimmed);
 	if (direct.ok) return { ok: true, value: direct.value };
-	const fenced = firstFence(trimmed);
-	if (fenced !== undefined) {
-		const parsed = tryParse(fenced);
+	const fences = scanFences(trimmed);
+	// More than one complete block, or one complete block plus a fence that never
+	// closes: the answer does not name a single submission.
+	if (fences.blocks.length > 1 || (fences.blocks.length === 1 && fences.dangling)) {
+		collect.add(
+			"submission_answer_ambiguous",
+			"$",
+			fences.blocks.length > 1
+				? `the final answer carries ${fences.blocks.length} fenced blocks; the submission must be exactly one`
+				: "the final answer carries a complete fenced block and an unclosed fence; the submission must be exactly one block",
+		);
+		return collect.finish(undefined as unknown as unknown);
+	}
+	if (fences.blocks.length === 1) {
+		const parsed = tryParse(fences.blocks[0] as string);
 		if (parsed.ok) return { ok: true, value: parsed.value };
 	}
-	collect.add("submission_result_unparseable", "$", "the final answer is neither a JSON object nor a fenced JSON block");
+	collect.add("submission_result_unparseable", "$", "the final answer is neither a JSON object nor a single fenced JSON block");
 	return collect.finish(undefined as unknown as unknown);
 }
 
@@ -135,17 +153,29 @@ function tryParse(text: string): { readonly ok: true; readonly value: unknown } 
 	}
 }
 
-/** The contents of the first fenced block, when the text has one. */
-function firstFence(text: string): string | undefined {
+/**
+ * Every complete fenced block in `text`, in order, plus whether a fence was left
+ * unclosed. A fence opens on any line whose content starts with ``` and closes on
+ * the next line that is exactly ```; a block is complete only when both are seen.
+ * Returning all of them is what lets the caller refuse an ambiguous answer rather
+ * than pick one.
+ */
+function scanFences(text: string): { readonly blocks: readonly string[]; readonly dangling: boolean } {
 	const lines = text.split(/\r?\n/);
-	const start = lines.findIndex((line) => line.trimStart().startsWith("```"));
-	if (start === -1) return undefined;
-	const end = lines.findIndex((line, index) => index > start && line.trim() === "```");
-	if (end === -1) return undefined;
-	return lines
-		.slice(start + 1, end)
-		.join("\n")
-		.trim();
+	const blocks: string[] = [];
+	let openAt = -1;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index] ?? "";
+		if (openAt === -1) {
+			if (line.trimStart().startsWith("```")) openAt = index;
+			continue;
+		}
+		if (line.trim() === "```") {
+			blocks.push(lines.slice(openAt + 1, index).join("\n").trim());
+			openAt = -1;
+		}
+	}
+	return { blocks, dangling: openAt !== -1 };
 }
 
 /**

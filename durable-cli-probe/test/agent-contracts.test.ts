@@ -594,6 +594,38 @@ describe("TASK-005.1 contracts — the completion boundary is the settled answer
 		}
 	});
 
+	it("refuses an answer that does not name exactly one fenced block", () => {
+		const draft = { ...work, summary: "draft figure" };
+		const corrected = { ...work, summary: "corrected figure" };
+		const block = (payload: unknown, tag = "json") => `\`\`\`${tag}\n${JSON.stringify(payload)}\n\`\`\``;
+
+		// Two valid blocks with different content: taking the first would submit a
+		// draft the model itself superseded, so the answer is refused outright.
+		const twoValid = parseStructuredAnswer([block(draft), block(corrected)].join("\n"));
+		expect(twoValid.ok).toBe(false);
+		if (!twoValid.ok) {
+			expect(twoValid.violations.map((item) => item.code)).toContain("submission_answer_ambiguous");
+			expect(twoValid.violations.map((item) => item.path)).toContain("$");
+		}
+
+		// A valid block followed by an invalid one is still ambiguous: the second
+		// block may be the correction, and nothing here may guess which is meant.
+		const secondInvalid = parseStructuredAnswer([block(draft), block({ findings: ["x"] })].join("\n"));
+		expect(secondInvalid.ok).toBe(false);
+		if (!secondInvalid.ok) expect(secondInvalid.violations.map((item) => item.code)).toContain("submission_answer_ambiguous");
+
+		// A complete block beside a fence that never closes does not say which is
+		// the submission either.
+		const dangling = parseStructuredAnswer([block(draft), "```json", JSON.stringify(corrected)].join("\n"));
+		expect(dangling.ok).toBe(false);
+		if (!dangling.ok) expect(dangling.violations.map((item) => item.code)).toContain("submission_answer_ambiguous");
+
+		// One block whose payload is not JSON at all is unparseable, not ambiguous.
+		const singleBad = parseStructuredAnswer("```json\n{not json\n```");
+		expect(singleBad.ok).toBe(false);
+		if (!singleBad.ok) expect(singleBad.violations.map((item) => item.code)).toContain("submission_result_unparseable");
+	});
+
 	it("accepts a submission only after the run settled with a valid answer", () => {
 		const settled = completeSubmission({ settlement: { status: "done" }, answerEntryId: "21", answerText: JSON.stringify(work) });
 		expect(settled.ok).toBe(true);

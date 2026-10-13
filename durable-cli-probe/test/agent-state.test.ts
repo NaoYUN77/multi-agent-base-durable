@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Type } from "@earendil-works/pi-ai";
-import type { Conversation, ConversationId, EntryRecord } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, EntryRecord, SubmissionId } from "@earendil-works/pi-durable";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc, AgentTaskConfigDoc, AgentTaskResultDoc } from "../src/agent/contracts/documents.ts";
@@ -487,21 +487,29 @@ describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)",
 	});
 
 	it("keeps the settled submission unchanged across a reopen", async () => {
+		// The provider counts every request, so a reopen that resumed work is visible
+		// as a count above zero rather than as a failure the harness could swallow.
+		let providerCalls = 0;
 		const first: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
 			fauxResponses: [JSON.stringify(submissionWork)],
 			fauxRouter: () => {
+				providerCalls += 1;
 				throw new Error("a reopen must not make a provider request");
 			},
 			extensions: [defineExtension({ name: "agent-finish", tools: [siblingTool] })],
 		});
 		let before: readonly string[];
 		let beforeWork: unknown;
+		let submissionId: SubmissionId;
 		try {
 			const root = await openRoot(first);
 			first.harness.resume();
 			const submission = await root.submit({ type: "input", content: "Verify the figure.", requestId: "finish-reopen-1" }, context);
+			// Keep the real submission id: the reopen reacquires this same submission
+			// rather than being handed a settlement the test wrote by hand.
+			submissionId = submission.id;
 			const settled = await submission.wait(context);
 			expect(settled.status).toBe("done");
 			const entries = await entriesOf(root);
@@ -513,27 +521,53 @@ describe("TASK-005.1 finish — reopening settles nothing twice (AC-03, AC-05)",
 			await first.close();
 		}
 
-		// Reopen over the same file: the router above throws if a provider request
-		// happens, so a reopen that resumed work would fail this test.
+		// Reopen over the same file with scheduling enabled, then drive it to idle.
+		// If the reopen re-ran or re-settled the submission, the provider would be
+		// asked again and `providerCalls` would stop being zero.
+		providerCalls = 0;
 		const second = await openProbe({
 			databasePath,
 			provider: "faux",
 			fauxRouter: () => {
+				providerCalls += 1;
 				throw new Error("a reopen must not make a provider request");
 			},
 		});
 		try {
 			const root = await openRoot(second);
+			// Scheduling on, and the ordinary ownership scope driven to idle: this is
+			// the part the previous version of this test skipped, and skipping it is
+			// what let a regression in recovery stay invisible.
+			second.harness.resume();
+			await second.harness.waitForIdle(context);
+
+			// Reacquire the real submission through the public harness entry point and
+			// settle it again: the settlement is read from persistence, not fabricated.
+			const reacquired = await second.harness.submission(submissionId, context);
+			expect(reacquired).toBeDefined();
+			const resettled = await reacquired?.wait(context);
+			expect(resettled?.status).toBe("done");
+			// The answer identity survives: same submission, same answering entry.
+			expect(String(resettled?.answer)).toBe(before.find((line) => line.startsWith("pi.assistant#"))?.split("#")[1]);
+
 			const entries = await entriesOf(root);
 			// Same conversation, same entries in the same order: a settled run is not
 			// re-run and its outcome is not rewritten by the reopen.
 			expect(entries.map((entry) => `${entry.kind}#${entry.id}`)).toEqual(before);
 			expect(entries.filter((entry) => entry.kind === "pi.assistant")).toHaveLength(1);
-			// And the submission read back from the reopened database is the same one.
-			const answerEntry = entries.find((entry) => entry.kind === "pi.assistant");
-			const reread = completeSubmission({ settlement: { status: "done" }, answerEntryId: String(answerEntry?.id), answerText: assistantTextOf(answerEntry) });
+
+			// And the submission read back through the real settlement is the same one.
+			const answerEntry = entries.find((entry) => String(entry.id) === String(resettled?.answer));
+			const reread = completeSubmission({
+				settlement: { status: "done" },
+				answerEntryId: String(resettled?.answer),
+				answerText: assistantTextOf(answerEntry),
+			});
 			expect(reread.ok).toBe(true);
 			if (reread.ok) expect(reread.value.work).toEqual(beforeWork);
+
+			// No provider request happened: the reopen neither re-ran nor re-settled.
+			expect(providerCalls).toBe(0);
 		} finally {
 			await second.close();
 		}
