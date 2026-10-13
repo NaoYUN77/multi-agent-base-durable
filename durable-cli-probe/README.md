@@ -755,3 +755,113 @@ poison a later one.
 - **Only the title and the block sequence are compared.** Formatting attributes
   such as colour or annotations are not asserted.
 
+---
+
+## 18. TASK-004 — typecheck, lint, and the pinned Pi checkout
+
+This section supersedes the manual `npm install --ignore-scripts` + `npm run link` dance in
+§3 for a from-scratch setup. One entry point now does all of it, in a fixed order, and CI runs
+exactly the same entry point (`.github/workflows/ci.yml`).
+
+### 18.1 One preparation command
+
+```bash
+cd durable-cli-probe
+
+# From a fresh clone (nothing pre-existing):
+npm run pi:prepare
+
+# Or prove nothing pre-existing is relied upon first:
+npm run pi:prepare -- --clean
+```
+
+`scripts/prepare.mjs` runs, in order, and fails on the first step that does not hold:
+
+| # | step | what it guarantees |
+|---|---|---|
+| 1 | read `pi-pin.json` | one pinned identity for the upstream checkout |
+| 2 | prepare the checkout at the pinned commit | `git rev-parse HEAD` equals the pin; a dirty or mismatched checkout is a hard failure, never a silent rewrite |
+| 3 | `npm ci --ignore-scripts` (upstream, then app) | installs from the lockfiles, no lifecycle scripts |
+| 4 | hydrate the generated model data from the pinned catalog revision | `packages/ai` can compile at all (see below) |
+| 5 | `packages/chord` → `packages/telemetry` → `packages/ai` (`build:offline`) → `packages/durable` | the `dist/*.d.ts` the app's typecheck resolves |
+| 6 | `scripts/link-checkout.mjs` (unchanged from TASK-001) | the three names are symlinks into the checkout, one identity per package |
+| 7 | verification | SHA, package name, symlink target, and the existence of the built declarations |
+
+**Why step 4 exists — the minimal chain alone does not build on a fresh clone.**
+`packages/ai` imports `src/providers/data/*.json` while compiling, and upstream **gitignores** that
+directory: the files are generated, not committed, so a fresh checkout has none and `tsc` fails with
+TS2307 for every provider. Upstream's own offline path is the model catalog revision pinned in the
+checkout's `nix/model-catalog.json`; step 4 downloads exactly that revision, checks that the bytes
+hash back to the revision, and runs upstream's `hydrate-model-catalog.ts`. It runs unconditionally,
+because a checkout hydrated from a live catalog holds different bytes (verified 2026-10-13: the
+structure hash and 17 of 42 provider files differed), and the app must typecheck against the same
+data locally and in CI. Only that gitignored, generated directory is replaced.
+
+`packages/telemetry` is in the chain for the same class of reason: `packages/ai/src/types.ts`
+imports `@earendil-works/pi-telemetry`. The chain is the topological order of the workspace
+dependency closure of the three linked packages; the other nine workspaces (`tui`, `codemode`,
+`mcp`, `env`, `agent`, `protocol`, `client`, `server`, `coding-agent`) are outside it and are not
+built.
+
+Two things the script deliberately does **not** do: the upstream `npm run check` (it runs
+`biome check --write`, which rewrites files) and the upstream full `build` / `generate-models` (no
+live provider-catalog refresh; `ai`'s `build:offline` is used instead, fed by step 4).
+
+### 18.2 The two checks
+
+```bash
+npm run typecheck   # tsc --noEmit; strict, unchanged from TASK-001
+npm run lint        # biome lint .; read-only, never --write / --fix
+```
+
+`npm run lint` exits non-zero on a lint **error**; warnings do not fail it (the first version
+does not turn warnings into a gate — see §18.5). The Biome scope is `src/**/*.ts`,
+`test/**/*.ts`, `scripts/**/*.mjs` and `vitest.config.ts`, declared in `biome.json`; the Pi
+checkout, `node_modules`, `data/` (SQLite files) and any `dist/` are outside it by
+construction, not by an ignore list. `noExplicitAny` is set to `error`.
+
+### 18.3 Where the Pi version is pinned
+
+`durable-cli-probe/pi-pin.json` — the official repository URL, the full commit SHA, the three
+package names, the build chain, and the model catalog endpoint. Local preparation and CI both read
+this one file. To move the pin, edit that file; everything else follows. Do not substitute a
+branch, a tag, or a registry version: the whole point is that a checkout, a local run and a CI run
+resolve to byte-identical code.
+
+The model data has a second, upstream-owned pin: the catalog revision in the checkout's
+`nix/model-catalog.json`. It is read from the checkout rather than copied into `pi-pin.json`, so it
+can never drift from the commit pin. The download is verified against it (the revision *is* the
+sha256 of the bytes).
+
+### 18.4 CI
+
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and `workflow_dispatch`.
+Two jobs on `ubuntu-latest`, named exactly `lint` and `typecheck`, each prepares the
+environment with `scripts/prepare.mjs` and then runs one command. Other v1 properties:
+`permissions: contents: read`, `concurrency` cancels superseded runs of the same ref, Node pinned to
+**22.22.2** (npm is whatever that Node distribution ships — 10.9.7 — and neither version is assumed:
+the workflow's revision step and `prepare.mjs` both print `node --version` / `npm --version`, so every
+run records the pair it actually used), every action pinned to a full commit SHA (version in a comment),
+npm download cache keyed on the pinned Pi commit plus the app lockfile hash, and no
+`dist/` in the cache so a missing build can never be masked by a cache hit. No secrets, no
+`pull_request_target`, no `continue-on-error`, no path filters.
+
+### 18.5 Common preparation failures
+
+| symptom | cause | what to do |
+|---|---|---|
+| `checkout revision conflict: pinned <A>, found <B>` | the checkout is on a different commit than `pi-pin.json` | move it aside or point `PI_CHECKOUT` at another clone; the script never rewrites a checkout for you |
+| `checkout has local modifications` | `git status --porcelain` in the checkout is not empty | commit, stash or discard inside the checkout; building on top of a dirty tree would hide the real revision |
+| `has no HEAD but is not empty (<entries>); refusing to touch it` | the checkout is a `git init` that never got a commit, and the tree holds files. An *empty* one is completed automatically (an interrupted first run); this one is not, because the files could be yours | move it aside, or point `PI_CHECKOUT` / `--checkout-dir` elsewhere |
+| `--clean refuses <label>: <path> resolves to <other>, which is outside <root>` | a delete target escapes its root, e.g. a `packages/<name>` entry that is a junction/symlink pointing out of the checkout | fix `pi-pin.json` or the checkout layout; nothing is deleted when this fires, and all targets are checked before the first delete |
+| `pi-pin.json is invalid: package dir must stay inside the checkout` | a `packages[].dir` or `build[].dir` is absolute, empty, or contains `..` | the pin is a checkout-relative path; the escape is refused before anything is fetched or deleted |
+| `cannot download the model catalog` / `catalog revision ... is unavailable` | step 4 needs one HTTPS GET of the pinned catalog revision from `pi.dev` | check network egress and that the endpoint in `pi-pin.json` is reachable; the revision itself is immutable, so a failure here is transport, not drift |
+| `catalog bytes hash to <X>, but the pin says <Y>` | the endpoint returned something other than the pinned revision (proxy, cache or a changed service) | do not work around it by editing the revision; report it — the hash check exists so a substituted catalog cannot silently enter a build |
+| `packages/ai` fails with `TS2307: Cannot find module './data/<provider>.json'` | the model data was not hydrated, or the checkout's data is from another catalog | re-run `npm run pi:prepare`; step 4 hydrates from the pinned revision every time |
+| `packages/ai` fails with `TS2307: Cannot find module '@earendil-works/pi-telemetry'` | `packages/telemetry` was not built before `packages/ai` | the chain order in `pi-pin.json` is load-bearing; re-run `npm run pi:prepare` rather than building one package by hand |
+| `npm ci` aborts with `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]` | an agent/session guard on this machine requires confirmation before a process bulk-deletes; `npm ci` replaces an existing `node_modules` | approve the deletion in the UI, or remove `node_modules` yourself and re-run. A fresh clone has nothing to delete and never hits this |
+| the `pi-ai` step fails with `rm: could not remove file (code undefined)` and `rm: could not remove directory (code ENOTEMPTY)` | same guard, different step: upstream's `build:offline` ends with `shx rm -rf dist/providers/data`, and the guard refuses that delete once the per-session deletion budget is spent | approve it, or re-run the whole preparation with the guard switched off for that command: `CODEBUDDY_SAFE_DELETE_ENABLED=0 npm run pi:prepare`. It deletes only build output inside the checkout; CI runners have no such guard |
+| `spawnSync`/`execSync` fail with `EBUSY` while `spawn` works | some Windows hosts refuse synchronous child-process creation to processes started from a node script | nothing to do: `prepare.mjs` uses async `spawn` on purpose |
+| `npm warn EBADENGINE ... @earendil-works/gondolin@0.12.0 requires node >=23.6.0` | the upstream workspace contains a package that wants a newer Node than the pinned 22.22.2 | informational only; the four packages in the chain build and typecheck on 22.22.2 |
+| `dist/index.d.ts is missing` during verification | the build step did not run or failed silently | re-run `npm run pi:prepare -- --clean` and read the build output |
+

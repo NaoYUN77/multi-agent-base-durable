@@ -1,0 +1,28 @@
+{
+	"comment": "TASK-004: the single pinned identity of the upstream Pi checkout. Read by scripts/prepare.mjs (local) and by .github/workflows/ci.yml (CI, through the same script). Never replace the commit with a branch name, a tag, or a registry version.",
+	"repository": "https://github.com/earendil-works/pi.git",
+	"commit": "f44707e7f7190a8cc86ce105790c72c6b0f5fd5f",
+	"packages": [
+		{ "name": "@earendil-works/chord", "dir": "packages/chord" },
+		{ "name": "@earendil-works/pi-ai", "dir": "packages/ai" },
+		{ "name": "@earendil-works/pi-durable", "dir": "packages/durable" }
+	],
+	"build": [
+		{ "dir": "packages/chord", "script": "build" },
+		{ "dir": "packages/telemetry", "script": "build" },
+		{ "dir": "packages/ai", "script": "build:offline" },
+		{ "dir": "packages/durable", "script": "build" }
+	],
+	"buildNote": "Topological order of the workspace dependency closure of the three linked packages. pi-ai depends on pi-telemetry (src/types.ts imports @earendil-works/pi-telemetry), pi-durable depends on chord and pi-ai. The other nine workspaces (tui, codemode, mcp, env, agent, protocol, client, server, coding-agent) are outside that closure and are not built.",
+	"modelCatalog": {
+		"endpoint": "https://pi.dev/api/models/revisions/{revision}?types=chat,image,classifier",
+		"revisionSource": "nix/model-catalog.json inside the pinned checkout",
+		"why": "packages/ai imports src/providers/data/*.json while compiling, and upstream gitignores that directory: the files are generated, not committed. Upstream's own offline path is the model catalog revision pinned in the checkout's nix/model-catalog.json, so prepare.mjs reads that revision, downloads it, checks that the bytes hash back to the revision, and runs upstream's hydrate-model-catalog.ts. No live catalog refresh happens, and hydration is byte-deterministic (it stamps a fixed manifest time)."
+	},
+	"verified": {
+		"fetchedFromOfficialRemoteOn": "2026-10-13",
+		"node": "v22.22.2",
+		"npm": "10.9.7",
+		"note": "The commit was fetched by SHA from the repository above (git fetch --depth 1 origin <sha>), so CI can reproduce the exact same tree without a full clone."
+	}
+}

@@ -25,7 +25,7 @@
 //     close, so the task cannot end up `failed` while a cancel is in flight.
 
 import type { Context } from "@earendil-works/chord";
-import type { ConversationId, EntryId, Extension, ModelRef, ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
+import type { ConversationId, EntryId, Extension, ModelRef, SettledSubmissionRecord, ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
 import { configure } from "@earendil-works/pi-durable";
 import { extractRoundEvidence, type RoundExtraction } from "./evidence.ts";
 import {
@@ -304,7 +304,7 @@ export async function runDelegationRound(
 	if (handle === undefined) {
 		return await failRound(api, callContext, input, `child conversation ${childId} not found`);
 	}
-	let settled;
+	let settled: SettledSubmissionRecord;
 	try {
 		const submission = await handle.submit(
 			{ type: "input", content: input.feedback === undefined ? input.task : `${input.task}\n\n评审反馈：${input.feedback}`, requestId },
