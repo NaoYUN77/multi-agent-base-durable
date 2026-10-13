@@ -16,7 +16,10 @@
 
 PR #23（Issue #16，TASK-005.1 合同与持久状态）的 AC-05 主问题**已确认解决**，
 但 Codex 对 HEAD `14f5b88` 给出 **`changes-required`**，剩 **2 项 P2** 待修（§7.1）。
-**未合并、Issue 未关闭、PR 非 Draft。**
+**未合并、Issue 未关闭。**
+
+> Codex 说的"请保持 Draft"是**象征性**的（= 暂不通过，修完再提交复审），
+> **不是**要求把 PR 转成 GitHub 的实际 Draft 状态。见 §7.3。
 
 ---
 
@@ -271,40 +274,49 @@ terminate = slots.length > 0 && slots.every((slot) => controls.get(slot.taskId)?
    用户确认：**账号是三方复用，`agent:`/`role:`/`event:` 标记协议就是区分作者的机制**。
    因此按标记识别作者即可，这不是待决问题。
    （遗留：该标记协议尚未写入 `WORKFLOW.md`，见 §1.2 注。）
-2. **PR 未保持 Draft**：Codex 第 4 轮明确要求"请保持 Draft"，`WORKFLOW.md` §7.3 也规定
-   存在待确认事项/已知失败时用 Draft。
-   **用户已指示转回 Draft（2026-10-14）**，但当前 **token 权限不足，尚未完成**——见 §7.3。
+2. **PR 的 "Draft" 是象征性表述，非 GitHub Draft 状态（已澄清）**：
+   用户说明（2026-10-14）——Codex 评审里的"请保持 Draft"是**象征性**的，
+   含义是"**暂不通过，修完以下问题再提交复审**"，**不是**要求把 PR 转成 GitHub 的实际 Draft 状态。
+   → **不需要**任何 GitHub Draft 转换操作，此项已关闭。见 §7.3。
 3. **合并授权**：WORKFLOW §9 明确不自行合并，由用户决定；accepted ≠ 合并授权。
 4. **后续子任务**：Issue #17–#21（TASK-005.2 ~ 005.6）均 open、`comments=0`，尚未认领。
 
-### 7.3 阻塞：转 Draft 未成功（2026-10-14）
+### 7.3 关于 "Draft"：象征性表述，非 GitHub 状态（2026-10-14 澄清）
 
-用户指示把 PR #23 转回 Draft，并提供了带 `issues: rw` / `pull requests: rw` 的新 token。
-**仍未成功。** 已排除的原因：
+> ⚠️ **前一版本文档在此处记录了一个不存在的阻塞。**
+
+用户澄清：**Codex 评审里的"请保持 Draft"是象征性的**，含义是
+"**暂不通过，请修复以下问题后提交复审**"，**不是**要求把 PR 转成 GitHub 的实际 Draft 状态。
+
+因此：
+
+- **不需要**执行任何 GitHub Draft 转换操作。此项**已关闭**。
+- 前一版本记录的"token 权限不足导致转 Draft 失败"是**在解决一个本不该存在的问题**。
+  该调查过程本身仍有参考价值（见下方"附：GitHub Draft 转换的实际限制"），但**不要**再尝试转换。
+
+**正确理解**：PR #23 保持 open、非 Draft 即可；Codex 的 `changes-required` 表达的是
+"修完 §7.1 的两项 P2 后再提交复审"，与 GitHub 的 Draft 开关无关。
+
+<details>
+<summary>附：GitHub Draft 转换的实际限制（仅为避免重复踩坑，非待办）</summary>
+
+排查过程中确认的事实，若**将来确实**需要转 Draft 时可用：
 
 | 假设 | 证据 | 结论 |
 |---|---|---|
-| token 缺 PR write | REST `PATCH /pulls/23`（标题改为自身）**成功** | ❌ 排除 |
+| token 缺 PR write | REST `PATCH /pulls/23`（标题改为自身）成功 | ❌ 排除 |
 | 账号无权限 | GraphQL `viewerPermission: ADMIN`、`viewerCanUpdate: true` | ❌ 排除 |
-| GraphQL 整体不可用 | `query { viewer { login } }` 正常返回 `NaoYUN77` | ❌ 排除 |
-| REST 的 `draft` 字段 | `PATCH {"draft":true}` 返回 200 但 `draft` 仍为 `false`（只读，静默忽略） | 该路本就不通 |
+| GraphQL 整体不可用 | `query { viewer { login } }` 正常返回 | ❌ 排除 |
 
-**实测失败**：GraphQL `convertPullRequestToDraft` 返回
-`FORBIDDEN: Resource not accessible by personal access token` —— **新旧两个 token 均如此**。
+- GraphQL `convertPullRequestToDraft` 对新旧两个 token 均返回
+  `FORBIDDEN: Resource not accessible by personal access token`，
+  尽管 token 的 REST 写入可用 → 疑似 fine-grained PAT 对该 mutation 的覆盖缺口。
+- REST `PATCH {"draft":true}` 返回 200 但 `draft` 仍为 `false`（该字段只读，静默忽略）。
+- **REST API 不支持从非 Draft 转回 Draft**，只支持 Draft→Ready；
+  转回 Draft 只有 GraphQL 或网页两条路。
+- 若将来真需要：网页点 "Convert to draft" 最可靠，或改用 classic PAT（scope `repo`）。
 
-**结论**：这不是"加个 `Pull requests: write` 就能解决"的问题——token 已有该权限（REST 写入成功）。
-剩余最可能的原因是 **fine-grained PAT 对 `convertPullRequestToDraft` 这类 GraphQL mutation 的支持缺口**
-（fine-grained token 与 GraphQL 存在已知覆盖差异）。
-
-**建议（需用户操作）：**
-
-1. **直接在网页点 PR #23 的 "Convert to draft"** —— 最可靠，立刻可用；或
-2. 用 **classic PAT**（scope `repo`）替代 fine-grained token 执行该 mutation。
-
-> 注意：REST API **不支持**从非 Draft 转回 Draft，只支持 Draft→Ready。
->
-> 未能完成进一步权限探测：GraphQL mutation 探测与 REST PATCH 探测均被 Claude Code 权限分类器拦截，
-> Agent 未绕过。以上结论基于只读查询 + 一次成功的 REST 写入。
+</details>
 
 ---
 
@@ -344,9 +356,8 @@ curl -s -H "Authorization: Bearer $TOKEN" "$B/commits/<HEAD_SHA>/check-runs"    
 - `src/agent/tools/` 在 HEAD 上**不存在**（已删除）
 - `scripts/finish-evidence.ts` 与 `package.json` 的 `agent:finish-evidence` 均存在
 - 测试用例计数：**15 文件 / 199 用例**（与实施方自述一致）
-- 转 Draft **失败**：GraphQL `convertPullRequestToDraft` 返回 `FORBIDDEN`；
-  REST `PATCH draft:true` 被静默忽略（见 §7.3）
-- 新旧 token 的 **REST 写入均可用**（标题 PATCH 成功），故失败**不是**缺 PR write
+- 新旧 token 的 **REST 写入均可用**（标题 PATCH 成功）
+- GraphQL `convertPullRequestToDraft` 对新旧 token 均 `FORBIDDEN`（见 §7.3 附录）
 - `WORKFLOW.md` 中**不存在** `agent:` / `Reviewed-SHA` / `codex` 头部定义（已全文搜过）
 
 **来自实施方自述（本次未独立复跑）：**
