@@ -9,12 +9,13 @@ result is copied from the README's history.
 
 | | |
 |---|---|
-| Application commits | `550af85` (implementation) · `1669557` (type-error probe) · `d52d6fb` (lint probe) · `e7dcf826` (probes removed) |
-| Pinned Pi commit | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f` — fetched by SHA from `https://github.com/earendil-works/pi.git` |
+| Application commits | `550af85` (implementation) · `1669557` (type-error probe) · `d52d6fb` (lint probe) · `e7dcf826` (probes removed) · `6066f03` (report) · **`e3ddb6d` (review fixes, current verified head)** |
+| Pinned Pi commit | `f44707e7f7190a8cc86ce105790c72c6b0f5fd5f` — fetched by SHA from the clone URL `https://github.com/earendil-works/pi.git` |
 | Model catalog revision | `sha256-439c53478c84ed27a58f8b54e1c3bd45810e5a969515b4e3666a3898d51ee22f` (read from the checkout's `nix/model-catalog.json`; verified as the sha256 of the downloaded bytes) |
-| Node / npm, local | `v22.22.2` / `10.9.7` |
-| Node / npm, CI | `v22.22.2` / `10.9.7` |
+| Node / npm, local | `v22.22.2` / `10.9.7` — the versions `prepare.mjs` prints at the start of every run |
+| Node / npm, CI | `v22.22.2` / `10.9.7` — printed by the workflow's revision step and by `prepare.mjs` |
 | Biome | `2.3.5` (exact, devDependency) |
+| Shell actually used on Windows | npm runs through `cmd.exe /d /s /c` (npm's own `.cmd` shim), git and node are spawned without a shell. `prepare.mjs` sets `shell: true` for npm only, because Windows ships npm as a `.cmd`; no path is ever passed through that shell |
 
 ## 2. Clean-room preparation and both checks (AC-01, AC-02, AC-03)
 
@@ -76,6 +77,7 @@ Four runs of the same workflow, one per pushed commit:
 | `1669557` | type error injected | success | **failure** | https://github.com/NaoYUN77/personal-agent/actions/runs/38342293591 |
 | `d52d6fb` | explicit `any` injected | **failure** | success | https://github.com/NaoYUN77/personal-agent/actions/runs/38342436066 |
 | `e7dcf826` | probes removed | success | success | https://github.com/NaoYUN77/personal-agent/actions/runs/38342538378 |
+| `e3ddb6d` | review fixes (§6) | success | success | https://github.com/NaoYUN77/personal-agent/actions/runs/38345385427 |
 
 The failing jobs' own diagnostics, from the run logs:
 
@@ -100,18 +102,70 @@ The check runs are attached to the branch head SHA, which is how they are listed
 
 ## 5. Required checks on `main` (AC-08)
 
-Set through the branch-protection API and read back afterwards:
+Set through the branch-protection API and read back afterwards. The read-back is reproduced here
+verbatim (minus the API's own URLs) so it can be checked without the write token:
 
+```json
+{
+  "required_status_checks": {
+    "strict": false,
+    "contexts": ["lint", "typecheck"],
+    "checks": [
+      { "context": "lint", "app_id": 15368 },
+      { "context": "typecheck", "app_id": 15368 }
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": null,
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
 ```
-required_status_checks.contexts = ["lint", "typecheck"]   (app_id 15368 = GitHub Actions)
-strict = false
-```
 
-`strict: false` means the branch does not have to be up to date with `main` before merging; only the
-two checks must pass. Turn it on if a stale-base merge should also be blocked. The repository had no
-branch protection before this task (the API answered `404 Branch not protected`).
+`app_id 15368` is GitHub Actions, so the two contexts are bound to this workflow's jobs rather than to
+any third-party status. `enforce_admins: false` means an admin can still merge past a red check;
+`restrictions: null` means no push allow-list beyond the two checks; `strict: false` means the branch
+does not have to be up to date with `main` before merging. Turn `strict` or `enforce_admins` on if the
+merge gate should be tighter. Before this task the API answered `404 Branch not protected`.
 
-## 6. Not verified / limitations
+Reading this requires admin on the repository: the reviewer's integration got `403`, so this section is
+the implementer's evidence, reproducible with
+`GET /repos/NaoYUN77/personal-agent/branches/main/protection` and an admin token.
+
+## 6. Review fixes and re-verification (second round)
+
+Review on 2026-10-13 asked for four fixes; all are in `scripts/prepare.mjs` at commit `e3ddb6d`.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | `--checkout-dir` never reached `link-checkout.mjs`, so preparation and linking could use different checkouts | the resolved directory is passed to the linker as `PI_CHECKOUT` (`env: { ...process.env, PI_CHECKOUT: checkoutDir }`) and is logged at the start of every run |
+| 2 | `--clean` deleted before validating, and `../../../victim` was an accepted `dir` | `readPin` now rejects any `packages`/`build` dir that is absolute, empty or contains `..`; `resolveDeleteTarget` resolves every target and refuses anything outside its root, including through a symlinked intermediate directory; all targets are checked before the first delete |
+| 3 | an interrupted first run left `.git` with no HEAD and the retry died in `rev-parse` | that state is recognized and completed (fetch + checkout are idempotent) — but only while the tree holds nothing except `.git`; with any other content it still refuses |
+| 4 | without `--checkout-dir`, `args[checkoutIndex + 1]` was `args[0]`, so the first unknown argument was ignored | arguments are parsed in one strict pass first; unknown, missing and repeated options all fail before any fetch, install or delete |
+
+Fixtures (all executed; the module is importable now, so the helpers are exercised directly):
+
+| Fixture | Command | Result |
+|---|---|---|
+| unknown argument | `node scripts/prepare.mjs --typo` | exit 1, `unknown argument: --typo`; default checkout path and `node_modules` still absent |
+| missing value | `… --checkout-dir` | exit 1, `--checkout-dir needs a path` |
+| repeated option | `… --clean --clean`, `… --checkout-dir a --checkout-dir b` | exit 1, `… was given twice` |
+| escaping config | fixture `pi-pin.json` with `packages[0].dir = "../../../../victim"` | exit 1, `package dir must stay inside the checkout`; the external marker file and the app marker were untouched |
+| escaping build dir | fixture config with `build[0].dir = "packages/../../.."` | exit 1, `build dir must stay inside the checkout` |
+| symlinked intermediate dir | `root/packages/ai` junctioned to `outside/packages/ai`, then `resolveDeleteTarget(root, root/packages/ai/dist)` | refused: `… resolves to …outside…, which is outside …root`; external marker untouched |
+| normal target | `resolveDeleteTarget(root, root/plain/dist)` | resolves normally (the check does not over-refuse) |
+| interrupted init | `git init` (no commits), then `… --checkout-dir <unborn>` | exit 0, log: `checkout has an interrupted initialization (no HEAD, empty tree); completing it`; `HEAD` afterwards is `f44707e7…` |
+| interrupted init with content | same, plus a `keep.txt` | exit 1, `has no HEAD but is not empty (keep.txt); refusing to touch it`; the file survived |
+| CLI beats env | `PI_CHECKOUT=<other> … --checkout-dir <room checkout>` | exit 0; the `PI_CHECKOUT` path was never created, and all three links resolve into the CLI directory |
+
+Re-run on the fixed head, room `E:\Code\pi-durable-room-e` (fresh clone of `e3ddb6d`, no checkout, no
+`node_modules`): default-path `npm run pi:prepare -- --clean` exit 0 with `checkout directory:` equal to
+the default; `npm run typecheck` 0; `npm run lint` 0; `git diff --exit-code` 0; `git status --short`
+empty; checkout at `f44707e7…` with an empty status. A second default-path run and both checks were
+repeated after the fixtures, with the same results.
+
+## 7. Not verified / limitations
 
 - **`npm test` and any offline behaviour test** — outside this task's boundary. Preparation only
   guarantees the type artifacts exist; it does not claim the probe's behaviour tests pass.
@@ -122,3 +176,5 @@ branch protection before this task (the API answered `404 Branch not protected`)
   gate were fixed.
 - **A local Windows run can still be interrupted** by the safe-delete guard described in §2; that is a
   property of this machine, not of the repository or of CI.
+- **The re-verification did not use the reviewer's environment.** Branch protection was read back with
+  an admin token here; the reviewer's integration is denied (403), so §5 is implementer evidence.
