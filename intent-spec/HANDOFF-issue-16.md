@@ -41,6 +41,8 @@ PR #23（Issue #16，TASK-005.1 合同与持久状态）的 AC-05 主问题**已
 
 ### 1.2 评论格式（所有协作评论必须带此头部）
 
+实施方（Claude）：
+
 ```text
 [agent:claude] [role:implementation] [event:<事件>]
 Issue: #<编号>
@@ -49,8 +51,22 @@ Head-SHA: <完整 SHA>
 Responds-To: <正在回应的评论或评审链接>
 ```
 
+审阅方（Codex）——注意用的是 **`Reviewed-SHA`**，与实施方的 `Head-SHA` 不同名：
+
+```text
+[agent:codex] [role:review] [event:<事件>]
+Issue: #<编号>
+PR: #<编号>
+Reviewed-SHA: <完整 SHA>
+```
+
 Claude 事件：`acknowledged` / `ready-for-review` / `blocked`
 Codex 事件：`changes-required` / `accepted` / `blocked`
+
+> **标记协议就是区分作者的机制**（用户确认，2026-10-14）。虽然三方共用同一 GitHub 账号
+> `NaoYUN77`，但 `agent:` / `role:` / `event:` 头部用于协作识别。
+> 注意：`WORKFLOW.md` 正文目前**只**定义了实施方的 `Responds-To` 式格式，**未收录** Codex 头部；
+> 该头部目前存在于实际评审评论中（如 review `5506732808`），尚未写进规范。
 
 ### 1.3 收到评审反馈的处理流程
 
@@ -251,10 +267,40 @@ terminate = slots.length > 0 && slots.every((slot) => controls.get(slot.taskId)?
 
 ### 7.2 需用户定夺
 
-1. **同账号三方混用**：PR #23 中 Codex 的判定与实施方回复**全部是 `NaoYUN77`**，无法从评论区分作者。是否给 Codex 单独账号或另一种标记方式？
-2. **PR 未保持 Draft**：WORKFLOW §7.3 要求存在待确认事项时用 Draft，但 PR #23 当前非 Draft；Codex 第 4 轮也明确要求"请保持 Draft"。
+1. **同账号三方混用（已澄清）**：PR #23 中 Codex 的判定与实施方回复**全部是 `NaoYUN77`**。
+   用户确认：**账号是三方复用，`agent:`/`role:`/`event:` 标记协议就是区分作者的机制**。
+   因此按标记识别作者即可，这不是待决问题。
+   （遗留：该标记协议尚未写入 `WORKFLOW.md`，见 §1.2 注。）
+2. **PR 未保持 Draft**：Codex 第 4 轮明确要求"请保持 Draft"，`WORKFLOW.md` §7.3 也规定
+   存在待确认事项/已知失败时用 Draft。
+   **用户已指示转回 Draft（2026-10-14）**，但当前 **token 权限不足，尚未完成**——见 §7.3。
 3. **合并授权**：WORKFLOW §9 明确不自行合并，由用户决定；accepted ≠ 合并授权。
 4. **后续子任务**：Issue #17–#21（TASK-005.2 ~ 005.6）均 open、`comments=0`，尚未认领。
+
+### 7.3 阻塞：转 Draft 需要 token 权限（2026-10-14）
+
+用户指示把 PR #23 转回 Draft。**未完成**，卡在凭据权限上：
+
+| 尝试 | 结果 |
+|---|---|
+| GraphQL `convertPullRequestToDraft` | ❌ `FORBIDDEN: Resource not accessible by personal access token` |
+| REST `PATCH /pulls/23 {"draft":true}` | ❌ 返回 200 但 `draft` 仍为 `false`（该字段只读，被静默忽略） |
+
+诊断：
+
+- GraphQL **可用**（`query { viewer { login } }` 正常返回 `NaoYUN77`），
+  所以不是 GraphQL 权限整体关闭，而是该 token **缺 `Pull requests: write`**。
+- `GET /repos/...` 返回的 `permissions: {admin, maintain, push, triage, pull}` 全 true
+  是**用户账号的仓库角色**，**不等于** fine-grained token 的权限范围。
+  ⚠️ 前一版交接文档把两者混为一谈，是错的。
+
+**解除方式（需用户操作，Agent 无法绕过）：**
+
+1. 在 GitHub 给该 fine-grained token 加 `Pull requests: Read and write`，或重建 token；或
+2. 直接在网页点 PR #23 的 "Convert to draft"。
+
+> 注意：REST API **不支持**从非 Draft 转回 Draft，只支持把 Draft 转为 Ready。转回 Draft 只有
+> GraphQL `convertPullRequestToDraft` 或网页两条路。
 
 ---
 
@@ -294,6 +340,9 @@ curl -s -H "Authorization: Bearer $TOKEN" "$B/commits/<HEAD_SHA>/check-runs"    
 - `src/agent/tools/` 在 HEAD 上**不存在**（已删除）
 - `scripts/finish-evidence.ts` 与 `package.json` 的 `agent:finish-evidence` 均存在
 - 测试用例计数：**15 文件 / 199 用例**（与实施方自述一致）
+- 转 Draft **失败**：GraphQL `convertPullRequestToDraft` 返回 `FORBIDDEN`；
+  REST `PATCH draft:true` 被静默忽略（见 §7.3）
+- `WORKFLOW.md` 中**不存在** `agent:` / `Reviewed-SHA` / `codex` 头部定义（已全文搜过）
 
 **来自实施方自述（本次未独立复跑）：**
 
