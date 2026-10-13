@@ -43,66 +43,92 @@
 // With `control.terminate` available in the pinned source, the fallback is not
 // used here.
 
+// ── The protocol this module settles on ──────────────────────────────────────
+//
+// A round of a sub-agent ends like this:
+//
+//   1. The model does its work with whatever business tools it is authorized to
+//      call — as many rounds as it needs.
+//   2. When it has something to submit, it calls `finish_task` with its own work
+//      and nothing else in that round.
+//   3. `finish_task` returns `control: { terminate: true }`. The harness ends the
+//      run at the final boundary **iff every call of the round asked to
+//      terminate** — so step 2's "and nothing else" is what makes it take effect.
+//   4. The program learns the run is over from the settlement of the submission
+//      it already made (`Submission.wait`), never from the tool having run.
+//
+// Why `finish_task` asks unconditionally instead of refusing when the conversation
+// is authorized to call other tools: a tool call cannot see its siblings'
+// controls, so "the authorized set contains more than finish_task" is not a fact
+// about this round — it is true of every usable sub-agent, and refusing on it
+// made the tool unusable in exactly the sessions that need it. What the tool can
+// do honestly is *ask* and say what it asked: the terminate is a request the
+// harness evaluates, and the tool's output never claims the run ended.
+//
+// The documented fallback, for a future Runtime that cannot rely on step 3: a
+// schema-validated final answer with no tool calls, settled the same way through
+// `Submission.wait`. It is strictly weaker (it depends on the model choosing to
+// stop rather than on the run actually ending), so it is a fallback — never
+// "make the prompt say stop".
+
 /** What the finish decision engine was asked. */
 export type FinishDecisionInput = {
-	/** Did the model call the finish tool at all? */
-	readonly finishRequested: boolean;
 	/**
-	 * Every other tool the conversation is authorized to call this round. A tool
-	 * call cannot see its siblings' controls, so this is what a finish call can
-	 * honestly check: any second authorized tool means a competing call can
-	 * exist, and the harness would not terminate the round.
+	 * Whether the conversation may call tools other than `finish_task`. This is
+	 * **not** a statement about what this round contains — the tool cannot see its
+	 * siblings — it only decides how much the tool's own output may claim.
 	 */
-	readonly authorizedCompetingCalls: readonly string[];
-	/** Did the model's final answer pass the contract validation? */
+	readonly roundMayHaveCompetitors: boolean;
+	/** Did the model's submitted work pass the contract validation? */
 	readonly answerValidated: boolean;
 };
 
 export type FinishDecision =
-	/** End the round: return `control: { terminate: true }`. */
-	| { readonly kind: "terminate" }
-	/** Do not end it, and do not claim it ended. */
-	| { readonly kind: "continue"; readonly reason: string }
+	/** Ask the harness to end the round. `statement` is all the tool may tell the model. */
+	| { readonly kind: "terminate"; readonly statement: string }
 	/** Refuse the call outright: no control, an error result. */
 	| { readonly kind: "refuse"; readonly code: string; readonly detail: string };
 
 /**
  * Decide what a finish call does. Pure, no IO, no documents touched.
  *
- * The rules, in order:
- *   * an unvalidated answer is refused — we never stop a round on a payload that
- *     failed its contract, because the stop would look like a settlement;
- *   * a finish call in a conversation that may call anything else cannot stop the
- *     round (source rule 1), so it is refused with the competing names. Returning
- *     a control that the harness then ignores would leave the model told
- *     "Finished" while the run continued.
+ * An unvalidated payload is refused: we never ask to end a round on work that
+ * failed its contract, because the stop would then look like a settlement of
+ * something that was never valid. A valid payload is always asked for, and the
+ * statement is worded to the one thing the tool knows — that it asked.
  */
 export function decideFinish(input: FinishDecisionInput): FinishDecision {
-	if (input.finishRequested && !input.answerValidated) {
-		return { kind: "refuse", code: "finish_answer_invalid", detail: "the final answer failed contract validation; the round was not terminated" };
+	if (!input.answerValidated) {
+		return { kind: "refuse", code: "finish_answer_invalid", detail: "the submitted work failed contract validation; the round was not asked to end" };
 	}
-	if (!input.finishRequested) {
-		return input.authorizedCompetingCalls.length === 0
-			? { kind: "continue", reason: "no finish call" }
-			: { kind: "continue", reason: `the round has unfinished calls: ${input.authorizedCompetingCalls.join(", ")}` };
-	}
-	if (input.authorizedCompetingCalls.length > 0) {
+	if (input.roundMayHaveCompetitors) {
 		return {
-			kind: "refuse",
-			code: "finish_round_has_competitors",
-			detail: `every call of a round must ask to terminate; this conversation may also call: ${input.authorizedCompetingCalls.join(", ")}`,
+			kind: "terminate",
+			statement:
+				"Submission recorded. This round is asking to end. The run ends only if every call of this round also asked to end, so if the run continues, call finish_task again as the only call of the round.",
 		};
 	}
-	return { kind: "terminate" };
+	return { kind: "terminate", statement: "Submission recorded. This round is asking to end; the run outcome is recorded after the submission settles." };
 }
 
 /**
- * Whether the run is over, as opposed to a round being over. A round ends on
- * success, failure or cancellation; the *run* ends only when the conversation
- * stops generating on its own — which, with `terminate`, is at the final
- * boundary and therefore immediately. Callers must not treat "a round settled"
- * as "the run ended": a revision round settles the same way.
+ * Whether the round *asked* to end. This is a request predicate, and it is named
+ * as one: a tool returning `terminate` is not the run having ended.
  */
-export function isRunEnded(input: { readonly roundStatus: "completed" | "failed" | "cancelled"; readonly terminateRequested: boolean }): boolean {
+export function isTerminateRequested(input: { readonly terminateRequested: boolean }): boolean {
 	return input.terminateRequested;
+}
+
+/** The statuses a submission can report; only the last two are terminal. */
+export type RunSettlementStatus = "queued" | "placed" | "done" | "unanswered";
+
+/**
+ * Whether the run is over. The only honest input is the settlement the program
+ * received from `Submission.wait`: a run ends when its submission settles, not
+ * when a tool asked it to stop and not when a round finished. (A revision round
+ * settles exactly like a first round, so "a round settled" is not "the run
+ * ended" either.)
+ */
+export function isRunEnded(settlement: { readonly status: RunSettlementStatus }): boolean {
+	return settlement.status === "done" || settlement.status === "unanswered";
 }

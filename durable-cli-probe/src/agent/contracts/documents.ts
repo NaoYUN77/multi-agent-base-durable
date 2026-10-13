@@ -31,6 +31,13 @@ import type { TaskResult } from "./task-result.ts";
 export type AgentRequestDocState = {
 	readonly schemaVersion: number;
 	readonly requestId: string;
+	/**
+	 * The **business version of the requirement**: bumped when the user restates
+	 * what they want. It is not `schemaVersion` (the document shape) and not the
+	 * plan's `version` (the plan's revision) — a task must be able to say which
+	 * requirement it answered, and "the newest plan" does not answer that.
+	 */
+	readonly requestVersion: number;
 	/** The user's own words. `""` means nothing recorded yet, not an empty request. */
 	readonly text: string;
 	readonly materials: { readonly id: string; readonly content: string; readonly source: string }[];
@@ -46,7 +53,7 @@ export const AgentRequestDoc = defineDocFamily<AgentRequestDocState, { readonly 
 	history: "latest",
 	fork: "initial",
 	family: true,
-	initial: (seed) => ({ schemaVersion: 1, requestId: seed.requestId, text: "", materials: [], requestedAt: 0 }),
+	initial: (seed) => ({ schemaVersion: 1, requestId: seed.requestId, requestVersion: 1, text: "", materials: [], requestedAt: 0 }),
 });
 
 /** Questions, answers and resolutions for one request. Answers are application-only. */

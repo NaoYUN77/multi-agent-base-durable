@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Type } from "@earendil-works/pi-ai";
-import type { Conversation, EntryRecord } from "@earendil-works/pi-durable";
+import type { Conversation, ConversationId, EntryRecord } from "@earendil-works/pi-durable";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc, AgentTaskConfigDoc, AgentTaskResultDoc } from "../src/agent/contracts/documents.ts";
@@ -22,7 +22,7 @@ import { validateClarificationState } from "../src/agent/contracts/clarification
 import { validatePlan } from "../src/agent/contracts/plan.ts";
 import { assembleTaskResult, validateTaskResult, type PersistedEntryIndex } from "../src/agent/contracts/task-result.ts";
 import { createFinishTaskTool } from "../src/agent/tools/finish-task.ts";
-import { QuotaError, consume, initialQuotaState, isBusinessBudgetExhausted, quotaRemaining, resetRoundCounters } from "../src/agent/state/quota.ts";
+import { QuotaError, businessStopReason, consume, initialQuotaState, isBusinessBudgetExhausted, quotaRemaining, resetRoundCounters } from "../src/agent/state/quota.ts";
 import {
 	IllegalTransitionError,
 	admissionBlockReasons,
@@ -222,6 +222,50 @@ describe("TASK-005.1 state — quota accounting (AC-01, AC-02)", () => {
 		expect(state.round.round).toBe(2);
 	});
 
+	it("refuses a new business call once the round has spent its failure allowance", () => {
+		const budget = config();
+		const state = initialQuotaState(1);
+		// One call, one failure. The allowance is 2, so work may continue.
+		consume(state, { kind: "tool_call" }, budget);
+		consume(state, { kind: "failed_tool_call" }, budget);
+		expect(businessStopReason(state, budget)).toBeUndefined();
+
+		consume(state, { kind: "tool_call" }, budget);
+		consume(state, { kind: "failed_tool_call" }, budget);
+		// The allowance is spent. The next call is refused *before* it happens —
+		// recording the failure afterwards would let the side effect run first.
+		expect(businessStopReason(state, budget)).toBe("failed_tool_calls_exhausted");
+		const spent = quotaRemaining(state, budget).toolInvocations;
+		expect(() => consume(state, { kind: "tool_call" }, budget)).toThrow(QuotaError);
+		expect(quotaRemaining(state, budget).toolInvocations).toBe(spent);
+
+		// The control channel is not a business call: reporting and finishing stay
+		// available so the round can hand the stop reason to Main.
+		expect(() => consume(state, { kind: "control" }, budget)).not.toThrow();
+	});
+
+	it("treats a zero failure allowance as admitting no business call at all", () => {
+		const zeroFailures = validateRunConfig({
+			schemaVersion: RUN_CONFIG_SCHEMA_VERSION,
+			maxConcurrentSubAgents: 1,
+			maxSubAgentsPerRequest: 1,
+			maxToolInvocationsPerRound: 3,
+			maxFailedToolCallsPerRound: 0,
+			maxAttemptsPerOperation: 2,
+			maxTechnicalRestarts: 1,
+			roundTimeoutMs: 1000,
+			providerRetry: { maxRetries: 0, backoffMs: 0 },
+			harnessRetry: { maxRetries: 0, backoffMs: 0 },
+		});
+		if (!zeroFailures.ok) throw new Error("fixture config invalid");
+		const state = initialQuotaState(1);
+		expect(businessStopReason(state, zeroFailures.value)).toBe("failed_tool_calls_exhausted");
+		expect(() => consume(state, { kind: "tool_call" }, zeroFailures.value)).toThrow(QuotaError);
+		// A refused admission spends nothing.
+		expect(state.round.toolInvocationsUsed).toBe(0);
+		expect(() => consume(state, { kind: "control" }, zeroFailures.value)).not.toThrow();
+	});
+
 	it("reports the business budget as exhausted, not the control channel", () => {
 		const state = initialQuotaState(1);
 		const tight = validateRunConfig({
@@ -330,7 +374,48 @@ describe("TASK-005.1 finish — a submission the round can actually honour (AC-0
 		}
 	});
 
-	it("refuses the submission when the round could contain another call", async () => {
+	it("works in a session that also has business tools: do the work, then submit alone", async () => {
+		const runtime: ProbeRuntime = await openProbe({
+			databasePath,
+			provider: "faux",
+			fauxToolTurns: [
+				// Round 1: a business call, which does not ask to terminate.
+				[{ name: "sibling_noop", arguments: {} }],
+				// Round 2: the submission, alone. This is the round that ends the run.
+				[{ name: "finish_task", arguments: { summary: "Revenue is 1,204 units, quoted from the material.", findings: ["quoted verbatim"] } }],
+			],
+			// A third provider request would reach the router, which refuses to
+			// answer: the run must end on round 2.
+			fauxRouter: () => {
+				throw new Error("the run must not make a third provider request");
+			},
+			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool(), siblingTool] })],
+		});
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const submission = await root.submit({ type: "input", content: "Use the sibling, then submit.", requestId: "finish-business-1" }, context);
+			const settled = await submission.wait(context);
+			expect(settled.status).toBe("done");
+
+			const entries = await entriesOf(root);
+			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
+			// Two rounds: the business call, then the submission that ended the run.
+			expect(assistantEntries).toHaveLength(2);
+			const result = toolResultOf(entries, "finish_task");
+			expect(result?.isError).toBe(false);
+			expect(result?.text).toContain("asking to end");
+			expect(result?.text).not.toContain("Finished");
+
+			// Settled means settled: nothing else ran, and the transcript is stable.
+			const after = await entriesOf(root);
+			expect(after.map((entry) => `${entry.kind}#${entry.id}`)).toEqual(entries.map((entry) => `${entry.kind}#${entry.id}`));
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("does not end the run when the submission shares its round with another call", async () => {
 		const runtime: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
@@ -340,25 +425,26 @@ describe("TASK-005.1 finish — a submission the round can actually honour (AC-0
 					{ name: "sibling_noop", arguments: {} },
 				],
 			],
-			fauxResponses: ["Answer after the refused submission."],
+			fauxResponses: ["Answer after the round that did not end."],
 			extensions: [defineExtension({ name: "agent-finish", tools: [createFinishTaskTool(), siblingTool] })],
 		});
 		try {
 			const root = await openRoot(runtime);
 			runtime.harness.resume();
-			const submission = await root.submit({ type: "input", content: "Verify, then also do the sibling.", requestId: "finish-refused-1" }, context);
+			const submission = await root.submit({ type: "input", content: "Verify, then also do the sibling.", requestId: "finish-competing-1" }, context);
 			const settled = await submission.wait(context);
 			expect(settled.status).toBe("done");
 
 			const entries = await entriesOf(root);
 			const assistantEntries = entries.filter((entry) => entry.kind === "pi.assistant");
-			// The round did not stop: the submission was refused, so the model got
-			// another turn. Returning a control here would have told it "Finished"
-			// while the run continued.
+			// The round did not end — the harness requires *every* call of the round
+			// to ask for it — so the run continued to a second round. The tool asked
+			// and said so; it never claimed the run had ended.
 			expect(assistantEntries).toHaveLength(2);
 			const result = toolResultOf(entries, "finish_task");
-			expect(result?.isError).toBe(true);
-			expect(result?.text).toContain("sibling_noop");
+			expect(result?.isError).toBe(false);
+			expect(result?.text).toContain("only call of the round");
+			expect(result?.text).not.toContain("Finished");
 		} finally {
 			await runtime.close();
 		}
@@ -497,6 +583,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 		const snapshot = validateTaskConfigSnapshot({
 			schemaVersion: RUN_CONFIG_SCHEMA_VERSION,
 			contractRevision: 1,
+			requestVersion: 2,
 			taskSpecVersion: 1,
 			planVersion: 1,
 			assembledPrompt: "Check the supplied material only.",
@@ -522,11 +609,32 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 			schemaVersion: 1,
 			resultId: "result-1",
 			runtime: { taskId, round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 2, sideEffect: "recorded", settledAt: 1_700_000_000_000 },
-			evidence: [],
-			work: { summary: "The figure matches.", findings: [], unresolved: [], artifacts: [] },
+			// Non-empty evidence and work, so the comparison after the reopen has
+			// something to lose: an empty list round-trips through anything.
+			evidence: [{ entryId: "42", kind: "pi.tool-result", byTaskId: taskId, toolCallId: "call-1", toolName: "text_check" }],
+			work: { summary: "The figure matches.", findings: ["Revenue is 1,204 units."], unresolved: ["Nothing open."], artifacts: [{ kind: "text", ref: "answer-1" }] },
 		});
 		if (!clarification.ok || !plan.ok || !snapshot.ok || !result.ok) throw new Error("fixture documents must validate");
 
+		/**
+		 * Read all five documents through the public read-only API. Used both
+		 * before the close and after the reopen, so the comparison is
+		 * document-to-document: a document that quietly became a *different valid*
+		 * document fails it, which field-by-field spot checks would not catch.
+		 */
+		const readFive = async (harness: ProbeRuntime["harness"], conversationId: ConversationId) => {
+			const request = await harness.snapshot(AgentRequestDoc, conversationId as never, requestId, context);
+			const clarificationRead = await harness.snapshot(AgentClarificationDoc, conversationId as never, requestId, context);
+			const planRead = await harness.snapshot(AgentPlanDoc, conversationId as never, planId, context);
+			const configRead = await harness.snapshot(AgentTaskConfigDoc, conversationId as never, taskId, context);
+			const resultRead = await harness.snapshot(AgentTaskResultDoc, conversationId as never, taskId, context);
+			if (request === undefined || clarificationRead === undefined || planRead === undefined || configRead === undefined || resultRead === undefined) {
+				throw new Error("every document must exist");
+			}
+			return { request, clarification: clarificationRead, plan: planRead, config: configRead, result: resultRead };
+		};
+
+		let before: Awaited<ReturnType<typeof readFive>> | undefined;
 		const runtime: ProbeRuntime = await openProbe({ databasePath, provider: "faux" });
 		try {
 			const root = await openRoot(runtime);
@@ -534,6 +642,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 			await runtime.harness.commit(
 				async (tx) => {
 					const request = await tx.doc(AgentRequestDoc, root.id, requestId, { requestId });
+					request.requestVersion = 2;
 					request.text = "Verify the revenue figure.";
 					request.materials = [{ id: "mat-1", content: "Revenue is 1,204 units.", source: "provided-by-user" }];
 					request.requestedAt = 1_700_000_000_000;
@@ -559,43 +668,55 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", () => {
 				},
 				context,
 			);
+			before = await readFive(runtime.harness, root.id);
 		} finally {
 			await runtime.close();
 		}
+		if (before === undefined) throw new Error("the documents must be readable before the reopen");
 
 		const reopened = await openProbe({ databasePath, provider: "faux" });
 		try {
 			const root = await openRoot(reopened);
-			// Read-only snapshots: no commit, so nothing is written by reading.
-			const request = await reopened.harness.snapshot(AgentRequestDoc, root.id as never, requestId, context);
-			const clarificationRead = await reopened.harness.snapshot(AgentClarificationDoc, root.id as never, requestId, context);
-			const planRead = await reopened.harness.snapshot(AgentPlanDoc, root.id as never, planId, context);
-			const configRead = await reopened.harness.snapshot(AgentTaskConfigDoc, root.id as never, taskId, context);
-			const resultRead = await reopened.harness.snapshot(AgentTaskResultDoc, root.id as never, taskId, context);
-			if (clarificationRead === undefined || planRead === undefined || configRead === undefined || resultRead === undefined || request === undefined) {
-				throw new Error("every document must survive the reopen");
-			}
+			const after = await readFive(reopened.harness, root.id);
 
-			// Field for field, after a real close and reopen of the SQLite file.
-			expect(request.text).toBe("Verify the revenue figure.");
-			expect(request.materials).toEqual([{ id: "mat-1", content: "Revenue is 1,204 units.", source: "provided-by-user" }]);
-			expect(request.inputEntryId).toBe("31");
-			expect(clarificationRead.answers[0]?.source).toBe("application");
-			expect(clarificationRead.answers[0]?.sufficient).toBe(true);
-			expect(clarificationRead.questions[0]?.blockingScope).toEqual(["scope"]);
-			expect(planRead.version).toBe(1);
-			expect(planRead.taskIds).toEqual([taskId]);
-			expect(configRead.snapshot?.contractRevision).toBe(1);
-			expect(configRead.snapshot?.tools).toEqual([{ name: "finish_task", version: "1.0.0" }]);
-			expect(resultRead.result?.runtime.status).toBe("completed");
-			expect(resultRead.result?.work.summary).toBe("The figure matches.");
+			// Identity, schemaVersion and every field, document for document.
+			expect(after).toEqual(before);
+
+			// And the fields the reopen is most likely to lose, named explicitly so
+			// a regression says which one moved.
+			expect(after.request.requestVersion).toBe(2);
+			expect(after.request.text).toBe("Verify the revenue figure.");
+			expect(after.request.materials).toEqual([{ id: "mat-1", content: "Revenue is 1,204 units.", source: "provided-by-user" }]);
+			expect(after.request.inputEntryId).toBe("31");
+			expect(after.clarification.questions).toEqual([{ questionId: "q-1", question: "Which version?", reason: "Two are supplied.", blockingScope: ["scope"], askedAt: 10 }]);
+			expect(after.clarification.answers).toEqual([{ questionId: "q-1", text: "The 2026 one.", source: "application", sufficient: true, answeredAt: 20 }]);
+			expect(after.clarification.resolutions).toEqual([{ questionId: "q-1", resolvedAt: 21, resolvedBy: "model", basis: { kind: "answer", answerAt: 20 } }]);
+			expect(after.plan.version).toBe(1);
+			expect(after.plan.goals).toEqual(["Check the figures."]);
+			expect(after.plan.taskIds).toEqual([taskId]);
+			expect(after.plan.savedAt).toBe(1_700_000_000_000);
+			expect(after.config.snapshot?.contractRevision).toBe(1);
+			expect(after.config.snapshot?.requestVersion).toBe(2);
+			expect(after.config.snapshot?.assembledPrompt).toBe("Check the supplied material only.");
+			expect(after.config.snapshot?.model).toBe("faux-faux-1");
+			expect(after.config.snapshot?.configHash).toBe("b".repeat(64));
+			expect(after.config.snapshot?.budget.maxToolInvocationsPerRound).toBe(8);
+			expect(after.config.snapshot?.tools).toEqual([{ name: "finish_task", version: "1.0.0" }]);
+			expect(after.result.result?.evidence).toEqual([{ entryId: "42", kind: "pi.tool-result", byTaskId: taskId, toolCallId: "call-1", toolName: "text_check" }]);
+			expect(after.result.result?.work).toEqual({
+				summary: "The figure matches.",
+				findings: ["Revenue is 1,204 units."],
+				unresolved: ["Nothing open."],
+				artifacts: [{ kind: "text", ref: "answer-1" }],
+			});
+			expect(after.result.result?.runtime.status).toBe("completed");
 
 			// And the documents still validate after the reopen: surviving is not
 			// the same as still being a contract.
-			expect(validateClarificationState(clarificationRead).ok).toBe(true);
-			expect(validatePlan(planRead).ok).toBe(true);
-			expect(validateTaskConfigSnapshot(configRead.snapshot).ok).toBe(true);
-			expect(validateTaskResult(resultRead.result).ok).toBe(true);
+			expect(validateClarificationState(after.clarification).ok).toBe(true);
+			expect(validatePlan(after.plan).ok).toBe(true);
+			expect(after.config.snapshot !== undefined && validateTaskConfigSnapshot(after.config.snapshot).ok).toBe(true);
+			expect(after.result.result !== undefined && validateTaskResult(after.result.result).ok).toBe(true);
 		} finally {
 			await reopened.close();
 		}
@@ -614,21 +735,23 @@ describe("TASK-005.1 documents — evidence attribution against real entries (AC
 		await rm(directory, { recursive: true, force: true });
 	});
 
-	it("refuses an entry that belongs to another conversation", async () => {
+	it("refuses an entry of another conversation, and one of an earlier round", async () => {
 		const runtime: ProbeRuntime = await openProbe({
 			databasePath,
 			provider: "faux",
-			fauxResponses: ["Child answer.", "Other conversation answer."],
+			fauxResponses: ["Child answer one.", "Child answer two.", "Other conversation answer."],
 		});
 		try {
-			// The child conversation, and a foreign one with its own entries.
+			// The child conversation (two rounds) and a foreign one with its own entry.
 			const child = await openRoot(runtime);
 			const foreign = await runtime.harness.createConversation({ ownership: { kind: "ownerless" } }, context);
 			await foreign.configure({ model: runtime.modelRef }, context);
 			runtime.harness.resume();
 
-			const childSubmission = await child.submit({ type: "input", content: "Do the work.", requestId: "evidence-child-1" }, context);
-			expect((await childSubmission.wait(context)).status).toBe("done");
+			const firstRound = await child.submit({ type: "input", content: "Do the work.", requestId: "evidence-child-1" }, context);
+			expect((await firstRound.wait(context)).status).toBe("done");
+			const secondRound = await child.submit({ type: "input", content: "Do it again.", requestId: "evidence-child-2" }, context);
+			expect((await secondRound.wait(context)).status).toBe("done");
 			const foreignSubmission = await foreign.submit({ type: "input", content: "Somebody else's work.", requestId: "evidence-foreign-1" }, context);
 			expect((await foreignSubmission.wait(context)).status).toBe("done");
 
@@ -637,38 +760,61 @@ describe("TASK-005.1 documents — evidence attribution against real entries (AC
 			// The index is everything the program can see: the child conversation *and*
 			// the other one. Attribution, not lookup, is what must refuse the forgery.
 			const childIndex = indexEntries([...(await entriesOf(child)), ...(await entriesOf(foreign))]);
+			const childAssistants = (await entriesOf(child)).filter((entry) => entry.kind === "pi.assistant");
 			const foreignEntry = (await entriesOf(foreign)).find((entry) => entry.kind === "pi.assistant");
+			// Two rounds of the same child conversation, each with its own durable task.
+			expect(childAssistants).toHaveLength(2);
 			expect(foreignEntry).toBeDefined();
-			if (foreignEntry === undefined) return;
+			const earlier = childAssistants[0];
+			const current = childAssistants[1];
+			if (earlier === undefined || current === undefined || foreignEntry === undefined) return;
+			expect(earlier.byTaskId).toBeDefined();
+			expect(current.byTaskId).toBeDefined();
+			expect(String(earlier.byTaskId)).not.toBe(String(current.byTaskId));
+			if (earlier.byTaskId === undefined || current.byTaskId === undefined) return;
 
-			// The program binds the durable tasks it owns to the business task; the child's
-			// own assistant entry was produced by one of them.
-			const ownEntry = (await entriesOf(child)).find((entry) => entry.kind === "pi.assistant");
-			expect(ownEntry).toBeDefined();
-			if (ownEntry === undefined) return;
-			const ownedDurableTaskIds = ownEntry.byTaskId === undefined ? [] : [String(ownEntry.byTaskId)];
-			const contextForTask = { childConversationId: String(child.id), businessTaskId: "task-a", ownedDurableTaskIds, round: 1 };
-			// A reference to the foreign conversation's own entry, claiming this task.
-			const forged = assembleTaskResult({
-				resultId: "result-1",
-				runtime: { taskId: "task-a", round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 1, sideEffect: "recorded", settledAt: 1 },
-				work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
-				evidence: [{ entryId: String(foreignEntry.id), kind: "pi.assistant", byTaskId: "task-a" }],
-				knownEntries: childIndex,
-				attribution: contextForTask,
+			const runtimeOutcome = (overrides: Readonly<Record<string, unknown>> = {}) => ({
+				taskId: "task-a",
+				round: 2,
+				status: "completed" as const,
+				attempts: 1,
+				technicalRestarts: 0,
+				toolInvocations: 1,
+				sideEffect: "recorded" as const,
+				settledAt: 1,
+				...overrides,
 			});
+			// Round 2 owns the durable task round 2 created — not every task the
+			// business task ever ran, which is what the earlier round's entry would
+			// need to slip through.
+			const contextForRound2 = { childConversationId: String(child.id), businessTaskId: "task-a", round: 2, roundDurableTaskIds: [String(current.byTaskId)] };
+			const assemble = (evidence: readonly { readonly entryId: string; readonly kind: string; readonly byTaskId?: string }[], overrides: Readonly<Record<string, unknown>> = {}) =>
+				assembleTaskResult({
+					resultId: "result-1",
+					runtime: runtimeOutcome(overrides),
+					work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
+					evidence,
+					knownEntries: childIndex,
+					attribution: contextForRound2,
+				});
+
+			// A reference to the foreign conversation's own entry, claiming this task.
+			const forged = assemble([{ entryId: String(foreignEntry.id), kind: "pi.assistant", byTaskId: "task-a" }]);
 			expect(forged.ok).toBe(false);
 			if (!forged.ok) expect(forged.violations.map((item) => item.code)).toContain("evidence_conversation_foreign");
 
-			// The same entry number would be accepted only if it were the child's.
-			const honest = assembleTaskResult({
-				resultId: "result-1",
-				runtime: { taskId: "task-a", round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 1, sideEffect: "recorded", settledAt: 1 },
-				work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
-				evidence: [{ entryId: String(ownEntry.id), kind: "pi.assistant" }],
-				knownEntries: childIndex,
-				attribution: contextForTask,
-			});
+			// Round 1's real entry, offered as round 2's evidence.
+			const stale = assemble([{ entryId: String(earlier.id), kind: "pi.assistant" }]);
+			expect(stale.ok).toBe(false);
+			if (!stale.ok) expect(stale.violations.map((item) => item.code)).toContain("evidence_task_mismatch");
+
+			// And a result that claims round 1 while the context is round 2.
+			const wrongRound = assemble([{ entryId: String(current.id), kind: "pi.assistant" }], { round: 1 });
+			expect(wrongRound.ok).toBe(false);
+			if (!wrongRound.ok) expect(wrongRound.violations.map((item) => item.code)).toContain("result_round_mismatch");
+
+			// This round's own entry, with the durable task the round actually owns.
+			const honest = assemble([{ entryId: String(current.id), kind: "pi.assistant" }]);
 			expect(honest.ok).toBe(true);
 		} finally {
 			await runtime.close();

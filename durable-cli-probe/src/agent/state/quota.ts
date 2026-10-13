@@ -13,6 +13,14 @@
 //      budget for both would either exhaust quality rework waiting on flaky
 //      providers, or let a flaky provider burn the task's revision allowance.
 //
+// A third rule, added because accounting alone was too late: **the failure
+// allowance gates admission, not just recording.** Once a round has spent its
+// failed-tool-call allowance, no further business call may *start* — checking
+// only when the next failure is recorded would let the side effect happen first
+// and refuse afterwards. `businessStopReason` is the reason a caller hands to
+// Main; the control channel (`{ kind: "control" }`) is never gated by it, so a
+// round can still report and finish.
+//
 // Per-round counters (tool calls, failed tool calls) are reset when a round
 // starts; per-operation counters (attempts, technical restarts) live as long as
 // the operation.
@@ -43,7 +51,17 @@ export type QuotaState = {
 	round: RoundQuota;
 };
 
-export type QuotaRequest = { readonly kind: "attempt" } | { readonly kind: "technical_restart" } | { readonly kind: "tool_call" } | { readonly kind: "failed_tool_call" };
+export type QuotaRequest =
+	| { readonly kind: "attempt" }
+	| { readonly kind: "technical_restart" }
+	| { readonly kind: "tool_call" }
+	| { readonly kind: "failed_tool_call" }
+	/**
+	 * A control-channel call: reporting, finishing, asking Main. It consumes
+	 * nothing and is never refused, so an exhausted business budget still leaves a
+	 * way to say so.
+	 */
+	| { readonly kind: "control" };
 
 /** Raised when the request does not fit the remaining budget. */
 export class QuotaError extends Error {
@@ -105,6 +123,15 @@ export function consume(state: QuotaState, request: QuotaRequest, budget: RunCon
 			state.operation.technicalRestartsUsed += 1;
 			return;
 		case "tool_call":
+			// Admission, not just accounting: once the round has spent its failure
+			// allowance, no further business call may start. Checking only when the
+			// *next* failure is recorded would let the side effect happen first.
+			if (remaining.failedToolCalls <= 0) {
+				throw new QuotaError(
+					"quota_failed_tool_calls_exhausted",
+					`round ${state.round.round} has spent its failure allowance (${budget.maxFailedToolCallsPerRound}), so no further business call may start`,
+				);
+			}
 			if (remaining.toolInvocations <= 0) {
 				throw new QuotaError("quota_tool_invocations_exhausted", `tool invocations for round ${state.round.round} exhausted (${budget.maxToolInvocationsPerRound} allowed)`);
 			}
@@ -116,13 +143,35 @@ export function consume(state: QuotaState, request: QuotaRequest, budget: RunCon
 			}
 			state.round.failedToolCallsUsed += 1;
 			return;
+		case "control":
+			// Nothing to reserve: the control channel is not a business call.
+			return;
 	}
+}
+
+/** Why no further business call may start, in a form a caller can hand to Main. */
+export type BusinessStopReason = "attempts_exhausted" | "tool_invocations_exhausted" | "failed_tool_calls_exhausted";
+
+/**
+ * The reason the round may not start another business call, or `undefined` when
+ * it may.
+ *
+ * A zero failure allowance admits no business call at all: the first failure
+ * would already exceed it, so "try until it fails" is not a budget. That is the
+ * explicit semantics of `maxFailedToolCallsPerRound: 0`, and it is why the check
+ * lives here rather than only on the failure path.
+ */
+export function businessStopReason(state: QuotaState, budget: RunConfig): BusinessStopReason | undefined {
+	const remaining = quotaRemaining(state, budget);
+	if (remaining.attempts <= 0) return "attempts_exhausted";
+	if (remaining.failedToolCalls <= 0) return "failed_tool_calls_exhausted";
+	if (remaining.toolInvocations <= 0) return "tool_invocations_exhausted";
+	return undefined;
 }
 
 /** True when no further business call may be made: the control channel stays open. */
 export function isBusinessBudgetExhausted(state: QuotaState, budget: RunConfig): boolean {
-	const remaining = quotaRemaining(state, budget);
-	return remaining.attempts <= 0 || remaining.toolInvocations <= 0;
+	return businessStopReason(state, budget) !== undefined;
 }
 
 /** Valid attempt counts: never negative, never unbounded, and never fractional. */

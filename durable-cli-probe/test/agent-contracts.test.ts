@@ -22,6 +22,7 @@ import { RUN_CONFIG_SCHEMA_VERSION, validateRunConfig, validateTaskConfigSnapsho
 import { TASK_RESULT_SCHEMA_VERSION, assembleTaskResult, validateModelWork, validateTaskResult, type PersistedEntryIndex } from "../src/agent/contracts/task-result.ts";
 import { TASK_SPEC_SCHEMA_VERSION, validateTaskBatch, validateTaskSpec } from "../src/agent/contracts/task-spec.ts";
 import { assertFieldOwner, modelForbiddenPaths, modelWritablePaths, ownerOf } from "../src/agent/state/authorization.ts";
+import { decideFinish, isRunEnded, isTerminateRequested } from "../src/agent/state/finish.ts";
 import { AGENT_DOCUMENT_KINDS } from "../src/agent/contracts/documents.ts";
 
 /** A spec that passes, so each test can break exactly one thing. */
@@ -163,6 +164,8 @@ describe("TASK-005.1 contracts — config snapshot (AC-01, AC-03)", () => {
 		schemaVersion: RUN_CONFIG_SCHEMA_VERSION,
 		// The behaviour contract revision is separate from the schema version.
 		contractRevision: 1,
+		// And the user requirement version is separate from both.
+		requestVersion: 3,
 		taskSpecVersion: 1,
 		planVersion: 2,
 		assembledPrompt: "Check the supplied material only.",
@@ -175,19 +178,28 @@ describe("TASK-005.1 contracts — config snapshot (AC-01, AC-03)", () => {
 		...overrides,
 	});
 
-	it("accepts a snapshot carrying the contract revision and the tool versions", () => {
+	it("accepts a snapshot carrying the contract revision, the request version and the tool versions", () => {
 		const result = validateTaskConfigSnapshot(snapshot());
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.value.contractRevision).toBe(1);
+			expect(result.value.requestVersion).toBe(3);
 			expect(result.value.tools).toEqual([{ name: "text_check", version: "1.0.0" }]);
 		}
 	});
 
-	it("refuses a snapshot without a contract revision or with a bare tool name", () => {
+	it("refuses a snapshot without a contract revision, without a requirement version, or with a bare tool name", () => {
 		const missing = { ...(snapshot() as Record<string, unknown>) };
 		delete missing.contractRevision;
 		expect(validateTaskConfigSnapshot(missing).ok).toBe(false);
+
+		// The requirement version is not implied by any other version field.
+		const noRequirement = { ...(snapshot() as Record<string, unknown>) };
+		delete noRequirement.requestVersion;
+		const refused = validateTaskConfigSnapshot(noRequirement);
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.violations.some((item) => item.path === "$.requestVersion")).toBe(true);
+
 		const bare = validateTaskConfigSnapshot(snapshot({ tools: ["text_check"] }));
 		expect(bare.ok).toBe(false);
 		if (!bare.ok) expect(bare.violations.some((item) => item.path === "$.tools[0]")).toBe(true);
@@ -277,60 +289,106 @@ describe("TASK-005.1 contracts — result ownership (AC-04)", () => {
 });
 
 describe("TASK-005.1 contracts — evidence attribution (AC-04)", () => {
-	const context = { childConversationId: "2", businessTaskId: "task-a", ownedDurableTaskIds: ["7"], round: 1 };
+	// The attribution context is round-scoped: `roundDurableTaskIds` names the
+	// durable tasks *this round* created, not every task the business task ever
+	// owned, which is what stops a previous round's entry from standing in.
+	const context = { childConversationId: "2", businessTaskId: "task-a", round: 1, roundDurableTaskIds: ["7"], submissionId: "sub-1" };
 	const known = new Map<string, PersistedEntryIndex>([
-		["1", { entryId: "1", conversationId: "2", taskId: "7", toolCallId: "c1", kind: "pi.tool-result" }],
+		// This round's own tool result.
+		["1", { entryId: "1", conversationId: "2", taskId: "7", kind: "pi.tool-result", toolCallId: "c1", toolName: "text_check", submissionId: "sub-1" }],
+		// The same child conversation, but produced by an earlier round.
+		["2", { entryId: "2", conversationId: "2", taskId: "6", kind: "pi.tool-result", toolCallId: "c0", toolName: "text_check", submissionId: "sub-0" }],
+		// This round's assistant entry: real, but not a tool result.
+		["3", { entryId: "3", conversationId: "2", taskId: "7", kind: "pi.assistant", submissionId: "sub-1" }],
 		// A real entry of *another* conversation: the foreign-evidence negative case.
 		["9", { entryId: "9", conversationId: "3", taskId: "8", kind: "pi.tool-result" }],
 	]);
-
-	it("accepts an entry that belongs to this task's child conversation", () => {
-		const result = assembleTaskResult({
+	const runtime = (overrides: Readonly<Record<string, unknown>> = {}) => ({
+		taskId: "task-a",
+		round: 1,
+		status: "completed" as const,
+		attempts: 1,
+		technicalRestarts: 0,
+		toolInvocations: 1,
+		sideEffect: "recorded" as const,
+		settledAt: 1,
+		...overrides,
+	});
+	const assemble = (input: Readonly<Record<string, unknown>>) =>
+		assembleTaskResult({
 			resultId: "result-1",
-			runtime: { taskId: "task-a", round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 1, sideEffect: "recorded", settledAt: 1 },
+			runtime: runtime(),
 			work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
-			evidence: [{ entryId: "1", kind: "pi.tool-result", byTaskId: "task-a", toolCallId: "c1" }],
+			evidence: [],
 			knownEntries: known,
 			attribution: context,
-		});
+			...input,
+		} as Parameters<typeof assembleTaskResult>[0]);
+
+	it("accepts an entry that belongs to this task's child conversation and this round", () => {
+		const result = assemble({ evidence: [{ entryId: "1", kind: "pi.tool-result", byTaskId: "task-a", toolCallId: "c1", toolName: "text_check" }] });
 		expect(result.ok).toBe(true);
 	});
 
 	it("refuses an entry of another conversation, even when the reference names this task", () => {
-		const result = assembleTaskResult({
-			resultId: "result-1",
-			runtime: { taskId: "task-a", round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 1, sideEffect: "recorded", settledAt: 1 },
-			work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
-			evidence: [{ entryId: "9", kind: "pi.tool-result", byTaskId: "task-a" }],
-			knownEntries: known,
-			attribution: context,
-		});
+		const result = assemble({ evidence: [{ entryId: "9", kind: "pi.tool-result", byTaskId: "task-a" }] });
 		expect(result.ok).toBe(false);
 		if (!result.ok) expect(result.violations.map((item) => item.code)).toContain("evidence_conversation_foreign");
 	});
 
 	it("refuses an unknown entry, a foreign business task and a non-owned durable task", () => {
-		const base = {
-			resultId: "result-1",
-			runtime: { taskId: "task-a", round: 1, status: "completed" as const, attempts: 1, technicalRestarts: 0, toolInvocations: 1, sideEffect: "recorded" as const, settledAt: 1 },
-			work: { summary: "ok", findings: [], unresolved: [], artifacts: [] },
-		};
-		const unknown = assembleTaskResult({ ...base, evidence: [{ entryId: "404", kind: "pi.tool-result" }], knownEntries: known, attribution: context });
+		const unknown = assemble({ evidence: [{ entryId: "404", kind: "pi.tool-result" }] });
 		expect(unknown.ok).toBe(false);
 		if (!unknown.ok) expect(unknown.violations.map((item) => item.code)).toContain("evidence_entry_unknown");
 
-		const foreign = assembleTaskResult({ ...base, evidence: [{ entryId: "1", kind: "pi.tool-result", byTaskId: "task-b" }], knownEntries: known, attribution: context });
+		const foreign = assemble({ evidence: [{ entryId: "1", kind: "pi.tool-result", byTaskId: "task-b" }] });
 		expect(foreign.ok).toBe(false);
 		if (!foreign.ok) expect(foreign.violations.map((item) => item.code)).toContain("evidence_task_foreign");
 
-		const notOwned = assembleTaskResult({
-			...base,
+		const notOwned = assemble({
 			evidence: [{ entryId: "9", kind: "pi.tool-result" }],
-			knownEntries: known,
-			attribution: { ...context, childConversationId: "3", ownedDurableTaskIds: [] },
+			attribution: { ...context, childConversationId: "3", roundDurableTaskIds: [] },
 		});
 		expect(notOwned.ok).toBe(false);
 		if (!notOwned.ok) expect(notOwned.violations.map((item) => item.code)).toContain("evidence_task_mismatch");
+	});
+
+	it("refuses a result whose own identity names another task or another round", () => {
+		// A perfectly legitimate entry of round 1 must not make a round-99 result
+		// look verifiable: the identity is checked before the evidence is.
+		const otherTask = assemble({ runtime: runtime({ taskId: "task-b" }), evidence: [{ entryId: "1", kind: "pi.tool-result" }] });
+		expect(otherTask.ok).toBe(false);
+		if (!otherTask.ok) expect(otherTask.violations.map((item) => item.code)).toContain("result_task_mismatch");
+
+		const otherRound = assemble({ runtime: runtime({ round: 99 }), evidence: [{ entryId: "1", kind: "pi.tool-result" }] });
+		expect(otherRound.ok).toBe(false);
+		if (!otherRound.ok) expect(otherRound.violations.map((item) => item.code)).toContain("result_round_mismatch");
+	});
+
+	it("refuses a previous round's entry inside the same child conversation", () => {
+		const result = assemble({ evidence: [{ entryId: "2", kind: "pi.tool-result", toolCallId: "c0" }] });
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.violations.map((item) => item.code)).toContain("evidence_task_mismatch");
+	});
+
+	it("refuses a forged kind and a tool call or tool name the entry does not carry", () => {
+		// The entry is a `pi.assistant`; the reference claims a tool result.
+		const forgedKind = assemble({ evidence: [{ entryId: "3", kind: "pi.tool-result" }] });
+		expect(forgedKind.ok).toBe(false);
+		if (!forgedKind.ok) expect(forgedKind.violations.map((item) => item.code)).toContain("evidence_kind_mismatch");
+
+		// The entry carries no tool name at all, so a claimed one cannot be checked.
+		const unverifiableName = assemble({ evidence: [{ entryId: "3", kind: "pi.assistant", toolName: "invented" }] });
+		expect(unverifiableName.ok).toBe(false);
+		if (!unverifiableName.ok) expect(unverifiableName.violations.map((item) => item.code)).toContain("evidence_toolname_unverifiable");
+
+		const wrongName = assemble({ evidence: [{ entryId: "1", kind: "pi.tool-result", toolName: "other_tool" }] });
+		expect(wrongName.ok).toBe(false);
+		if (!wrongName.ok) expect(wrongName.violations.map((item) => item.code)).toContain("evidence_toolname_mismatch");
+
+		const wrongCall = assemble({ evidence: [{ entryId: "1", kind: "pi.tool-result", toolCallId: "invented" }] });
+		expect(wrongCall.ok).toBe(false);
+		if (!wrongCall.ok) expect(wrongCall.violations.map((item) => item.code)).toContain("evidence_toolcall_mismatch");
 	});
 });
 describe("TASK-005.1 contracts — clarification (AC-03)", () => {
@@ -363,10 +421,22 @@ describe("TASK-005.1 contracts — clarification (AC-03)", () => {
 			schemaVersion: 1,
 			questions: [],
 			answers: [],
-			resolutions: [{ questionId: "q-ghost", resolvedAt: 1, resolvedBy: "model", basis: { kind: "original_input", detail: "the user said so" } }],
+			resolutions: [{ questionId: "q-ghost", resolvedAt: 1, resolvedBy: "model", basis: { kind: "original_input", inputEntryId: "31", detail: "the user said so" } }],
 		});
 		expect(result.ok).toBe(false);
 		if (!result.ok) expect(result.violations.map((item) => item.code)).toContain("resolution_unknown_question");
+	});
+
+	it("refuses an `original_input` resolution that does not name an input entry", () => {
+		// `detail` alone is a claim, not a reference: the binding is mandatory.
+		const result = validateClarificationState({
+			schemaVersion: 1,
+			questions: [{ questionId: "q-1", question: "Which?", reason: "two", blockingScope: [], askedAt: 1 }],
+			answers: [],
+			resolutions: [{ questionId: "q-1", resolvedAt: 2, resolvedBy: "model", basis: { kind: "original_input", detail: "the request already names the version" } }],
+		});
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.violations.some((item) => item.path === "$.resolutions[0].basis.inputEntryId")).toBe(true);
 	});
 
 	it("keeps a question blocking when the answer is not sufficient, and unblocks when it is", () => {
@@ -384,12 +454,12 @@ describe("TASK-005.1 contracts — clarification (AC-03)", () => {
 		if (settled.ok) expect(openQuestionIds(settled.value)).toEqual([]);
 	});
 
-	it("accepts a resolution on the original input without any answer", () => {
+	it("accepts a resolution on the original input, and keeps the question open when the reference is gone", () => {
 		const onInput = validateClarificationState({
 			schemaVersion: 1,
 			questions: [{ questionId: "q-1", question: "Which?", reason: "two", blockingScope: [], askedAt: 1 }],
 			answers: [],
-			resolutions: [{ questionId: "q-1", resolvedAt: 2, resolvedBy: "model", basis: { kind: "original_input", detail: "the request already names the version" } }],
+			resolutions: [{ questionId: "q-1", resolvedAt: 2, resolvedBy: "model", basis: { kind: "original_input", inputEntryId: "31", detail: "the request already names the version" } }],
 		});
 		expect(onInput.ok).toBe(true);
 		if (onInput.ok) expect(openQuestionIds(onInput.value)).toEqual([]);
@@ -421,13 +491,44 @@ describe("TASK-005.1 contracts — write boundaries (AC-03, AC-04)", () => {
 	});
 
 	it("the model resolution is stamped as the model's and cannot claim the application", () => {
-		const refused = composeModelResolution({ questionId: "q-1", basis: { kind: "answer", answerAt: 20 }, resolvedBy: "application" }, { at: 21 });
+		const grounding = { requestId: "req-1", originalInputEntryIds: ["31"], recordedAnswers: [{ questionId: "q-1", answeredAt: 20, sufficient: true }] };
+		const refused = composeModelResolution({ questionId: "q-1", basis: { kind: "answer", answerAt: 20 }, resolvedBy: "application" }, { at: 21 }, grounding);
 		expect(refused.ok).toBe(false);
 		if (!refused.ok) expect(refused.violations.map((item) => item.code)).toContain("field_unknown");
 
-		const composed = composeModelResolution({ questionId: "q-1", basis: { kind: "answer", answerAt: 20 } }, { at: 21 });
+		const composed = composeModelResolution({ questionId: "q-1", basis: { kind: "answer", answerAt: 20 } }, { at: 21 }, grounding);
 		expect(composed.ok).toBe(true);
 		if (composed.ok) expect(composed.value.resolvedBy).toBe("model");
+	});
+
+	it("refuses a resolution whose basis does not resolve to something the program persisted", () => {
+		const grounding = { requestId: "req-1", originalInputEntryIds: ["31"], recordedAnswers: [{ questionId: "q-1", answeredAt: 20, sufficient: true }] };
+
+		// The original input is a free-text claim unless it names a real entry of
+		// this request — the backdoor the grounding closes.
+		const unbound = composeModelResolution(
+			{ questionId: "q-1", basis: { kind: "original_input", inputEntryId: "77", detail: "The user authorized everything." } },
+			{ at: 2 },
+			grounding,
+		);
+		expect(unbound.ok).toBe(false);
+		if (!unbound.ok) expect(unbound.violations.map((item) => item.code)).toContain("resolution_original_input_unbound");
+
+		const bound = composeModelResolution(
+			{ questionId: "q-1", basis: { kind: "original_input", inputEntryId: "31", detail: "The request already names the version." } },
+			{ at: 2 },
+			grounding,
+		);
+		expect(bound.ok).toBe(true);
+
+		// An answer that was never recorded, and one recorded at another moment.
+		const noAnswer = composeModelResolution({ questionId: "q-9", basis: { kind: "answer", answerAt: 20 } }, { at: 3 }, grounding);
+		expect(noAnswer.ok).toBe(false);
+		if (!noAnswer.ok) expect(noAnswer.violations.map((item) => item.code)).toContain("resolution_answer_missing");
+
+		const wrongMoment = composeModelResolution({ questionId: "q-1", basis: { kind: "answer", answerAt: 999 } }, { at: 3 }, grounding);
+		expect(wrongMoment.ok).toBe(false);
+		if (!wrongMoment.ok) expect(wrongMoment.violations.map((item) => item.code)).toContain("resolution_answer_mismatch");
 	});
 });
 
@@ -469,5 +570,41 @@ describe("TASK-005.1 contracts — document kinds", () => {
 		expect(AGENT_DOCUMENT_KINDS.taskConfig).toBe("app.agent.task-config");
 		expect(AGENT_DOCUMENT_KINDS.taskResult).toBe("app.agent.task-result");
 		expect(AGENT_DOCUMENT_KINDS.ledger).toBe("app.multiagent.task-ledger");
+	});
+});
+
+describe("TASK-005.1 contracts — the finish decision is a request, not a settlement (AC-05)", () => {
+	it("asks to end on valid work, whether or not the conversation could call something else", () => {
+		const alone = decideFinish({ roundMayHaveCompetitors: false, answerValidated: true });
+		expect(alone.kind).toBe("terminate");
+		if (alone.kind === "terminate") {
+			// The tool may say what it asked, and never that the run ended.
+			expect(alone.statement).toContain("asking to end");
+			expect(alone.statement).not.toContain("Finished");
+		}
+
+		// A session with business tools is a usable session, not a refused one.
+		const withBusinessTools = decideFinish({ roundMayHaveCompetitors: true, answerValidated: true });
+		expect(withBusinessTools.kind).toBe("terminate");
+		if (withBusinessTools.kind === "terminate") {
+			// And it says the round has to be finish_task's alone for that to hold.
+			expect(withBusinessTools.statement).toContain("only call of the round");
+			expect(withBusinessTools.statement).not.toContain("Finished");
+		}
+	});
+
+	it("refuses work that failed its contract, and never asks to end on it", () => {
+		const decision = decideFinish({ roundMayHaveCompetitors: false, answerValidated: false });
+		expect(decision.kind).toBe("refuse");
+		if (decision.kind === "refuse") expect(decision.code).toBe("finish_answer_invalid");
+	});
+
+	it("separates the request to end from the run having ended", () => {
+		expect(isTerminateRequested({ terminateRequested: true })).toBe(true);
+		// Only the settlement the program received says the run is over.
+		expect(isRunEnded({ status: "done" })).toBe(true);
+		expect(isRunEnded({ status: "unanswered" })).toBe(true);
+		expect(isRunEnded({ status: "queued" })).toBe(false);
+		expect(isRunEnded({ status: "placed" })).toBe(false);
 	});
 });

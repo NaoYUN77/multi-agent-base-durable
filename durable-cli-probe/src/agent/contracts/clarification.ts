@@ -14,6 +14,11 @@
 //   2. **A model may only resolve a question against something that already
 //      exists** — a recorded answer, or the user's original input — and
 //      `resolvedBy` is stamped by the composer, never read from the payload.
+//      "Exists" means *pointed at*: the composer is handed the program's own
+//      grounding (the answers it recorded, the input entries it persisted) and
+//      refuses a basis that does not resolve to one of them. A resolution that
+//      merely asserts "the original input already covers this" is a claim, not a
+//      resolution, and it does not unblock anything.
 //
 // A third rule, about meaning rather than authorization: receiving an answer is
 // not the same as being satisfied with it. `UserAnswer.sufficient` is the
@@ -57,7 +62,15 @@ export type UserAnswer = {
 	readonly inputEntryId?: string;
 };
 
-export type ResolutionBasis = { readonly kind: "answer"; readonly answerAt: number } | { readonly kind: "original_input"; readonly detail: string };
+export type ResolutionBasis =
+	/** Resolved on an answer the application recorded, identified by its timestamp. */
+	| { readonly kind: "answer"; readonly answerAt: number }
+	/**
+	 * Resolved on the user's original input. `inputEntryId` is the binding — a
+	 * persisted entry of *this* request — and it is required: free-text `detail`
+	 * explains the reasoning, but it can never stand in for the reference.
+	 */
+	| { readonly kind: "original_input"; readonly inputEntryId: string; readonly detail: string };
 
 /** Who closed a question, and on what basis. */
 export type QuestionResolution = {
@@ -95,6 +108,31 @@ export type ApplicationStamp = { readonly at: number };
 export type ModelResolutionInput = {
 	readonly questionId: string;
 	readonly basis: ResolutionBasis;
+};
+
+/** One answer the application has already recorded, as the grounding supplies it. */
+export type GroundedAnswer = {
+	readonly questionId: string;
+	readonly answeredAt: number;
+	readonly sufficient: boolean;
+};
+
+/**
+ * The facts only the program can supply when a model claims a question resolved.
+ *
+ * This is what turns "resolved on the original input" from a label into a
+ * reference: the model cannot name an input entry the program has not persisted
+ * for this very request, and it cannot cite an answer that was never recorded.
+ * The caller reads these from persistence and hands them in, so the write
+ * boundary stays a pure function of facts it did not invent.
+ */
+export type ResolutionGrounding = {
+	/** The request this clarification belongs to. */
+	readonly requestId: string;
+	/** Entry ids of the user's original input for this request, as persisted. */
+	readonly originalInputEntryIds: readonly string[];
+	/** Answers the application has actually recorded for this request. */
+	readonly recordedAnswers: readonly GroundedAnswer[];
 };
 
 function readQuestion(value: unknown, path: string, collect: Violations): ClarificationQuestion | undefined {
@@ -148,7 +186,7 @@ function readBooleanField(holder: Record<string, unknown>, field: string, path: 
 function readBasis(value: unknown, path: string, collect: Violations): ResolutionBasis | undefined {
 	const holder = readObject(value, path, collect);
 	if (holder === undefined) return undefined;
-	readNoUnknownKeys(holder, path, collect, ["kind", "answerAt", "detail"]);
+	readNoUnknownKeys(holder, path, collect, ["kind", "answerAt", "inputEntryId", "detail"]);
 	const kind = readEnum(holder, "kind", `${path}.kind`, collect, ["answer", "original_input"] as const);
 	if (kind === "answer") {
 		const answerAt = readCount(holder, "answerAt", `${path}.answerAt`, collect);
@@ -156,9 +194,12 @@ function readBasis(value: unknown, path: string, collect: Violations): Resolutio
 		return { kind, answerAt };
 	}
 	if (kind === "original_input") {
+		// The binding is mandatory: without a persisted input entry there is
+		// nothing to resolve on, and `detail` alone would be a free-text claim.
+		const inputEntryId = readStableId(holder, "inputEntryId", `${path}.inputEntryId`, collect);
 		const detail = readString(holder, "detail", `${path}.detail`, collect);
-		if (detail === undefined) return undefined;
-		return { kind, detail };
+		if (inputEntryId === undefined || detail === undefined) return undefined;
+		return { kind, inputEntryId, detail };
 	}
 	return undefined;
 }
@@ -264,17 +305,37 @@ export function composeUserAnswer(input: unknown, stamp: ApplicationStamp): Cont
 /**
  * Compose a model's resolution attempt. `resolvedBy: "model"` is stamped here, so
  * a model payload cannot claim the application's authority, and the payload type
- * has no `answers` field to smuggle one through. The basis must still name a
- * recorded answer or the original input — `validateClarificationState` is what
- * checks that the named answer actually exists.
+ * has no `answers` field to smuggle one through.
+ *
+ * The basis is checked against `grounding` — facts the program read from
+ * persistence — so a resolution is composed only when it actually points at
+ * something: a recorded answer with the same `answeredAt`, or an input entry of
+ * this same request. A payload that merely *says* the original input covers the
+ * question is refused; that claim is the backdoor this check closes.
  */
-export function composeModelResolution(input: unknown, stamp: { readonly at: number }): ContractValidation<QuestionResolution> {
+export function composeModelResolution(input: unknown, stamp: { readonly at: number }, grounding: ResolutionGrounding): ContractValidation<QuestionResolution> {
 	const collect = new Violations();
 	const holder = readObject(input, "$", collect);
 	if (holder === undefined) return collect.finish(undefined as unknown as QuestionResolution);
 	readNoUnknownKeys(holder, "$", collect, ["questionId", "basis"]);
 	const questionId = readStableId(holder, "questionId", "$.questionId", collect);
 	const basis = readBasis(holder.basis, "$.basis", collect);
+	if (basis !== undefined) {
+		if (basis.kind === "answer") {
+			const recorded = grounding.recordedAnswers.find((entry) => entry.questionId === questionId);
+			if (recorded === undefined) {
+				collect.add("resolution_answer_missing", "$.basis", `no answer for ${String(questionId)} is recorded for request ${grounding.requestId}`);
+			} else if (recorded.answeredAt !== basis.answerAt) {
+				collect.add("resolution_answer_mismatch", "$.basis.answerAt", `resolution cites answerAt ${basis.answerAt}, the recorded answer is ${recorded.answeredAt}`);
+			}
+		} else if (!grounding.originalInputEntryIds.includes(basis.inputEntryId)) {
+			collect.add(
+				"resolution_original_input_unbound",
+				"$.basis.inputEntryId",
+				`entry ${basis.inputEntryId} is not a recorded input of request ${grounding.requestId}`,
+			);
+		}
+	}
 	if (questionId === undefined || basis === undefined) return collect.finish(undefined as unknown as QuestionResolution);
 	return collect.finish({ questionId, resolvedBy: "model", resolvedAt: stamp.at, basis });
 }
@@ -284,8 +345,10 @@ export function composeModelResolution(input: unknown, stamp: { readonly at: num
  *
  * A question stops blocking when it has a resolution whose basis holds up: a
  * recorded answer the **application marked sufficient**, or a resolution on the
- * user's original input. Merely having *some* answer is not enough — that is the
- * "receiving an answer is not semantic sufficiency" rule made mechanical.
+ * user's original input that names the input entry it resolves on. Merely having
+ * *some* answer is not enough — that is the "receiving an answer is not semantic
+ * sufficiency" rule made mechanical — and an unbound `original_input` claim does
+ * not unblock either, because a claim is not a reference.
  */
 export function openQuestionIds(state: ClarificationState): readonly string[] {
 	const answerByQuestion = new Map(state.answers.map((answer) => [answer.questionId, answer]));
@@ -295,7 +358,9 @@ export function openQuestionIds(state: ClarificationState): readonly string[] {
 		.filter((question) => {
 			const basis = satisfying.get(question.questionId);
 			if (basis === undefined) return true;
-			if (basis.kind === "original_input") return false;
+			// An `original_input` resolution only counts when it names the entry it
+			// resolves on; the type requires the field, and this guards the value.
+			if (basis.kind === "original_input") return basis.inputEntryId.trim() === "";
 			const answer = answerByQuestion.get(question.questionId);
 			return answer === undefined || !answer.sufficient;
 		})

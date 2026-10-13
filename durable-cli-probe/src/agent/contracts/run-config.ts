@@ -151,6 +151,17 @@ export type TaskConfigSnapshot = {
 	 * stays identical, and a resumed run must be able to tell those apart.
 	 */
 	readonly contractRevision: number;
+	/**
+	 * Version of the **user requirement** this run was built for — the business
+	 * revision of the request, bumped when the user restates what they want.
+	 *
+	 * Deliberately a third field: `contractRevision` versions the rules the run
+	 * obeys, `taskSpecVersion` versions the dispatched spec, `planVersion` versions
+	 * the plan, and none of them says *which requirement* was answered. A resumed
+	 * run that cannot tell "the same requirement, new plan" from "a new
+	 * requirement" would silently answer the wrong one.
+	 */
+	readonly requestVersion: number;
 	readonly taskSpecVersion: number;
 	readonly planVersion: number;
 	/** The prompt the program assembled from the validated spec, never raw model prose. */
@@ -168,6 +179,7 @@ export type TaskConfigSnapshot = {
 const SNAPSHOT_FIELDS: readonly string[] = [
 	"schemaVersion",
 	"contractRevision",
+	"requestVersion",
 	"taskSpecVersion",
 	"planVersion",
 	"assembledPrompt",
@@ -191,6 +203,7 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	readNoUnknownKeys(holder, "$", collect, SNAPSHOT_FIELDS);
 	const schemaVersion = readSchemaVersion(holder, "$", collect, [RUN_CONFIG_SCHEMA_VERSION]);
 	const contractRevision = readPositiveInteger(holder, "contractRevision", "$.contractRevision", collect);
+	const requestVersion = readPositiveInteger(holder, "requestVersion", "$.requestVersion", collect);
 	const taskSpecVersion = readPositiveInteger(holder, "taskSpecVersion", "$.taskSpecVersion", collect);
 	const planVersion = readPositiveInteger(holder, "planVersion", "$.planVersion", collect);
 	// The prompt the program assembled: long free text, not an identifier.
@@ -205,6 +218,7 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	if (
 		schemaVersion === undefined ||
 		contractRevision === undefined ||
+		requestVersion === undefined ||
 		taskSpecVersion === undefined ||
 		planVersion === undefined ||
 		assembledPrompt === undefined ||
@@ -219,6 +233,7 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	return collect.finish({
 		schemaVersion,
 		contractRevision,
+		requestVersion,
 		taskSpecVersion,
 		planVersion,
 		assembledPrompt,

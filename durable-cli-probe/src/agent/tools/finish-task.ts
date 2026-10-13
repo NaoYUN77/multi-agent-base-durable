@@ -13,12 +13,11 @@
 //
 // The stop itself comes from the pinned harness: `control: { terminate: true }`
 // ends the run at the final boundary, **but only when every call of the round
-// asks to terminate**. A tool call cannot see its siblings' controls, so the
-// only thing this tool can honestly check is whether a competing call *could*
-// exist: the conversation's authorized tool set. When the child is authorized to
-// call anything besides `finish_task`, this tool refuses the submission instead
-// of returning a control that would be ignored — a round that continues while
-// the model was told "Finished" is exactly the failure AC-05 guards against.
+// asks to terminate**. A tool call cannot see its siblings' controls, so this
+// tool asks unconditionally and says exactly that: it records the submission and
+// asks the round to end, and it never claims the run ended. Making the round
+// contain nothing but `finish_task` is the model's part of the protocol, and the
+// statement this tool returns tells it so.
 //
 // Authorization: the model writes the work fields and nothing else. Identity,
 // status, counts and evidence references are runtime-owned, so they are not part
@@ -73,28 +72,19 @@ export function createFinishTaskTool() {
 				unresolved: args.unresolved,
 				artifacts: args.artifacts,
 			});
-			// The only honest proxy for "this call is alone in its round": what this
-			// conversation is authorized to call. Any second tool means a competing
-			// call can exist, and the harness would not terminate.
+			// Whether the conversation *could* call something else decides only how
+			// the result is worded — never whether the submission is accepted.
 			const agent = await api.agent(callContext);
-			const competing = agent.tools.map((tool) => tool.name).filter((name) => name !== FINISH_TASK_TOOL_NAME);
-			const decision = decideFinish({ finishRequested: true, authorizedCompetingCalls: competing, answerValidated: candidate.ok });
-			if (decision.kind !== "terminate") {
-				const detail = decision.kind === "refuse" ? decision.detail : decision.reason;
-				api.diagnostic({ severity: "error", message: `finish refused: ${detail}` });
-				return { output: [{ type: "text", text: `Submission refused: ${detail}` }], isError: true };
+			const competitors = agent.tools.map((tool) => tool.name).filter((name) => name !== FINISH_TASK_TOOL_NAME);
+			const decision = decideFinish({ roundMayHaveCompetitors: competitors.length > 0, answerValidated: candidate.ok });
+			if (decision.kind === "refuse") {
+				api.diagnostic({ severity: "error", message: `finish refused: ${decision.detail}` });
+				return { output: [{ type: "text", text: `Submission refused: ${decision.detail}` }], isError: true };
 			}
 			// Asking to end the round is not the same as having ended it. The result
 			// is recorded by whoever awaits the submission, after it settles.
 			return {
-				output: [
-					{
-						type: "text",
-						text: candidate.ok
-							? "Submission accepted. This round is asking to end; the run outcome is recorded after it settles."
-							: "Submission accepted without work content.",
-					},
-				],
+				output: [{ type: "text", text: decision.statement }],
 				...(candidate.ok ? { structuredOutput: candidate.value } : {}),
 				control: { terminate: true },
 			};
