@@ -21,7 +21,8 @@
 		"multiagent:inspect": "node --conditions=source --experimental-strip-types src/multiagent/cli-multiagent-inspect.ts",
 		"multiagent:test": "vitest --run test/multiagent.test.ts test/multiagent-concurrency.test.ts test/multiagent-cancel.test.ts test/multiagent-cancel-admission.test.ts test/multiagent-revision.test.ts test/multiagent-evidence.test.ts test/multiagent-compaction.test.ts test/multiagent-recovery.test.ts test/multiagent-inspect.test.ts test/multiagent-prompts.test.ts",
 		"pi:prepare": "node scripts/prepare.mjs",
-		"lint": "biome lint ."
+		"lint": "biome lint .",
+		"agent:finish-evidence": "node --conditions=source --experimental-strip-types scripts/finish-evidence.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.3.5",

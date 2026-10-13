@@ -121,3 +121,50 @@ jobs:
       - name: typecheck
         working-directory: durable-cli-probe
         run: npm run typecheck
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.2
+
+      - name: Log the revisions and toolchain under test
+        id: revisions
+        working-directory: durable-cli-probe
+        run: |
+          app_commit=$(git rev-parse HEAD)
+          pi_commit=$(node -p "require('./pi-pin.json').commit")
+          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          node_version=$(node --version)
+          npm_version=$(npm --version)
+          {
+            echo "app_commit=$app_commit"
+            echo "pi_commit=$pi_commit"
+            echo "app_lock_hash=$app_lock_hash"
+            echo "node_version=$node_version"
+            echo "npm_version=$npm_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "application commit: $app_commit"
+          echo "pinned Pi commit:   $pi_commit"
+          echo "node $node_version, npm $npm_version"
+
+      - name: Cache npm downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ steps.revisions.outputs.pi_commit }}-${{ steps.revisions.outputs.app_lock_hash }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Prepare the pinned Pi checkout and build its type artifacts
+        working-directory: durable-cli-probe
+        run: node scripts/prepare.mjs
+
+      - name: test
+        working-directory: durable-cli-probe
+        run: npm test
