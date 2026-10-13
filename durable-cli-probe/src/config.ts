@@ -131,5 +131,5 @@ export function requireArticleParentPageId(override?: string, env: NodeJS.Proces
 	return value.trim();
 }
 
-// TASK-004 negative verification (temporary): must make `npm run typecheck` fail.
-export const GATE_PROBE_TYPE_ERROR: number = "not a number";
+// TASK-004 negative verification (temporary): must make `npm run lint` fail.
+export const GATE_PROBE_LINT_VIOLATION: any = 1;
