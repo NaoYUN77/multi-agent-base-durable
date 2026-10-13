@@ -206,7 +206,12 @@ export function validateTaskSpec(input: unknown): ContractValidation<TaskSpec> {
  */
 export function validateTaskBatch(input: unknown): ContractValidation<readonly TaskSpec[]> {
 	const collect = new Violations();
-	if (!Array.isArray(input)) return collect.finish([] as readonly TaskSpec[]);
+	// A non-array is an invalid batch, not an empty one: `null`, `{}` and `"plan"`
+	// must all be refused rather than read as "nothing to dispatch".
+	if (!Array.isArray(input)) {
+		collect.add("type_array", "$", "a batch must be an array of task specs");
+		return collect.finish([] as readonly TaskSpec[]);
+	}
 	if (input.length === 0) {
 		collect.add("batch_empty", "$", "a plan must dispatch at least one task");
 		return collect.finish([] as readonly TaskSpec[]);

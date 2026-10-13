@@ -126,9 +126,20 @@ export type RoundFailureKind = "technical" | "quality" | "cancelled";
 /** How the run status is expected to read and what the next round status is. */
 export type RoundSettlement = {
 	readonly roundStatus: RoundStatus;
-	/** Set when the business status must move. Absent: the task keeps its status. */
+	/**
+	 * Set when the business status must move *as part of this settlement*. Never
+	 * set for a technical failure: an exhausted budget is not a business decision.
+	 */
 	readonly nextBusinessStatus?: NewBusinessStatus;
-	/** Set when the failure is terminal and must be recorded on the task. */
+	/**
+	 * Set when Main must decide what happens to the task now, and no further
+	 * business call may be made until it does. This is how a technical budget
+	 * runs out: the round settles as failed, the business calls stop, and the
+	 * decision — accept what exists, fail the task, or ask for more material —
+	 * belongs to Main, because `failed` is terminal and cannot be undone.
+	 */
+	readonly requiresMainDecision?: boolean;
+	/** Set when the settlement itself is terminal for the task. */
 	readonly terminal?: boolean;
 };
 
@@ -144,11 +155,15 @@ export type RoundFailureDecisionInput = {
 };
 
 /**
- * Decide what a failed round does. The rule the task contract cares about:
- * a technical failure inside the restart budget retries the round (the task
- * stays `running`, the round goes to `retry_wait`); a technical failure past it
- * ends the task as `failed`, because an unbounded restart chain is exactly what
- * this machine exists to prevent. A cancelled failure ends as `cancelled`.
+ * Decide what a failed round does.
+ *
+ * The rule the task contract cares about: a technical failure inside the restart
+ * budget retries the round; a technical failure *past* it settles the round as
+ * failed and stops the business calls, but leaves the business status to Main —
+ * because `failed` is terminal and a spent retry budget is a fact about the
+ * infrastructure, not a judgement about the task. An unbounded restart chain is
+ * what the budget prevents, and a premature `failed` is what the Main decision
+ * prevents.
  *
  * Pure: no IO, no document writes. The caller applies the result inside its own
  * commit, so the decision and the write are atomic.
@@ -161,13 +176,18 @@ export function decideRoundFailure(input: RoundFailureDecisionInput): RoundSettl
 		// A bad result is a review matter, not a run failure: the round completed.
 		return { roundStatus: "completed" };
 	}
-	if (technicalRestartsUsed >= budget.maxTechnicalRestarts) {
-		return { roundStatus: "failed", nextBusinessStatus: "failed", terminal: true };
-	}
-	if (attemptsUsed >= budget.maxAttemptsPerOperation) {
-		return { roundStatus: "failed", nextBusinessStatus: "failed", terminal: true };
+	if (technicalRestartsUsed >= budget.maxTechnicalRestarts || attemptsUsed >= budget.maxAttemptsPerOperation) {
+		// Budget spent: stop business calls, settle the round, and hand the task to
+		// Main. No automatic business status change — that would make an
+		// infrastructure failure indistinguishable from a verdict.
+		return { roundStatus: "failed", requiresMainDecision: true };
 	}
 	return { roundStatus: "retry_wait" };
+}
+
+/** True when a settlement means no further business call may be made. */
+export function stopsBusinessCalls(settlement: RoundSettlement): boolean {
+	return settlement.requiresMainDecision === true;
 }
 
 /**
@@ -188,11 +208,19 @@ export function mayTerminateAfterCancel(input: {
 	return true;
 }
 
-/** Whether a task in `awaiting_input` may resume execution. */
-export function mayResumeAfterAnswer(businessStatus: TaskBusinessStatus, answeredQuestionIds: readonly string[], blockingQuestionIds: readonly string[]): boolean {
+/**
+ * Whether a task in `awaiting_input` may resume execution.
+ *
+ * `settledQuestionIds` are the questions the clarification contract no longer
+ * lists as open — answered with the application's `sufficient` judgement, or
+ * resolved on the user's original input. It is deliberately *not* a list of
+ * question ids that merely have an answer: receiving an answer is not the same
+ * as being satisfied with it (contract §"Main Agent 合同").
+ */
+export function mayResumeAfterAnswer(businessStatus: TaskBusinessStatus, blockingQuestionIds: readonly string[], settledQuestionIds: readonly string[]): boolean {
 	if (businessStatus !== "awaiting_input") return false;
-	const answered = new Set(answeredQuestionIds);
-	return blockingQuestionIds.every((questionId) => answered.has(questionId));
+	const settled = new Set(settledQuestionIds);
+	return blockingQuestionIds.every((questionId) => settled.has(questionId));
 }
 
 /**

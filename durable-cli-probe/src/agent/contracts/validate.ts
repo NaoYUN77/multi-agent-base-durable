@@ -153,14 +153,26 @@ export function readStableId(holder: Record<string, unknown>, field: string, pat
 	return value;
 }
 
-/** A list of non-empty strings. Absent means empty, never missing. */
+/**
+ * A list of non-empty strings. Every element is checked: an illegal item is
+ * reported with its index rather than filtered out, because dropping one would
+ * silently narrow a task's scope, constraints or acceptance list.
+ */
 export function readStringList(value: unknown, path: string, collect: Violations): string[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) {
 		collect.add("type_array", path, "must be an array when present");
 		return [];
 	}
-	return value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "");
+	const items: string[] = [];
+	value.forEach((entry, index) => {
+		if (typeof entry !== "string" || entry.trim() === "") {
+			collect.add("type_string", `${path}[${index}]`, "must be a non-empty string");
+			return;
+		}
+		items.push(entry);
+	});
+	return items;
 }
 
 /** An array of strings, each a stable identifier. */

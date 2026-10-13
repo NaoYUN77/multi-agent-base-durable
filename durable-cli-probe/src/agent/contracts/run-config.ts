@@ -8,7 +8,7 @@
 // test's* decision — this module never supplies a default, because a default
 // would become an unbounded value nobody chose.
 
-import { Violations, readCount, readHexHash, readIdArray, readNoUnknownKeys, readObject, readPositiveInteger, readSchemaVersion, readStableId, readString } from "./validate.ts";
+import { Violations, readCount, readHexHash, readNoUnknownKeys, readObject, readPositiveInteger, readSchemaVersion, readStableId, readString } from "./validate.ts";
 import type { ContractValidation } from "./errors.ts";
 
 export const RUN_CONFIG_SCHEMA_VERSION = 1;
@@ -113,16 +113,52 @@ export function validateRunConfig(input: unknown): ContractValidation<RunConfig>
 	});
 }
 
+/** One tool as it was actually authorized, with the version that ran. */
+export type ToolVersion = {
+	/** Tool name as the model saw it (snake_case). */
+	readonly name: string;
+	/** Version identifier of the implementation that actually ran. */
+	readonly version: string;
+};
+
+/** Read the authorized tool list: names and the versions that actually ran. */
+function readToolVersions(value: unknown, path: string, collect: Violations): ToolVersion[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		collect.add("type_array", path, "must be an array when present");
+		return [];
+	}
+	const tools: ToolVersion[] = [];
+	value.forEach((entry, index) => {
+		const holder = readObject(entry, `${path}[${index}]`, collect);
+		if (holder === undefined) return;
+		readNoUnknownKeys(holder, `${path}[${index}]`, collect, ["name", "version"]);
+		const name = readStableId(holder, "name", `${path}[${index}].name`, collect);
+		const version = readString(holder, "version", `${path}[${index}].version`, collect);
+		if (name === undefined || version === undefined) return;
+		tools.push({ name, version });
+	});
+	return tools;
+}
+
 /** Config snapshot recorded with every task run: what the run actually used. */
 export type TaskConfigSnapshot = {
+	/** Schema version of this document shape. */
 	readonly schemaVersion: number;
+	/**
+	 * Revision of the *behaviour contract* this configuration was built against.
+	 * Distinct from schemaVersion: a contract revision can change while the shape
+	 * stays identical, and a resumed run must be able to tell those apart.
+	 */
+	readonly contractRevision: number;
 	readonly taskSpecVersion: number;
 	readonly planVersion: number;
 	/** The prompt the program assembled from the validated spec, never raw model prose. */
 	readonly assembledPrompt: string;
 	readonly skillVersion: string;
 	readonly skillHash: string;
-	readonly tools: string[];
+	/** The tools actually authorized for this run, with the version that ran. */
+	readonly tools: ToolVersion[];
 	readonly model: string;
 	readonly budget: RunConfig;
 	/** Stable hash of everything above, so a resumed run can prove it is the same config. */
@@ -131,6 +167,7 @@ export type TaskConfigSnapshot = {
 
 const SNAPSHOT_FIELDS: readonly string[] = [
 	"schemaVersion",
+	"contractRevision",
 	"taskSpecVersion",
 	"planVersion",
 	"assembledPrompt",
@@ -153,6 +190,7 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	if (holder === undefined) return collect.finish(undefined as unknown as TaskConfigSnapshot);
 	readNoUnknownKeys(holder, "$", collect, SNAPSHOT_FIELDS);
 	const schemaVersion = readSchemaVersion(holder, "$", collect, [RUN_CONFIG_SCHEMA_VERSION]);
+	const contractRevision = readPositiveInteger(holder, "contractRevision", "$.contractRevision", collect);
 	const taskSpecVersion = readPositiveInteger(holder, "taskSpecVersion", "$.taskSpecVersion", collect);
 	const planVersion = readPositiveInteger(holder, "planVersion", "$.planVersion", collect);
 	// The prompt the program assembled: long free text, not an identifier.
@@ -160,12 +198,13 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	const skillVersion = readStableId(holder, "skillVersion", "$.skillVersion", collect);
 	const skillHash = readHexHash(holder, "skillHash", "$.skillHash", collect);
 	const model = readStableId(holder, "model", "$.model", collect);
-	const tools = readIdArray(holder, "tools", "$.tools", collect) ?? [];
+	const tools = readToolVersions(holder.tools, "$.tools", collect);
 	const budget = validateRunConfig(holder.budget);
 	if (!budget.ok) for (const item of budget.violations) collect.add(item.code, `$.budget${item.path.slice(1)}`, item.detail);
 	const configHash = readHexHash(holder, "configHash", "$.configHash", collect);
 	if (
 		schemaVersion === undefined ||
+		contractRevision === undefined ||
 		taskSpecVersion === undefined ||
 		planVersion === undefined ||
 		assembledPrompt === undefined ||
@@ -179,6 +218,7 @@ export function validateTaskConfigSnapshot(input: unknown): ContractValidation<T
 	}
 	return collect.finish({
 		schemaVersion,
+		contractRevision,
 		taskSpecVersion,
 		planVersion,
 		assembledPrompt,

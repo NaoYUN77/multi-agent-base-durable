@@ -47,8 +47,13 @@
 export type FinishDecisionInput = {
 	/** Did the model call the finish tool at all? */
 	readonly finishRequested: boolean;
-	/** Other tool calls the model made in the same round, by name. */
-	readonly competingCalls: readonly string[];
+	/**
+	 * Every other tool the conversation is authorized to call this round. A tool
+	 * call cannot see its siblings' controls, so this is what a finish call can
+	 * honestly check: any second authorized tool means a competing call can
+	 * exist, and the harness would not terminate the round.
+	 */
+	readonly authorizedCompetingCalls: readonly string[];
 	/** Did the model's final answer pass the contract validation? */
 	readonly answerValidated: boolean;
 };
@@ -67,21 +72,26 @@ export type FinishDecision =
  * The rules, in order:
  *   * an unvalidated answer is refused — we never stop a round on a payload that
  *     failed its contract, because the stop would look like a settlement;
- *   * a finish call beside calls that do not terminate cannot stop the round
- *     (source rule 1), so it reports `continue` with the competing names, which
- *     is what lets a caller put that in the tool's output back to the model.
+ *   * a finish call in a conversation that may call anything else cannot stop the
+ *     round (source rule 1), so it is refused with the competing names. Returning
+ *     a control that the harness then ignores would leave the model told
+ *     "Finished" while the run continued.
  */
 export function decideFinish(input: FinishDecisionInput): FinishDecision {
 	if (input.finishRequested && !input.answerValidated) {
 		return { kind: "refuse", code: "finish_answer_invalid", detail: "the final answer failed contract validation; the round was not terminated" };
 	}
 	if (!input.finishRequested) {
-		return input.competingCalls.length === 0
+		return input.authorizedCompetingCalls.length === 0
 			? { kind: "continue", reason: "no finish call" }
-			: { kind: "continue", reason: `the round has unfinished calls: ${input.competingCalls.join(", ")}` };
+			: { kind: "continue", reason: `the round has unfinished calls: ${input.authorizedCompetingCalls.join(", ")}` };
 	}
-	if (input.competingCalls.length > 0) {
-		return { kind: "continue", reason: `finish needs every call of the round to terminate; these do not: ${input.competingCalls.join(", ")}` };
+	if (input.authorizedCompetingCalls.length > 0) {
+		return {
+			kind: "refuse",
+			code: "finish_round_has_competitors",
+			detail: `every call of a round must ask to terminate; this conversation may also call: ${input.authorizedCompetingCalls.join(", ")}`,
+		};
 	}
 	return { kind: "terminate" };
 }

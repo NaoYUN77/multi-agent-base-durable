@@ -1,20 +1,24 @@
 // TASK-005.1 src/agent/tools/finish-task.ts
 //
-// The `finish_task` tool: a model's structured final answer that ends its round.
+// The `finish_task` tool: a model's structured submission of its own work.
 //
-// What this tool is and is not (TASK-005 §"三层故障与结果"):
+// Two things this tool deliberately does not do:
 //
-//   * it is the model's structured submission of *its work* — summary, findings,
-//     unresolved items, artifact references — validated against the contract
-//     before anything else happens;
-//   * it is **not** an acceptance. Marking a task `accepted` is Main's decision,
-//     made against the persisted evidence; a tool that did it would let a model
-//     close its own task.
+//   * it does **not** accept a task. Marking a task `accepted` is Main's decision
+//     against the persisted evidence; a tool that did it would let a model close
+//     its own task.
+//   * it does **not** report completion. What the model submits is a request to
+//     end its round; the outcome is known only once the submission settles, and
+//     the runtime's writer — not this tool — records the result then.
 //
-// The stop itself comes from the pinned harness, not from this file: a validated
-// call returns `control: { terminate: true }`, and `finishToolRound` ends the run
-// at the final boundary when every call of the round asks to terminate. See
-// `../state/finish.ts` for the source basis and the rules this tool obeys.
+// The stop itself comes from the pinned harness: `control: { terminate: true }`
+// ends the run at the final boundary, **but only when every call of the round
+// asks to terminate**. A tool call cannot see its siblings' controls, so the
+// only thing this tool can honestly check is whether a competing call *could*
+// exist: the conversation's authorized tool set. When the child is authorized to
+// call anything besides `finish_task`, this tool refuses the submission instead
+// of returning a control that would be ignored — a round that continues while
+// the model was told "Finished" is exactly the failure AC-05 guards against.
 //
 // Authorization: the model writes the work fields and nothing else. Identity,
 // status, counts and evidence references are runtime-owned, so they are not part
@@ -24,7 +28,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import type { ToolExecutionResult } from "@earendil-works/pi-durable";
 import { defineTool } from "@earendil-works/pi-durable";
-import type { ModelWork } from "../contracts/task-result.ts";
 import { validateModelWork } from "../contracts/task-result.ts";
 import { decideFinish } from "../state/finish.ts";
 
@@ -39,66 +42,57 @@ const finishParameters = Type.Object({
 	artifacts: Type.Optional(Type.Array(Type.Object({ kind: Type.String(), ref: Type.String() }), { description: "References to artifacts this round produced." })),
 });
 
-export type FinishTaskToolOptions = {
-	/**
-	 * Called with the validated work once the model's submission is accepted.
-	 * The runtime (not this tool) writes identity, status and evidence alongside
-	 * it. Optional: a run that only needs the terminate behaviour can omit it.
-	 */
-	readonly onFinish?: (work: ModelWork) => void;
-};
-
 /**
  * Build the `finish_task` tool.
  *
- * Side effects: on a valid submission the model's work is handed to
- * `options.onFinish` — the runtime's own writer — and the round is asked to
- * terminate. Nothing else is written here: this tool appends no document, marks
- * no task, and claims no evidence.
+ * Side effects: none of its own. It returns a tool result carrying the model's
+ * validated work in `structuredOutput` (so the program that awaits the submission
+ * can read it), and asks the harness to end the round when — and only when — the
+ * submission can actually end it. It writes no document, marks no task, and
+ * claims no evidence.
  *
  * Idempotency and recovery: the tool is `replay: "safe"` — re-running the same
  * call after an interruption re-validates the same payload and returns the same
  * control, so a recovered round cannot terminate twice or settle a different
  * answer.
  */
-export function createFinishTaskTool(options: FinishTaskToolOptions = {}) {
+export function createFinishTaskTool() {
 	return defineTool({
 		name: FINISH_TASK_TOOL_NAME,
 		description:
-			"Submit this round's work and end the round. Write only your own findings: identity, status and evidence are recorded by the program. " +
+			"Submit this round's work and ask to end the round. Write only your own findings: identity, status and evidence are recorded by the program. " +
 			"Submitting work is not acceptance; the main agent reviews it.",
 		parameters: finishParameters,
 		replay: "safe",
-		execute: async (args, api, _callContext): Promise<ToolExecutionResult> => {
-			// The model's payload is untrusted input: validate it before trusting it
-			// enough to stop a round on it.
+		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
+			// The model's payload is untrusted input: validate before trusting it
+			// enough to ask the run to end on it.
 			const candidate = validateModelWork({
 				summary: args.summary,
 				findings: args.findings,
 				unresolved: args.unresolved,
 				artifacts: args.artifacts,
 			});
-			// A finish call is valid only on its own: any sibling call that does not
-			// ask to terminate makes this one a plain call (see ../state/finish.ts).
-			const decision = decideFinish({ finishRequested: true, competingCalls: [], answerValidated: candidate.ok });
-			if (decision.kind === "refuse") {
-				const detail = candidate.ok
-					? decision.detail
-					: candidate.violations.map((item) => `${item.path}: ${item.code} (${item.detail})`).join("; ");
+			// The only honest proxy for "this call is alone in its round": what this
+			// conversation is authorized to call. Any second tool means a competing
+			// call can exist, and the harness would not terminate.
+			const agent = await api.agent(callContext);
+			const competing = agent.tools.map((tool) => tool.name).filter((name) => name !== FINISH_TASK_TOOL_NAME);
+			const decision = decideFinish({ finishRequested: true, authorizedCompetingCalls: competing, answerValidated: candidate.ok });
+			if (decision.kind !== "terminate") {
+				const detail = decision.kind === "refuse" ? decision.detail : decision.reason;
 				api.diagnostic({ severity: "error", message: `finish refused: ${detail}` });
 				return { output: [{ type: "text", text: `Submission refused: ${detail}` }], isError: true };
 			}
-			if (decision.kind === "continue") {
-				return { output: [{ type: "text", text: `Not finished: ${decision.reason}` }], isError: true };
-			}
-			// The runtime's writer, not the model, records the outcome; `control` is
-			// the only thing this tool claims.
-			if (candidate.ok) options.onFinish?.(candidate.value);
+			// Asking to end the round is not the same as having ended it. The result
+			// is recorded by whoever awaits the submission, after it settles.
 			return {
 				output: [
 					{
 						type: "text",
-						text: candidate.ok ? `Finished. Work recorded: ${candidate.value.summary.slice(0, 200)}` : "Finished.",
+						text: candidate.ok
+							? "Submission accepted. This round is asking to end; the run outcome is recorded after it settles."
+							: "Submission accepted without work content.",
 					},
 				],
 				...(candidate.ok ? { structuredOutput: candidate.value } : {}),

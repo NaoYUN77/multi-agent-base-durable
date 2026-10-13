@@ -234,3 +234,119 @@ export function validateTaskResult(input: unknown): ContractValidation<TaskResul
 	}
 	return collect.finish({ schemaVersion, resultId, runtime, evidence, work: work.value });
 }
+
+// ── Evidence attribution ─────────────────────────────────────────────────────
+//
+// Shape validation cannot answer AC-04's "cross-task evidence cannot be forged":
+// a reference that *looks* right is not a reference that belongs to this task.
+// The check below is the one the runtime performs before it attaches evidence,
+// and it needs the facts only persistence can supply: which conversation the
+// entry lives in, which durable task produced it, and which durable tasks the
+// program has already bound to this business task.
+//
+// Note the two id spaces: `entry.taskId` is Durable's task id (a harness
+// concept) and `businessTaskId` is the application's. They are never compared to
+// each other by name; the bridge is the program's own binding list.
+
+/** What the harness can say about one persisted entry. */
+export type PersistedEntryIndex = {
+	readonly entryId: string;
+	readonly conversationId: string;
+	/** Durable task id that produced the entry, when it was durable work. */
+	readonly taskId?: string;
+	readonly toolCallId?: string;
+	readonly kind: string;
+};
+
+/** Where the evidence is supposed to come from. */
+export type EvidenceAttributionContext = {
+	/** Child conversation this task's work happened in. */
+	readonly childConversationId: string;
+	/** Business task id that owns the work. */
+	readonly businessTaskId: string;
+	/**
+	 * Durable task ids the program has bound to this business task (the ledger's
+	 * operation bindings). An entry produced by any other durable task is not
+	 * this task's evidence.
+	 */
+	readonly ownedDurableTaskIds: readonly string[];
+	/** Round the result settles. */
+	readonly round: number;
+};
+
+/**
+ * Verify that every evidence reference really belongs to this task's work.
+ *
+ * Refuses, with a stable code: an entry that is not in the index at all
+ * (`evidence_entry_unknown`), an entry from another conversation
+ * (`evidence_conversation_foreign`), a reference naming another business task
+ * (`evidence_task_foreign`), an entry produced by a durable task this business
+ * task does not own (`evidence_task_mismatch`), and a tool-call reference that
+ * does not match the entry's own tool call (`evidence_toolcall_mismatch`).
+ *
+ * Performs no IO: the caller reads the entries and hands them in, so the check
+ * stays a pure function of persisted facts.
+ */
+export function verifyEvidenceAttribution(
+	references: readonly ResultEvidenceReference[],
+	known: ReadonlyMap<string, PersistedEntryIndex>,
+	context: EvidenceAttributionContext,
+): ContractValidation<readonly ResultEvidenceReference[]> {
+	const collect = new Violations();
+	const accepted: ResultEvidenceReference[] = [];
+	const owned = new Set(context.ownedDurableTaskIds);
+	references.forEach((reference, index) => {
+		const path = `$.evidence[${index}]`;
+		const entry = known.get(reference.entryId);
+		if (entry === undefined) {
+			collect.add("evidence_entry_unknown", `${path}.entryId`, `no entry ${reference.entryId} is known in this task's child conversation`);
+			return;
+		}
+		if (entry.conversationId !== context.childConversationId) {
+			collect.add("evidence_conversation_foreign", `${path}.entryId`, `entry ${reference.entryId} belongs to conversation ${entry.conversationId}, not ${context.childConversationId}`);
+			return;
+		}
+		if (reference.byTaskId !== undefined && reference.byTaskId !== context.businessTaskId) {
+			collect.add("evidence_task_foreign", `${path}.byTaskId`, `entry ${reference.entryId} is claimed for task ${reference.byTaskId}, not ${context.businessTaskId}`);
+			return;
+		}
+		if (entry.taskId !== undefined && !owned.has(entry.taskId)) {
+			collect.add("evidence_task_mismatch", `${path}.entryId`, `entry ${reference.entryId} was produced by durable task ${entry.taskId}, which ${context.businessTaskId} does not own`);
+			return;
+		}
+		if (reference.toolCallId !== undefined && entry.toolCallId !== undefined && reference.toolCallId !== entry.toolCallId) {
+			collect.add("evidence_toolcall_mismatch", `${path}.toolCallId`, `entry ${reference.entryId} belongs to tool call ${entry.toolCallId}, not ${reference.toolCallId}`);
+			return;
+		}
+		accepted.push(reference);
+	});
+	if (collect.reported) return { ok: false, violations: collect.list };
+	return { ok: true, value: accepted };
+}
+
+/**
+ * Assemble a task result from its three sources: the program-assigned identity,
+ * the runtime's observed outcome, and the model's validated work. Evidence is
+ * attributed against the persisted entries *before* the result is returned, so a
+ * forged or foreign reference never reaches a document.
+ */
+export function assembleTaskResult(input: {
+	readonly resultId: string;
+	readonly runtime: RuntimeOutcome;
+	readonly work: unknown;
+	readonly evidence: readonly ResultEvidenceReference[];
+	readonly knownEntries: ReadonlyMap<string, PersistedEntryIndex>;
+	readonly attribution: EvidenceAttributionContext;
+}): ContractValidation<TaskResult> {
+	const work = validateModelWork(input.work);
+	if (!work.ok) return { ok: false, violations: work.violations };
+	const attribution = verifyEvidenceAttribution(input.evidence, input.knownEntries, input.attribution);
+	if (!attribution.ok) return attribution;
+	return validateTaskResult({
+		schemaVersion: TASK_RESULT_SCHEMA_VERSION,
+		resultId: input.resultId,
+		runtime: input.runtime,
+		evidence: input.evidence,
+		work: work.value,
+	});
+}
