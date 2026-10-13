@@ -9,9 +9,16 @@
 	],
 	"build": [
 		{ "dir": "packages/chord", "script": "build" },
+		{ "dir": "packages/telemetry", "script": "build" },
 		{ "dir": "packages/ai", "script": "build:offline" },
 		{ "dir": "packages/durable", "script": "build" }
 	],
+	"buildNote": "Topological order of the workspace dependency closure of the three linked packages. pi-ai depends on pi-telemetry (src/types.ts imports @earendil-works/pi-telemetry), pi-durable depends on chord and pi-ai. The other nine workspaces (tui, codemode, mcp, env, agent, protocol, client, server, coding-agent) are outside that closure and are not built.",
+	"modelCatalog": {
+		"endpoint": "https://pi.dev/api/models/revisions/{revision}?types=chat,image,classifier",
+		"revisionSource": "nix/model-catalog.json inside the pinned checkout",
+		"why": "packages/ai imports src/providers/data/*.json while compiling, and upstream gitignores that directory: the files are generated, not committed. Upstream's own offline path is the model catalog revision pinned in the checkout's nix/model-catalog.json, so prepare.mjs reads that revision, downloads it, checks that the bytes hash back to the revision, and runs upstream's hydrate-model-catalog.ts. No live catalog refresh happens, and hydration is byte-deterministic (it stamps a fixed manifest time)."
+	},
 	"verified": {
 		"fetchedFromOfficialRemoteOn": "2026-10-13",
 		"node": "v22.22.2",

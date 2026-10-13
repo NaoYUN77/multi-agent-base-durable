@@ -5,26 +5,40 @@
 // knows the order of operations; .github/workflows/ci.yml calls this script,
 // so local preparation and CI preparation cannot drift apart.
 //
-// Order (same as the task spec):
+// Order (same as the task spec, plus the one step the spec's minimal chain
+// turned out to need):
 //   1. read the pinned dependency config   (pi-pin.json)
 //   2. prepare the Pi checkout at the pinned commit
 //   3. install dependencies from the app and upstream lockfiles
 //      (npm ci --ignore-scripts)
-//   4. build the type artifacts the app's typecheck needs
-//      (Chord -> Pi AI build:offline -> Durable)
-//   5. link the three Pi packages (scripts/link-checkout.mjs, unchanged)
-//   6. verify revision, package identity, and link targets
+//   4. hydrate the generated model data from the pinned catalog revision
+//   5. build the type artifacts the app's typecheck needs
+//      (Chord -> Telemetry -> Pi AI build:offline -> Durable)
+//   6. link the three Pi packages (scripts/link-checkout.mjs, unchanged)
+//   7. verify revision, package identity, and link targets
 //
-// Two deliberate non-actions:
+// Deliberate non-actions:
 //   * the upstream `npm run check` is never used: it runs
 //     `biome check --write`, which rewrites files.
-//   * the upstream full `build` / `generate-models` are never used: only the
-//     minimal chain above. `ai`'s `build:offline` reads the model data that is
-//     committed at the pinned commit instead of regenerating it.
+//   * the upstream full `build` and `generate-models` are never used: no live
+//     provider-catalog refresh happens. `ai`'s `build:offline` is used instead,
+//     fed by step 4.
+//
+// Why step 4 exists (the minimal chain alone does not build on a fresh clone):
+//   `packages/ai` imports `src/providers/data/*.json` while compiling, and
+//   upstream gitignores that directory — the files are generated, not
+//   committed, so a fresh checkout has none and `tsc` fails with TS2307 for
+//   every provider. Upstream's own offline path is the model catalog revision
+//   pinned in the checkout's `nix/model-catalog.json`; step 4 downloads exactly
+//   that revision, checks the bytes hash back to it, and runs upstream's
+//   `hydrate-model-catalog.ts`. Telemetry appears in the chain for the same
+//   class of reason: `packages/ai/src/types.ts` imports it.
 //
 // Safety: an existing checkout is never deleted or re-fetched. A revision
 // mismatch or a dirty checkout is a hard failure with the evidence printed, so
-// re-running this script can never destroy a checkout you were relying on.
+// re-running this script can never destroy a checkout you were relying on. The
+// only directory this script replaces is the gitignored, generated model data
+// (step 4) — and it is replaced by upstream's own hydration command.
 //
 // Usage:
 //   node scripts/prepare.mjs [--clean] [--checkout-dir <path>]
@@ -35,8 +49,10 @@
 //                             PI_CHECKOUT, which link-checkout.mjs also reads)
 
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -118,6 +134,9 @@ function readPin() {
 	if (!Array.isArray(pin.packages) || pin.packages.length === 0) {
 		problems.push("packages must be a non-empty array");
 	}
+	if (typeof pin.modelCatalog?.endpoint !== "string" || !pin.modelCatalog.endpoint.includes("{revision}")) {
+		problems.push("modelCatalog.endpoint must be a URL template containing {revision}");
+	}
 	for (const entry of pin.packages ?? []) {
 		if (typeof entry.name !== "string" || !entry.name.startsWith("@")) {
 			problems.push(`package name is not a scoped name: ${JSON.stringify(entry)}`);
@@ -188,6 +207,53 @@ async function clean(checkoutDir, pin) {
 	for (const { dir } of pin.packages) {
 		rmSync(join(checkoutDir, dir, "dist"), { recursive: true, force: true });
 	}
+}
+
+/**
+ * Regenerate the checkout's model data from the revision the pinned commit
+ * declares, using upstream's own hydration command.
+ *
+ * This runs unconditionally, even when data already exists: a checkout that was
+ * hydrated from a live catalog holds different bytes (verified on 2026-10-13:
+ * the structure hash and 17 of 42 provider files differed), and the app must
+ * typecheck against the same data locally and in CI. Only this gitignored,
+ * generated directory is touched.
+ */
+async function ensureModelData(checkoutDir, pin) {
+	const aiDir = join(checkoutDir, "packages", "ai");
+	const revisionFile = join(checkoutDir, "nix", "model-catalog.json");
+	if (!existsSync(revisionFile)) {
+		fail(`${revisionFile} is missing, so the pinned commit declares no model catalog revision`);
+	}
+	const revision = JSON.parse(readFileSync(revisionFile, "utf8")).revision;
+	if (!/^sha256-[0-9a-f]{64}$/.test(revision ?? "")) {
+		fail(`${revisionFile} carries no usable revision: ${JSON.stringify(revision)}`);
+	}
+
+	const url = pin.modelCatalog.endpoint.replace("{revision}", revision);
+	log(`model catalog revision: ${revision}`);
+	log(`$ GET ${url}`);
+	let bytes;
+	try {
+		const response = await fetch(url);
+		if (!response.ok) fail(`catalog revision ${revision} is unavailable: HTTP ${response.status}`);
+		bytes = Buffer.from(await response.arrayBuffer());
+	} catch (error) {
+		fail(`cannot download the model catalog: ${error.message}`);
+	}
+	// The revision is the sha256 of the bytes, so this proves the download is
+	// exactly the pinned catalog and not a newer or truncated one.
+	const actual = `sha256-${createHash("sha256").update(bytes).digest("hex")}`;
+	if (actual !== revision) fail(`catalog bytes hash to ${actual}, but the pin says ${revision}`);
+
+	const catalogPath = join(tmpdir(), `pi-model-catalog-${revision.slice("sha256-".length, 20)}.json`);
+	try {
+		writeFileSync(catalogPath, bytes);
+		await run(process.execPath, [join(aiDir, "scripts", "hydrate-model-catalog.ts"), catalogPath], { cwd: aiDir });
+	} finally {
+		rmSync(catalogPath, { force: true });
+	}
+	await npm(["run", "check:model-data"], { cwd: aiDir });
 }
 
 async function verify(checkoutDir, pin) {
@@ -266,6 +332,8 @@ async function main() {
 	// links are what the three packages resolve their own dependencies through.
 	await npm(["ci", "--ignore-scripts"], { cwd: checkoutDir });
 	await npm(["ci", "--ignore-scripts"], { cwd: appRoot });
+
+	await ensureModelData(checkoutDir, pin);
 
 	for (const { dir, script } of pin.build) {
 		await npm(["run", script], { cwd: join(checkoutDir, dir) });
