@@ -39,16 +39,21 @@ jobs:
         id: revisions
         working-directory: durable-cli-probe
         run: |
+          app_commit=$(git rev-parse HEAD)
+          pi_commit=$(node -p "require('./pi-pin.json').commit")
+          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          node_version=$(node --version)
+          npm_version=$(npm --version)
           {
-            echo "app_commit=$(git rev-parse HEAD)"
-            echo "pi_commit=$(node -p "require('./pi-pin.json').commit")"
-            echo "app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}"
-            echo "node_version=$(node --version)"
-            echo "npm_version=$(npm --version)"
+            echo "app_commit=$app_commit"
+            echo "pi_commit=$pi_commit"
+            echo "app_lock_hash=$app_lock_hash"
+            echo "node_version=$node_version"
+            echo "npm_version=$npm_version"
           } >> "$GITHUB_OUTPUT"
-          echo "application commit: ${{ steps.revisions.outputs.app_commit }}"
-          echo "pinned Pi commit:   ${{ steps.revisions.outputs.pi_commit }}"
-          echo "node ${{ steps.revisions.outputs.node_version }}, npm ${{ steps.revisions.outputs.npm_version }}"
+          echo "application commit: $app_commit"
+          echo "pinned Pi commit:   $pi_commit"
+          echo "node $node_version, npm $npm_version"
 
       # One npm download cache for both installs. The key is the pinned upstream
       # commit (which pins the upstream lockfile byte for byte) plus the hash of the
@@ -85,16 +90,21 @@ jobs:
         id: revisions
         working-directory: durable-cli-probe
         run: |
+          app_commit=$(git rev-parse HEAD)
+          pi_commit=$(node -p "require('./pi-pin.json').commit")
+          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          node_version=$(node --version)
+          npm_version=$(npm --version)
           {
-            echo "app_commit=$(git rev-parse HEAD)"
-            echo "pi_commit=$(node -p "require('./pi-pin.json').commit")"
-            echo "app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}"
-            echo "node_version=$(node --version)"
-            echo "npm_version=$(npm --version)"
+            echo "app_commit=$app_commit"
+            echo "pi_commit=$pi_commit"
+            echo "app_lock_hash=$app_lock_hash"
+            echo "node_version=$node_version"
+            echo "npm_version=$npm_version"
           } >> "$GITHUB_OUTPUT"
-          echo "application commit: ${{ steps.revisions.outputs.app_commit }}"
-          echo "pinned Pi commit:   ${{ steps.revisions.outputs.pi_commit }}"
-          echo "node ${{ steps.revisions.outputs.node_version }}, npm ${{ steps.revisions.outputs.npm_version }}"
+          echo "application commit: $app_commit"
+          echo "pinned Pi commit:   $pi_commit"
+          echo "node $node_version, npm $npm_version"
 
       - name: Cache npm downloads
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
