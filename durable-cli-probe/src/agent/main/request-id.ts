@@ -15,9 +15,18 @@
 //      the model returns, so a model cannot re-enter a spent operation by
 //      repeating an id it chose.
 
-/** The request id of the user's first input for `requestId`. Pure. */
-export function requestInputId(requestId: string): string {
-	return `req-input:${requestId}`;
+/**
+ * The submission id of one version of the user's request. Pure.
+ *
+ * The version is part of the key, and it has to be: the Harness deduplicates
+ * submissions by `requestId` within a conversation, so keying on the request id
+ * alone would make a *restatement* — the user saying the same thing differently —
+ * settle as a replay of the first input and never reach the model at all. The
+ * version makes each restatement its own submission while keeping a replay of the
+ * same version idempotent, which is what the dedup key is for.
+ */
+export function requestInputId(requestId: string, requestVersion: number): string {
+	return `req-input:${requestId}:v${requestVersion}`;
 }
 
 /**

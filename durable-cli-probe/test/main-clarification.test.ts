@@ -391,10 +391,25 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			await answered.submission.wait(context);
 			await runtime.harness.waitForIdle(context);
 
+			// The restatement must reach the model as a real request. The Harness
+			// deduplicates submissions by requestId, so an id keyed on the request
+			// alone would make this settle as a replay of version 1 and the model
+			// would never see the new words — a restatement that silently does
+			// nothing. Asserting the provider *received* the text is what catches it.
+			requests.length = 0;
 			const again = await service.submitUserInput({ text: `${MARKER} count again`, requestId: "req-1", expectedRequestVersion: 1 });
 			expect(again.kind).toBe("request");
 			if (again.kind !== "request") return;
 			expect(again.requestVersion).toBe(2);
+			await again.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(requests.length).toBeGreaterThan(0);
+			expect(requests.some((request) => request.includes(`${MARKER} count again`))).toBe(true);
+
+			// And the stored request is the restated one, at version 2.
+			const restated = await runtime.harness.snapshot(AgentRequestDoc, 1 as never, "req-1", context);
+			expect(restated?.requestVersion).toBe(2);
+			expect(restated?.text).toBe(`${MARKER} count again`);
 		} finally {
 			await runtime.close();
 		}

@@ -298,7 +298,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			if (staleVersion !== undefined) {
 				return { kind: "refused", reason: `stale request version: expected ${staleVersion.expected}, stored ${staleVersion.stored}` };
 			}
-			const submission = await handle.submit({ type: "input", content: text, requestId: requestInputId(requestId) }, context);
+			const submission = await handle.submit({ type: "input", content: text, requestId: requestInputId(requestId, requestVersion) }, context);
 			return { kind: "request", requestId, requestVersion, submission };
 		},
 
