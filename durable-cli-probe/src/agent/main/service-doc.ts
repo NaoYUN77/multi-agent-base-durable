@@ -44,8 +44,19 @@ export type PlanIndexEntry = {
 export type QueuedInput = {
 	/** The submission the Harness admitted, so the caller can withdraw it. */
 	readonly submissionId: string;
+	/** The requirement this input belongs to. Applied to the pointer at consume time. */
 	readonly requestId: string;
+	/**
+	 * The requirement version this input was queued against — the basis of the
+	 * submission key, so it is part of the input's identity.
+	 */
 	readonly requestVersion: number;
+	/**
+	 * The requirement version the caller's decision was made against, when it gave
+	 * one. Re-checked at the consume boundary: a queued restatement whose basis went
+	 * stale while it waited must not be applied as if it were current.
+	 */
+	readonly expectedRequestVersion?: number;
 	readonly text: string;
 	readonly queuedAt: number;
 };

@@ -399,11 +399,18 @@ export function createMainExtension(host: MainToolHost): Extension {
 			if (replayed !== undefined) {
 				// A recorded call with no result was begun but never finished: it died in
 				// the window between the executor's effects and the receipt. Re-dispatching
-				// would run the batch a second time, so it is reported instead. A finished
-				// call replays its result verbatim.
-				const text =
-					replayed.result ?? `dispatch ${args.planId} was interrupted after it started and may have partially run; not dispatching again.`;
-				return { output: [{ type: "text", text }], isError: replayed.result === undefined };
+				// would run the batch a second time, so it is reported instead — and
+				// reported as an *error with unknown outcome*, not as a completion. Not
+				// re-running is not the same as having succeeded: the batch may have
+				// partially taken effect, and nothing here can tell whether it did. A
+				// finished call replays its result verbatim.
+				if (replayed.result === undefined) {
+					const text =
+						`dispatch ${args.planId} did NOT complete: it was interrupted after starting and may have partially run. ` +
+						`Its outcome is unknown — this is not a success and not a completion receipt. Do not treat the tasks as done.`;
+					return { output: [{ type: "text", text }], isError: true };
+				}
+				return { output: [{ type: "text", text: replayed.result }] };
 			}
 
 			const active = await host.activeRequest();

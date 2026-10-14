@@ -356,14 +356,19 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * this the queue only ever grew, and a caller could withdraw an input that had
 	 * already been consumed.
 	 *
-	 * The reconcile is a pure comparison of two durable facts — the submission's
-	 * own status and the service's record — so it is safe to run on every read and
-	 * cannot drop an input the Harness still holds.
+	 * Removing the record is not the whole job. A queued restatement carries *its
+	 * own* requirement identity, and the service's active pointer still names
+	 * whatever was being served when the round began. Consuming the input therefore
+	 * also applies that identity to the request document and the pointer — in the
+	 * same commit — and re-checks the version basis the caller gave: a restatement
+	 * whose `expectedRequestVersion` went stale while it waited is dropped rather
+	 * than applied as if it were current. "Left the queue" and "became the active
+	 * requirement" are different facts, and only the second one is correctness.
 	 */
 	async function reconcileQueue(): Promise<void> {
 		const held = await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
-			return (JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[]).map((entry) => entry.submissionId);
+			return JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[];
 		}, context);
 		if (held.length === 0) return;
 		const inspection = await harness.inspect(context);
@@ -372,11 +377,28 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				.filter((record) => record.conversationId === conversationId && record.type === "input" && record.status === "queued")
 				.map((record) => String(record.id)),
 		);
-		const consumed = held.filter((id) => !stillQueued.has(id));
+		const consumed = held.filter((entry) => !stillQueued.has(String(entry.submissionId)));
 		if (consumed.length === 0) return;
 		await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
-			doc.queue = doc.queue.filter((entry) => !consumed.includes(entry.submissionId));
+			// Apply each consumed input's requirement identity, oldest first, so the
+			// pointer ends at the newest restatement the round's boundary admitted.
+			for (const entry of consumed) {
+				const request = await tx.doc(AgentRequestDoc, conversationId, entry.requestId, { requestId: entry.requestId });
+				const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
+				// The caller's basis must still hold. A stale one is not applied — the
+				// input was admitted, but it does not become the active requirement.
+				if (entry.expectedRequestVersion !== undefined && storedVersion !== undefined && storedVersion !== entry.expectedRequestVersion) {
+					continue;
+				}
+				const nextVersion = storedVersion === undefined ? 1 : Math.max(storedVersion + 1, entry.requestVersion);
+				request.requestVersion = nextVersion;
+				request.text = entry.text;
+				request.requestedAt = entry.queuedAt;
+				doc.activeRequestId = entry.requestId;
+				doc.requestVersion = nextVersion;
+			}
+			doc.queue = doc.queue.filter((entry) => !consumed.some((gone) => gone.submissionId === entry.submissionId));
 		}, context);
 	}
 
@@ -495,7 +517,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					{ type: "input", content: text, requestId: queuedInputId(requestId, requestVersion, text) },
 					context,
 				);
-				const record: QueuedInput = { submissionId: String(submission.id), requestId, requestVersion, text, queuedAt };
+				const record: QueuedInput = {
+					submissionId: String(submission.id),
+					requestId,
+					requestVersion,
+					...(input.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: input.expectedRequestVersion }),
+					text,
+					queuedAt,
+				};
 				await handle.commit(async (tx) => {
 					const doc = await tx.doc(MainServiceDoc, conversationId);
 					doc.queue = [...doc.queue, record];

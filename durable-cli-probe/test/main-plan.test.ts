@@ -625,7 +625,14 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 				context,
 			);
 			expect(replayed.isError).toBe(true);
-			expect(JSON.stringify(replayed.output)).toContain("may have partially run");
+			// The uncertain semantics are preserved: not re-running is not the same as
+			// having succeeded, and the report says so rather than reading as a
+			// completion receipt.
+			const text = JSON.stringify(replayed.output);
+			expect(text).toContain("did NOT complete");
+			expect(text).toContain("may have partially run");
+			expect(text).toContain("outcome is unknown");
+			expect(text).toContain("not a success");
 			// And it did not run the batch again.
 			expect(dispatched).toHaveLength(1);
 		} finally {
@@ -805,6 +812,106 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect(after).toContain("Use report.txt");
 			expect(after).toContain("plan-a v1");
 			expect(after).toContain("Open questions: (none)");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("walks insufficient → re-ask → sufficient → plan as one legal chain (AC-02)", async () => {
+		// The whole AC-02 chain, not one link of it. Each step is asserted on a
+		// durable fact: the question stays open on a vague reply, the follow-up
+		// reaches the provider, the question closes, and only then does a dispatch
+		// get through — with the executor's call count as the evidence that it did.
+		const requests: string[] = [];
+		const dispatched: string[][] = [];
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			// The round is decided by the newest user input, not by a running count:
+			// one run may take several provider requests, so counting them would let
+			// the script drift out from under the test.
+			let newest = -1;
+			for (let index = request.messages.length - 1; index >= 0; index--) {
+				if (request.messages[index]!.role === "user") {
+					newest = index;
+					break;
+				}
+			}
+			const said = newest >= 0 ? flatten([request.messages[newest]!]) : "";
+			const tail = request.messages.slice(newest + 1);
+			const sawToolResult = tail.some((message) => message.role === "toolResult");
+			if (sawToolResult) return fauxAssistantMessage([fauxText("nothing left to do")]);
+			if (said.includes("plan the work")) {
+				// The plan is saved AND the question asked in the same round, so that in
+				// the next step the open question is the *only* thing standing between
+				// the model and a dispatch — otherwise a missing plan would refuse it
+				// first and the assertion would prove nothing about the question.
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("save_plan", { planId: "plan-a", goals: ["g"], taskIds: ["t1"] }, { id: "save-0" }),
+						fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: "ask-1" }),
+					],
+					{ stopReason: "toolUse" },
+				);
+			}
+			// The vague reply: the model tries to dispatch anyway. It must be refused
+			// while the question is still open, so the executor never runs.
+			if (said.includes("not sure")) {
+				return fauxAssistantMessage([fauxToolCall("dispatch_tasks", { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] }, { id: "disp-early" })], { stopReason: "toolUse" });
+			}
+			if (said.includes("Use report.txt")) {
+				// The answer's own run: the question is resolved by the time the model
+				// speaks, so the dispatch that was refused a step ago is admitted now.
+				return fauxAssistantMessage([fauxToolCall("dispatch_tasks", { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] }, { id: "disp-late" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("nothing left to do")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async ({ tasks }) => {
+					dispatched.push(tasks.map((task) => task.id));
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				now: () => 1_700_000_000_000,
+			});
+
+			// 1. The model asks (and saves the plan it will later dispatch); the question
+			// is open and nothing ran.
+			const first = await service.submitUserInput({ text: `${MARKER2} plan the work`, requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+			// The plan exists, so the open question really is the only blocker below.
+			expect((await service.readRequest()).plans.map((plan) => plan.planId)).toEqual(["plan-a"]);
+			expect(dispatched).toHaveLength(0);
+
+			// 2. A vague reply: recorded, but not sufficient — the question stays open.
+			const vague = await service.submitUserInput({ text: "not sure", answerTo: questionId, sufficient: false });
+			if (vague.kind !== "answer") throw new Error("expected an answer");
+			await vague.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect((await service.readRequest()).openQuestionIds).toEqual([questionId]);
+			// The model tried to dispatch here and was refused: the executor never ran.
+			expect(dispatched).toHaveLength(0);
+
+			// 3. A sufficient follow-up: it reaches the provider, closes the question,
+			// and the dispatch the model had been refused is admitted in that same run —
+			// the executor runs, which is the evidence the chain actually completed.
+			requests.length = 0;
+			const clear = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
+			if (clear.kind !== "answer") throw new Error("expected an answer");
+			await clear.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(requests.some((text) => text.includes("Use report.txt"))).toBe(true);
+			expect((await service.readRequest()).openQuestionIds).toEqual([]);
+			expect(dispatched).toEqual([["t1"]]);
 		} finally {
 			await runtime.close();
 		}

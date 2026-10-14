@@ -655,9 +655,66 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			await first.submission.wait(context);
 			await runtime.harness.waitForIdle(context);
 			expect(await service.readQueue()).toHaveLength(0);
+
+			// Consuming is not just "left the queue": the surviving input's own
+			// requirement identity is applied to the request document and the active
+			// pointer, so the service serves the queued restatement rather than the
+			// request that happened to be running when it was admitted.
+			const view = await service.readRequest();
+			expect(view.requestId).toBe("req-q2");
+			expect(view.text).toBe("same words");
 			// And withdrawing a consumed input is refused, not reported as a withdrawal.
 			const late = await service.withdrawQueued(queue[1]!.submissionId);
 			expect(late.withdrawn).toBe(false);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("does not apply a queued restatement whose version basis went stale while it waited (AC-04)", async () => {
+		// A queued input carries the version its caller's decision was made against.
+		// If the requirement moves on while the input waits, applying it would
+		// complete a new goal on a stale basis — so the consume boundary re-checks
+		// and drops it, leaving the active requirement where it was.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const parkingRouter: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: parkingRouter });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER} go`, requestId: "req-busy" });
+			if (first.kind !== "request") throw new Error("expected a request");
+
+			// Queued against a basis that is already stale: the requirement is at v1.
+			const stale = await service.submitUserInput({ text: "restated", requestId: "req-busy", expectedRequestVersion: 99 });
+			expect(stale.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			await service.readQueue();
+
+			// The stale restatement was admitted to the queue but is not applied: the
+			// active requirement is unchanged, and the text did not become the request.
+			const view = await service.readRequest();
+			expect(view.requestId).toBe("req-busy");
+			expect(view.text).toBe(`${MARKER} go`);
+			expect(view.requestVersion).toBe(1);
 		} finally {
 			release?.();
 			await runtime.close();
