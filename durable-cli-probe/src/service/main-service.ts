@@ -38,8 +38,8 @@ import type {
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../agent/contracts/documents.ts";
 import { composeUserAnswer, openQuestionIds, type ClarificationState, type UserAnswer } from "../agent/contracts/clarification.ts";
 import { validatePlan, type Plan } from "../agent/contracts/plan.ts";
-import { MainServiceDoc } from "../agent/main/service-doc.ts";
-import { answerInputId, requestInputId, stableSlug } from "../agent/main/request-id.ts";
+import { MainServiceDoc, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
+import { answerInputId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
 import { mainInstructions } from "../agent/prompts/main.ts";
 
@@ -108,16 +108,24 @@ export type MainService = {
 		readonly requestId?: string;
 		readonly answerTo?: string;
 		/**
-		 * The application's judgement of an answer, not the model's. Defaults to
-		 * `true`: the user replied to the question that was asked, so the answer
-		 * resolves it. Pass `false` for a reply that does not settle the question,
-		 * which leaves it open for the model to ask again.
+		 * The application's judgement of an answer, not the model's, and **required
+		 * when `answerTo` is given**. There is no default: "the user replied" is not
+		 * "the reply is sufficient" (contract §"Main Agent 合同"), so an input that
+		 * answers without a judgement is refused rather than treated as settled.
+		 * `false` leaves the question open for the model to ask again.
 		 */
 		readonly sufficient?: boolean;
 		readonly expectedRequestVersion?: number;
 	}): Promise<SubmitOutcome>;
 	/** Read the active request, its open questions and its plans. Read-only; never waits on a model. */
 	readRequest(): Promise<RequestView>;
+	/** Inputs admitted while the conversation was busy and not yet submitted. */
+	readQueue(): Promise<readonly QueuedInput[]>;
+	/**
+	 * Withdraw one queued input. Only that input is withdrawn — the rest of the
+	 * queue and any running round are untouched.
+	 */
+	withdrawQueued(submissionId: string): Promise<{ readonly withdrawn: boolean; readonly reason: string }>;
 	/** The conversation's live status, read from `harness.inspect()`. Writes nothing. */
 	status(): Promise<{ readonly busy: boolean; readonly openQuestionIds: readonly string[]; readonly requestId: string | undefined }>;
 	/**
@@ -139,15 +147,6 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	const handle: Conversation = found;
 
 	/**
-	 * Plan ids this process has seen saved. Plan documents are a family keyed by
-	 * planId and the Harness exposes no "list family keys" call, so the service
-	 * records the keys it observes. A restart therefore lists no plans until the
-	 * model saves or dispatches one again — a limitation recorded in the PR's
-	 * "not executed" section rather than papered over with a key scan.
-	 */
-	const knownPlanIds = new Set<string>();
-
-	/**
 	 * Committed reads go through `handle.commit` rather than `harness.snapshot`.
 	 *
 	 * The reason is the contract's own: the service must read the *latest*
@@ -156,8 +155,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * them would silently not drive the work it is supposed to serve. A commit
 	 * gives the same committed read while keeping the conversation live.
 	 */
-	async function activeRequestId(): Promise<string | undefined> {
-		return await handle.commit(async (tx) => (await tx.doc(MainServiceDoc, conversationId)).activeRequestId, context);
+	async function activeRequest(): Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined> {
+		return await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			return doc.activeRequestId === undefined ? undefined : { requestId: doc.activeRequestId, requestVersion: doc.requestVersion };
+		}, context);
 	}
 
 	async function readClarification(requestId: string): Promise<ClarificationState> {
@@ -181,6 +183,121 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		);
 	}
 
+	/** The plans of one request, read from the persisted index and the plan documents. */
+	async function readPlansOf(requestId: string): Promise<readonly Plan[]> {
+		const index = await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			return (JSON.parse(JSON.stringify(doc.plans)) as PlanIndexEntry[]).filter((entry) => entry.requestId === requestId);
+		}, context);
+		const plans: Plan[] = [];
+		for (const entry of index) {
+			// The copy has to happen inside the commit: the document's nested values
+			// are write overlays that throw "Cannot use a settled overlay" once the
+			// commit is finished.
+			const raw = await handle.commit(
+				async (tx) => JSON.parse(JSON.stringify(await tx.doc(AgentPlanDoc, conversationId, entry.planId, { planId: entry.planId }))),
+				context,
+			);
+			if (raw.version === 0) continue;
+			const checked = validatePlan(raw);
+			if (checked.ok) plans.push(checked.value);
+		}
+		return plans;
+	}
+
+	/**
+	 * Mark one management-tool call as begun, before it runs its side effect. A
+	 * crash between this and `recordOperation` leaves a start with no result, which
+	 * a replay reports as interrupted instead of re-executing.
+	 */
+	async function beginOperation(opKey: string): Promise<void> {
+		await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			if (doc.receipts.some((receipt) => receipt.opKey === opKey)) return;
+			doc.receipts = [...doc.receipts, { opKey, at: now() }];
+		}, context);
+	}
+
+	/**
+	 * Record one finished management-tool call, so a replay returns its result
+	 * instead of redoing the work. `replay: "safe"` is not exactly-once.
+	 */
+	async function recordOperation(input: { readonly opKey: string; readonly result: string; readonly control?: { readonly handoff?: string } }): Promise<void> {
+		await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			const existing = doc.receipts.find((receipt) => receipt.opKey === input.opKey);
+			// A finished call is never overwritten by a replay: the first result stands.
+			if (existing?.result !== undefined) return;
+			const receipt: OperationReceipt = { opKey: input.opKey, result: input.result, at: now() };
+			if (input.control !== undefined) (receipt as { control?: { readonly handoff?: string } }).control = input.control;
+			// A begin-then-finish replaces the started marker in place, so a call has
+			// exactly one receipt whatever path it took.
+			doc.receipts =
+				existing === undefined
+					? [...doc.receipts, receipt]
+					: doc.receipts.map((entry) => (entry.opKey === input.opKey ? receipt : entry));
+		}, context);
+	}
+
+	async function readOperation(opKey: string): Promise<{ readonly result?: string; readonly control?: { readonly handoff?: string } } | undefined> {
+		return await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			const found = doc.receipts.find((receipt) => receipt.opKey === opKey);
+			// Copied inside the commit: the document's nested values are write overlays
+			// that throw "Cannot use a settled overlay" once it finishes.
+			return found === undefined
+				? undefined
+				: (JSON.parse(JSON.stringify({ result: found.result, control: found.control })) as {
+						readonly result?: string;
+						readonly control?: { readonly handoff?: string };
+					});
+		}, context);
+	}
+
+	/**
+	 * The text a clarification hands back to the next round.
+	 *
+	 * The program assembles it from persisted facts, never from the model. A
+	 * handoff *replaces* the model's context, so anything this omits is context
+	 * the next round cannot see: the request as the user stated it, its materials,
+	 * the answer that was just recorded, and the open questions. This is what makes
+	 * the guaranteed round end compatible with a long-lived Main conversation —
+	 * the model's automatic history is reset, the *facts* are not.
+	 */
+	async function buildHandoff(input: {
+		readonly requestId: string;
+		readonly questionId: string;
+		readonly question: string;
+		readonly reason: string;
+	}): Promise<string> {
+		// Copied inside the commit, because the document's nested values are write
+		// overlays that throw "Cannot use a settled overlay" once it finishes.
+		const request = await handle.commit(async (tx) => {
+			const doc = await tx.doc(AgentRequestDoc, conversationId, input.requestId, { requestId: input.requestId });
+			return JSON.parse(JSON.stringify({ requestVersion: doc.requestVersion, text: doc.text, materials: doc.materials })) as {
+				readonly requestVersion: number;
+				readonly text: string;
+				readonly materials: readonly { readonly source: string; readonly content: string }[];
+			};
+		}, context);
+		const clarification = await readClarification(input.requestId);
+		const answer = clarification.answers.find((entry) => entry.questionId === input.questionId);
+		const open = openQuestionIds(clarification).filter((id) => id !== input.questionId);
+		const lines = [
+			`Request ${input.requestId} v${request.requestVersion}: ${request.text}`,
+			request.materials.length === 0
+				? "Materials: (none recorded)"
+				: `Materials:\n${request.materials.map((material) => `- [${material.source}] ${material.content}`).join("\n")}`,
+			`You asked: ${input.question}`,
+			`Why: ${input.reason}`,
+			answer === undefined
+				? "The user has not answered yet. Wait for their reply; do not invent one."
+				: `The user answered: ${answer.text}${answer.sufficient ? "" : " (The application did not judge this sufficient.)"}`,
+			open.length === 0 ? "No other question is open." : `Still open: ${open.join(", ")}`,
+		];
+		return lines.join("\n");
+	}
+
 	/**
 	 * Install the Main agent: the bundled prompt plus the three management tools.
 	 *
@@ -192,15 +309,23 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * is selected but not installed resolves to nothing, which is why the registry
 	 * is a required option rather than something this module reaches for.
 	 *
-	 * `activeRequestId` is a closure over the function above, not a captured
-	 * value: a tool call reads the pointer as it stands at that moment, so a
-	 * question asked after a restatement binds to the current request.
+	 * `activeRequest` is a closure, not a captured value: a tool call reads the
+	 * pointer as it stands at that moment, so a question asked after a restatement
+	 * binds to the current request.
 	 */
 	const extension = createMainExtension({
-		activeRequestId: () => activeRequestId(),
+		activeRequest,
 		dispatch: options.dispatch,
 		now,
-		onPlanSaved: (planId) => knownPlanIds.add(planId),
+		buildHandoff,
+		readOperation,
+		beginOperation: (input) => beginOperation(input.opKey),
+		recordOperation,
+		// `save_plan` writes its own index entry inside its transaction, so the index
+		// and the plan can never disagree — and because the index is *persisted*, the
+		// plan list survives a reopen instead of belonging to the process that saved
+		// it.
+		indexPlans: true,
 		...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
 	});
 	options.registry.install(extension);
@@ -220,6 +345,41 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		return inspection.tasks.some((task) => task.record.conversationId === conversationId && task.record.background !== true);
 	}
 
+	/**
+	 * The consume boundary for the queue.
+	 *
+	 * A queued input is placed into the transcript by the Harness when the round it
+	 * was waiting on reaches its boundary — that is not something this service
+	 * drives. So the persisted queue is reconciled against what the Harness
+	 * actually holds before it is reported: an input the Harness no longer lists as
+	 * `queued` has been placed (or settled), and its record is removed. Without
+	 * this the queue only ever grew, and a caller could withdraw an input that had
+	 * already been consumed.
+	 *
+	 * The reconcile is a pure comparison of two durable facts — the submission's
+	 * own status and the service's record — so it is safe to run on every read and
+	 * cannot drop an input the Harness still holds.
+	 */
+	async function reconcileQueue(): Promise<void> {
+		const held = await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			return (JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[]).map((entry) => entry.submissionId);
+		}, context);
+		if (held.length === 0) return;
+		const inspection = await harness.inspect(context);
+		const stillQueued = new Set(
+			inspection.submissions
+				.filter((record) => record.conversationId === conversationId && record.type === "input" && record.status === "queued")
+				.map((record) => String(record.id)),
+		);
+		const consumed = held.filter((id) => !stillQueued.has(id));
+		if (consumed.length === 0) return;
+		await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			doc.queue = doc.queue.filter((entry) => !consumed.includes(entry.submissionId));
+		}, context);
+	}
+
 	const service: MainService = {
 		conversationId,
 
@@ -227,34 +387,87 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			const text = input.text;
 			if (text.trim() === "") return { kind: "refused", reason: "empty input" };
 
-			const current = await activeRequestId();
-			const openIds = current === undefined ? [] : openQuestionIds(await readClarification(current));
+			const current = await activeRequest();
+			const openIds = current === undefined ? [] : openQuestionIds(await readClarification(current.requestId));
 
 			// ── Answering an open question ────────────────────────────────────────
 			if (input.answerTo !== undefined) {
 				if (current === undefined) return { kind: "refused", reason: "no active request to answer" };
 				if (!openIds.includes(input.answerTo)) return { kind: "refused", reason: `question ${input.answerTo} is not open` };
 				// The write boundary: `source` is stamped by the composer, and the
-				// payload below has no field to claim it.
-				const composed = composeUserAnswer({ questionId: input.answerTo, text, sufficient: input.sufficient ?? true }, { at: now() });
+				// payload below has no field to claim it. There is no default for
+				// `sufficient`: omitting it means the application has NOT judged the
+				// answer, which keeps the question open. "The user replied" is not
+				// "the reply was sufficient" (contract §"Main Agent 合同").
+				const sufficient = input.sufficient;
+				if (sufficient === undefined) {
+					return {
+						kind: "refused",
+						reason: `answer needs a sufficiency judgement: pass sufficient: true or false for question ${input.answerTo}`,
+					};
+				}
+				const composed = composeUserAnswer({ questionId: input.answerTo, text, sufficient }, { at: now() });
 				if (!composed.ok) {
 					return { kind: "refused", reason: `answer refused: ${composed.violations.map((v) => `${v.path}:${v.code}`).join(", ")}` };
 				}
 				// The answer AND its resolution are written in one commit, and both are
-				// required: the contract's rule is that a question stops blocking on a
-				// resolution, not on an answer. Receiving an answer is not the same as
-				// being satisfied with it, so an answer the application does not judge
-				// sufficient leaves the question open on purpose — the model will ask
-				// again rather than proceed on a vague reply.
-				await handle.commit(async (tx) => {
-					const state = await tx.doc(AgentClarificationDoc, conversationId, current, { requestId: current });
-					state.answers = [...state.answers, composed.value];
-					state.resolutions = [
-						...state.resolutions,
-						{ questionId: input.answerTo!, resolvedAt: composed.value.answeredAt, resolvedBy: "application", basis: { kind: "answer", answerAt: composed.value.answeredAt } },
-					];
+				// required: a question stops blocking on a *resolution*, not on an
+				// answer. The clarification contract holds exactly one answer per
+				// question, so a follow-up reply REPLACES the stored answer rather than
+				// appending a second one (a duplicate is a validation failure), and the
+				// replaced text is kept in the service's own attempt log so the
+				// exchange stays auditable.
+				//
+				// The returned revision counts the *attempts*, not the stored answers:
+				// it is what makes a follow-up a new submission rather than a replay of
+				// the first answer, and it must therefore increase even though the
+				// stored answer count does not.
+				const revision = await handle.commit(async (tx) => {
+					const service = await tx.doc(MainServiceDoc, conversationId);
+					const state = await tx.doc(AgentClarificationDoc, conversationId, current.requestId, { requestId: current.requestId });
+					const previous = state.answers.find((entry) => entry.questionId === input.answerTo);
+					if (previous !== undefined) state.answers = state.answers.filter((entry) => entry.questionId !== input.answerTo);
+					const answer = composed.value;
+					state.answers = [...state.answers, answer];
+					// A repeat of the *same logical answer* — the same words, judged the
+					// same way — is a replay, not a new input: it reuses the attempt it
+					// already has, so the submission key is unchanged and the Harness
+					// deduplicates it. Only a genuinely different reply (different words, or
+					// the same words judged differently) is a new attempt and a new key.
+					//
+					// Every distinct answer is recorded as an attempt, whichever way the
+					// judgement went: the clarification document holds exactly one answer
+					// per question, so an earlier reply is otherwise gone, and the attempt
+					// log is what keeps the exchange auditable.
+					const same = service.answerAttempts.find(
+						(attempt) => attempt.questionId === input.answerTo && attempt.text === text && attempt.sufficient === sufficient,
+					);
+					if (same === undefined) {
+						service.answerAttempts = [...service.answerAttempts, { questionId: input.answerTo!, text, sufficient, at: answer.answeredAt }];
+					}
+					// Only a sufficient answer resolves the question. An insufficient one
+					// leaves it open, and the model is expected to ask again.
+					if (sufficient) {
+						state.resolutions = [
+							...state.resolutions.filter((entry) => entry.questionId !== input.answerTo),
+							{ questionId: input.answerTo!, resolvedAt: answer.answeredAt, resolvedBy: "application", basis: { kind: "answer", answerAt: answer.answeredAt } },
+						];
+					}
+					// The revision is the ordinal of this logical answer among the
+					// question's attempts, so a replay of an earlier answer returns the
+					// revision it had — and a new one gets a new key.
+					return service.answerAttempts.filter((attempt) => attempt.questionId === input.answerTo).findIndex(
+						(attempt) => attempt.text === text && attempt.sufficient === sufficient,
+					) + 1;
 				}, context);
-				const submission = await handle.submit({ type: "input", content: text, requestId: answerInputId(input.answerTo) }, context);
+				// The submission key carries the request AND the revision, so a
+				// follow-up to the same question is its own input rather than a replay
+				// of the first answer — and two requests that ask the same words cannot
+				// collide on one key.
+				const submission = await handle.submit(
+					{ type: "input", content: text, requestId: answerInputId(current.requestId, input.answerTo, revision) },
+					context,
+				);
 				return { kind: "answer", questionId: input.answerTo, submission };
 			}
 
@@ -267,15 +480,31 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			}
 
 			// ── A plain input while a round is running ────────────────────────────
-			// The Harness queues it in `pi.inbox`; the outcome says so rather than
-			// letting the caller believe it started immediately.
+			// Queued, not submitted, and not keyed on the text: two different
+			// requests that say the same words are two inputs, and keying on the text
+			// would collapse them into one and drop the second. The queue is a
+			// persisted record, so it can be queried and withdrawn.
 			if (await busy()) {
-				const submission = await handle.submit({ type: "input", content: text, requestId: `queued:${stableSlug(text)}` }, context);
+				const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
+				const requestVersion = current?.requestVersion ?? 1;
+				const queuedAt = now();
+				// The submission key is the logical identity of the input, not a clock:
+				// keying on `queuedAt` would make the same input a different submission on
+				// a retry, which is the replay the dedup key exists to catch.
+				const submission = await handle.submit(
+					{ type: "input", content: text, requestId: queuedInputId(requestId, requestVersion, text) },
+					context,
+				);
+				const record: QueuedInput = { submissionId: String(submission.id), requestId, requestVersion, text, queuedAt };
+				await handle.commit(async (tx) => {
+					const doc = await tx.doc(MainServiceDoc, conversationId);
+					doc.queue = [...doc.queue, record];
+				}, context);
 				return { kind: "queued", submission, reason: "a round is running; the input is queued for the next boundary" };
 			}
 
 			// ── A new request (or a restatement of the current one) ───────────────
-			const requestId = input.requestId ?? current ?? `req-${now().toString(36)}`;
+			const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
 			// The version check and the write happen in ONE commit, so a concurrent
 			// restatement cannot slip between them.
 			let staleVersion: { readonly expected: number; readonly stored: number } | undefined;
@@ -303,41 +532,72 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		},
 
 		async readRequest() {
-			const requestId = await activeRequestId();
-			if (requestId === undefined) {
+			const current = await activeRequest();
+			if (current === undefined) {
 				return { requestId: undefined, requestVersion: 0, text: "", openQuestionIds: [], questions: [], answers: [], plans: [] };
 			}
 			const request = await handle.commit(async (tx) => {
-				const doc = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
+				const doc = await tx.doc(AgentRequestDoc, conversationId, current.requestId, { requestId: current.requestId });
 				return { requestVersion: doc.requestVersion, text: doc.text };
 			}, context);
-			const clarification = await readClarification(requestId);
-			const plans: Plan[] = [];
-			for (const planId of knownPlanIds) {
-				const raw = await harness.snapshot(AgentPlanDoc, conversationId, planId, context);
-				if (raw === undefined || raw.version === 0) continue;
-				const checked = validatePlan(raw);
-				if (checked.ok) plans.push(checked.value);
-			}
+			const clarification = await readClarification(current.requestId);
 			return {
-				requestId,
-				requestVersion: request?.requestVersion ?? 0,
-				text: request?.text ?? "",
+				requestId: current.requestId,
+				requestVersion: request.requestVersion,
+				text: request.text,
 				openQuestionIds: openQuestionIds(clarification),
 				questions: clarification.questions,
 				answers: clarification.answers,
-				plans,
+				// Only this request's plans: an index filtered by the active request,
+				// not every plan the conversation has ever held.
+				plans: await readPlansOf(current.requestId),
 			};
 		},
 
 		async status() {
-			const requestId = await activeRequestId();
-			const clarification = requestId === undefined ? undefined : await readClarification(requestId);
+			const current = await activeRequest();
+			const clarification = current === undefined ? undefined : await readClarification(current.requestId);
 			return {
 				busy: await busy(),
 				openQuestionIds: clarification === undefined ? [] : openQuestionIds(clarification),
-				requestId,
+				requestId: current?.requestId,
 			};
+		},
+
+		/** Inputs admitted while busy and not yet submitted. */
+		async readQueue() {
+			await reconcileQueue();
+			return await handle.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, conversationId);
+				// Copied inside the commit: the document's nested values are write
+				// overlays that throw "Cannot use a settled overlay" afterwards.
+				return JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[];
+			}, context);
+		},
+
+		/**
+		 * Withdraw a queued input that has not been submitted yet.
+		 *
+		 * The Harness's abort withdraws queued submissions of the whole conversation,
+		 * which is exactly what must NOT happen here: withdrawing one queued input
+		 * must not disturb the rest. So the intent is recorded first and the
+		 * submission is aborted through the public per-submission entry point.
+		 */
+		async withdrawQueued(submissionId: string) {
+			// Reconcile first: an input the Harness has already placed is no longer
+			// withdrawable, and reporting it as withdrawn would be a lie.
+			await reconcileQueue();
+			const found = await handle.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, conversationId);
+				return doc.queue.some((entry) => entry.submissionId === submissionId);
+			}, context);
+			if (!found) return { withdrawn: false, reason: `no queued input ${submissionId}` };
+			const outcome = await harness.abortSubmission(submissionId as never, context, conversationId);
+			await handle.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, conversationId);
+				doc.queue = doc.queue.filter((entry) => entry.submissionId !== submissionId);
+			}, context);
+			return { withdrawn: outcome === "aborted", reason: outcome };
 		},
 
 		async requestCancel(reason) {
@@ -357,8 +617,4 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	};
 
 	return service;
-}
-
-function emptyClarification(): ClarificationState {
-	return { schemaVersion: 1, questions: [], answers: [], resolutions: [] };
 }

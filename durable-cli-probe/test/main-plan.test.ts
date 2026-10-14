@@ -19,7 +19,9 @@ import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.
 import { AgentClarificationDoc, AgentPlanDoc } from "../src/agent/contracts/documents.ts";
 import { validateTaskSpec, type TaskSpec } from "../src/agent/contracts/task-spec.ts";
 import { openMainService } from "../src/service/main-service.ts";
+import { MainServiceDoc } from "../src/agent/main/service-doc.ts";
 import type { DispatchResult } from "../src/agent/main/tools.ts";
+import { createMainExtension } from "../src/agent/main/tools.ts";
 
 /** A valid TaskSpec, so the batch passes the contract and admission is the only gate. */
 function taskSpec(id: string, dependencies: readonly string[] = []): TaskSpec {
@@ -48,15 +50,28 @@ type ScriptedCall = { readonly name: string; readonly arguments: JsonObject };
 function flatten(messages: readonly unknown[]): string {
 	return messages
 		.map((message) => {
-			const content = (message as { content?: unknown }).content;
-			if (typeof content === "string") return content;
-			if (!Array.isArray(content)) return "";
-			return content
-				.map((part) => (typeof part === "object" && part !== null && "text" in part ? String((part as { text?: string }).text ?? "") : ""))
+			const record = message as { content?: unknown; sections?: Record<string, string | null> };
+			// A system message carries prompt sections in a `sections` field beside
+			// `content`, so a helper that reads only `content` would report a rendered
+			// section as absent. That is the whole surface these tests assert on.
+			const sections = Object.values(record.sections ?? {})
+				.filter((value): value is string => typeof value === "string")
 				.join("\n");
+			const content = record.content;
+			if (typeof content === "string") return `${content}\n${sections}`;
+			if (!Array.isArray(content)) return sections;
+			return [
+				content
+					.map((part) => (typeof part === "object" && part !== null && "text" in part ? String((part as { text?: string }).text ?? "") : ""))
+					.join("\n"),
+				sections,
+			].join("\n");
 		})
 		.join("\n");
 }
+
+/** A marker the handoff payload must carry back to the next round. */
+const MARKER2 = "HANDOFF-PAYLOAD-6D2A";
 
 describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)", { timeout: 30_000 }, () => {
 	let directory: string;
@@ -72,9 +87,15 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 	});
 
 	/**
-	 * Drive the service with a scripted sequence of tool calls, one per model turn.
-	 * The router pops the next scripted turn per request, so a test writes the
-	 * conversation the model would have had.
+	 * Drive the service with a scripted sequence of tool calls, one entry per model
+	 * turn.
+	 *
+	 * The router advances its turn on the first provider request of each *run*. A
+	 * harness turn and a provider request are not the same thing — a round whose
+	 * tool did not ask the run to end produces several provider requests — so
+	 * counting every request let the script drift out from under the test. The turn
+	 * is therefore keyed to the start of a run, which is what one submission
+	 * produces.
 	 */
 	async function runScript(
 		script: readonly (readonly ScriptedCall[])[],
@@ -92,9 +113,21 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		const dispatched: TaskSpec[][] = [];
 		const requests: string[] = [];
 		let turn = 0;
+		/**
+		 * The tool transcript marks the start of a new run, so it is what advances the
+		 * script: a `pi.tool-result` entry means the previous round's tools finished
+		 * and the harness is about to ask again, which is the next scripted turn.
+		 */
 		const router: FauxResponseFactory = (request) => {
 			requests.push(flatten(request.messages));
-			const calls: readonly ScriptedCall[] = script[turn++] ?? [];
+			// A `pi.tool-result` entry means the round's tools finished and the harness
+			// is about to ask again — that is the next scripted turn.
+			const sawToolResult = request.messages.some((message) => message.role === "toolResult");
+			if (sawToolResult) turn += 1;
+			// Once the script is spent the model answers with plain text, which ends
+			// the run. Repeating the last entry forever would spin the conversation and
+			// make every assertion about call counts meaningless.
+			const calls: readonly ScriptedCall[] = turn >= script.length ? [] : script[turn] ?? [];
 			if (calls.length === 0) return fauxAssistantMessage([fauxText("nothing left to do")]);
 			return fauxAssistantMessage(
 				calls.map((call, index) => fauxToolCall(call.name, call.arguments, { id: `call-${turn}-${index}` })),
@@ -139,6 +172,13 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect(stored?.taskIds).toEqual(["t1"]);
 			expect(stored?.supersedes).toBeUndefined();
 			expect(stored?.savedAt).toBe(1_700_000_000_000);
+			// The requirement identity is bound by the program: the model has no
+			// parameter for it, so it cannot claim a plan belongs to a requirement it
+			// does not.
+			expect(stored?.requestId).toBe("req-plan");
+			expect(stored?.requestVersion).toBe(1);
+			// And the persisted index lists it for this request.
+			expect((await service.readRequest()).plans.map((plan) => plan.planId)).toEqual(["plan-a"]);
 		} finally {
 			await runtime.close();
 		}
@@ -155,6 +195,11 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect(stored?.version).toBe(2);
 			expect(stored?.supersedes).toBe(1);
 			expect(stored?.taskIds).toEqual(["t1", "t2"]);
+			// The persisted index is *refreshed*, not only inserted: the restoration
+			// section renders from the index, so a stale entry would tell the model
+			// `plan-a v1` after the plan had moved to v2.
+			const service2 = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(service2?.plans.filter((entry) => entry.planId === "plan-a").map((entry) => entry.version)).toEqual([2]);
 		} finally {
 			await runtime.close();
 		}
@@ -205,22 +250,149 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
-	it("refuses a dispatch while a related question is open (AC-03)", async () => {
+	it("refuses a dispatch while a question blocking the whole request is open (AC-03)", async () => {
 		const { runtime, service, dispatched } = await runScript(
 			[
-				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"], relatedQuestionIds: ["q-1"] } }],
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
 				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
 			],
 			{ seededQuestions: ["q-1"] },
 		);
 		try {
-			// A question is open for this request: the dispatch must be refused even
-			// though the plan version is correct.
+			// A question with no blocking scope blocks the whole request.
 			await runtime.harness.commit(async (tx) => {
 				const state = await tx.doc(AgentClarificationDoc, 1 as never, "req-plan", { requestId: "req-plan" });
 				state.questions = [...state.questions, { questionId: "q-1", question: "which file?", reason: "ambiguous", blockingScope: [], askedAt: 1 }];
 			}, context);
 			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("lets an independent task dispatch while a scoped question blocks only another (AC-03)", async () => {
+		// AC-03: "独立不受影响任务可执行". A question scoped to task t1 must not stop
+		// a batch that dispatches t2. The model's `relatedQuestionIds` is deliberately
+		// absent here, and it would not help: the question's own persisted scope is
+		// the authority, so a model cannot unblock work by declining to list it.
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1", "t2"] } }],
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t2")] } }],
+		]);
+		try {
+			await runtime.harness.commit(async (tx) => {
+				const state = await tx.doc(AgentClarificationDoc, 1 as never, "req-plan", { requestId: "req-plan" });
+				state.questions = [...state.questions, { questionId: "q-1", question: "which file?", reason: "ambiguous", blockingScope: ["t1"], askedAt: 1 }];
+			}, context);
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+			expect(dispatched[0]?.map((task) => task.id)).toEqual(["t2"]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses a task the scoped question names even when the plan omits it (AC-03)", async () => {
+		// The inverse, and the reason the scope is authoritative: a model that drops
+		// the question from `relatedQuestionIds` must not thereby unblock the task the
+		// question itself says it blocks.
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+		]);
+		try {
+			await runtime.harness.commit(async (tx) => {
+				const state = await tx.doc(AgentClarificationDoc, 1 as never, "req-plan", { requestId: "req-plan" });
+				state.questions = [
+					...state.questions,
+					{ questionId: "q-1", question: "which file?", reason: "ambiguous", blockingScope: ["t1"], askedAt: 1 },
+				];
+			}, context);
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses a plan written for a superseded requirement version (AC-03, AC-04)", async () => {
+		// A plan's own `version` says nothing about *which goal* it serves. The plan
+		// is saved bound to the requirement as it stands, so after the user restates
+		// the requirement the stored plan and the active requirement disagree — and
+		// `dispatch_tasks` refuses on exactly that disagreement.
+		//
+		// The dispatch is held behind a gate rather than sequenced by turn counting:
+		// the harness decides when the model speaks again, and a router that indexed
+		// its script by provider request let the dispatch fire during the save run,
+		// which asserted the test's own bookkeeping instead of the contract.
+		const gate = { open: false };
+		const saved = { done: false };
+		const dispatched: string[][] = [];
+		const router: FauxResponseFactory = () => {
+			if (!saved.done) {
+				saved.done = true;
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-a", goals: ["old goal"], taskIds: ["t1"] }, { id: "save-1" })], { stopReason: "toolUse" });
+			}
+			if (!gate.open) return fauxAssistantMessage([fauxText("waiting for the user to restate the requirement")]);
+			return fauxAssistantMessage([fauxToolCall("dispatch_tasks", { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] }, { id: "dispatch-1" })], { stopReason: "toolUse" });
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		const root = await openRoot(runtime);
+		runtime.harness.resume();
+		const service = await openMainService({
+			harness: runtime.harness,
+			registry: runtime.registry,
+			context,
+			conversationId: root.id,
+			dispatch: async ({ tasks }) => {
+				dispatched.push(tasks.map((task) => task.id));
+				return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+			},
+			now: () => 1_700_000_000_000,
+		});
+		try {
+			// Round 1: the model saves the plan while the requirement is v1.
+			const first = await service.submitUserInput({ text: "plan the work", requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const stored = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context);
+			expect(stored?.requestId).toBe("req-plan");
+			expect(stored?.requestVersion).toBe(1);
+
+			// The user restates the requirement: the active request moves to v2.
+			const restated = await service.submitUserInput({
+				text: "actually, do the other thing",
+				requestId: "req-plan",
+				expectedRequestVersion: 1,
+			});
+			expect(restated.kind).toBe("request");
+			if (restated.kind !== "request") return;
+			expect(restated.requestVersion).toBe(2);
+			await restated.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			// Still gated: the model has had no chance to dispatch yet.
+			expect(dispatched).toHaveLength(0);
+
+			// Now the model dispatches the plan it saved — against requirement v2. The
+			// nudge re-states the *same* request, so the active requirement stays v2.
+			gate.open = true;
+			const third = await service.submitUserInput({
+				text: "go ahead",
+				requestId: "req-plan",
+				expectedRequestVersion: 2,
+			});
+			if (third.kind !== "request") throw new Error("expected a request");
+			expect(third.requestVersion).toBe(3);
+			await third.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The plan is still bound to v1 while the active requirement is at v3, and
+			// the executor was never reached.
+			expect((await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context))?.requestVersion).toBe(1);
+			expect((await service.readRequest()).requestVersion).toBe(3);
 			expect(dispatched).toHaveLength(0);
 		} finally {
 			await runtime.close();
@@ -283,7 +455,11 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
-	it("keeps the plan readable across a close and reopen (AC-03)", async () => {
+	it("keeps the plans listed by the service across a close and reopen (AC-03)", async () => {
+		// The old test read the plan document directly by a key the test already
+		// knew, which proved nothing about the shared service coming back. This one
+		// reopens through `openMainService` and reads its public list: an in-memory
+		// index loses every plan on reopen, which is exactly what was wrong before.
 		const first = await runScript([[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["survive"], taskIds: ["t1"] } }]]);
 		try {
 			await drive(first.runtime, first.service);
@@ -293,9 +469,23 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 
 		const second = await openProbe({ databasePath, provider: "faux", fauxResponses: ["ok"] });
 		try {
-			const stored = await second.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context);
-			expect(stored?.version).toBe(1);
-			expect(stored?.goals).toEqual(["survive"]);
+			const root = await openRoot(second);
+			second.harness.resume();
+			const reopened = await openMainService({
+				harness: second.harness,
+				registry: second.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+			// The active request survived, and so did its plan list.
+			const view = await reopened.readRequest();
+			expect(view.requestId).toBe("req-plan");
+			expect(view.plans.map((plan) => plan.planId)).toEqual(["plan-a"]);
+			expect(view.plans[0]?.goals).toEqual(["survive"]);
+			expect(view.plans[0]?.requestId).toBe("req-plan");
+			await reopened.close();
 		} finally {
 			await second.close();
 		}
@@ -316,6 +506,305 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect((await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context))?.version).toBe(2);
 			// And dispatching the superseded version 1 reached no executor.
 			expect(dispatched).toHaveLength(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("does not execute a dispatch twice when the call is replayed (AC-03)", async () => {
+		// `replay: "safe"` is not exactly-once: the locked Harness re-executes a
+		// call that is replayed after an interruption. The receipt is what makes the
+		// replay report the result it already produced instead of dispatching again.
+		//
+		// The replay is driven at the *tool* boundary, with the same call identity —
+		// the tool task id and the call id, which is what a replay repeats. (A second
+		// `submitUserInput` would be deduplicated by the Harness's submission key
+		// before any tool ran, which is why it proved nothing.)
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+		]);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+
+			// The identity the original call recorded: `dispatch:<taskId>:<callId>`.
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = doc?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt).toBeDefined();
+			const [kind, taskId, ...callParts] = receipt!.opKey.split(":");
+			expect(kind).toBe("dispatch");
+
+			// Re-execute the *same* call through the extension, with the same identity a
+			// replay would carry.
+			const extension = createMainExtension({
+				activeRequest: async () => ({ requestId: "req-plan", requestVersion: 1 }),
+				dispatch: async ({ tasks }) => {
+					(dispatched as TaskSpec[][]).push([...tasks]);
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				readOperation: async (opKey) => {
+					const found = doc?.receipts.find((entry) => entry.opKey === opKey);
+					return found === undefined ? undefined : { result: found.result, control: found.control };
+				},
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const dispatch = extension.tools?.find((tool) => tool.name === "dispatch_tasks");
+			expect(dispatch).toBeDefined();
+			const api = {
+				taskId: taskId as never,
+				callId: callParts.join(":"),
+				conversationId: 1 as never,
+				commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+			};
+			const replayed = await dispatch!.execute(
+				{ planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } as never,
+				api as never,
+				context,
+			);
+			expect(replayed.isError).toBeFalsy();
+			expect(JSON.stringify(replayed.output)).toContain("dispatched plan plan-a");
+			// The executor was not reached a second time.
+			expect(dispatched).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("reports a dispatch that was begun but never finished instead of running it again (AC-03)", async () => {
+		// The window `replay: "safe"` leaves open: the executor ran, the process died
+		// before the receipt was written. The begun-but-unfinished marker is what makes
+		// a replay report that instead of dispatching a second time.
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+		]);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+			// The identity the original call recorded, so the replay repeats it exactly.
+			const before = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = before?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt).toBeDefined();
+			const [, taskId, ...callParts] = receipt!.opKey.split(":");
+
+			// Simulate the crash: drop the finished result, leaving only the start
+			// marker the tool writes before the executor runs.
+			await runtime.harness.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, 1 as never);
+				doc.receipts = doc.receipts.map((entry) => (entry.opKey === receipt!.opKey ? { opKey: entry.opKey, at: entry.at } : entry));
+			}, context);
+			const after = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(after?.receipts.find((entry) => entry.opKey === receipt!.opKey)?.result).toBeUndefined();
+
+			const extension = createMainExtension({
+				activeRequest: async () => ({ requestId: "req-plan", requestVersion: 1 }),
+				dispatch: async ({ tasks }) => {
+					(dispatched as TaskSpec[][]).push([...tasks]);
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				readOperation: async (opKey) => {
+					const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+					const found = doc?.receipts.find((entry) => entry.opKey === opKey);
+					return found === undefined ? undefined : { result: found.result, control: found.control };
+				},
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const dispatch = extension.tools?.find((tool) => tool.name === "dispatch_tasks");
+			const api = {
+				taskId: taskId as never,
+				callId: callParts.join(":"),
+				conversationId: 1 as never,
+				commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+			};
+			const replayed = await dispatch!.execute(
+				{ planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } as never,
+				api as never,
+				context,
+			);
+			expect(replayed.isError).toBe(true);
+			expect(JSON.stringify(replayed.output)).toContain("may have partially run");
+			// And it did not run the batch again.
+			expect(dispatched).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("ends the run when the question shares its round with another tool (AC-02)", async () => {
+		// The reason `handoff` replaced `terminate`: `terminate` fires only when
+		// *every* call of the round asks for it, so one sibling call silently kept
+		// the run going. `handoff` ends the run from any single call, which is what
+		// AC-02's "问题结束当前模型轮次" asks for. The sibling still runs — the
+		// control is applied at the boundary, after the round's tools are terminal.
+		const { runtime, service, requests } = await runScript([
+			[
+				{ name: "request_clarification", arguments: { question: "Which file?", reason: "two files match" } },
+				{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } },
+			],
+		]);
+		try {
+			await drive(runtime, service);
+			// Exactly one provider request: the round ended, and no second turn ran.
+			expect(requests).toHaveLength(1);
+			// The question is open and the plan was saved — both happened in that one
+			// round, and neither was lost to the reset.
+			expect((await service.readRequest()).openQuestionIds).toHaveLength(1);
+			expect((await service.readRequest()).plans.map((plan) => plan.planId)).toEqual(["plan-a"]);
+			// The conversation is still the same one, and the handoff left a reset
+			// point in it rather than starting a new conversation.
+			const entries = await (await runtime.harness.conversation(1 as never, context))!.entries({ order: "ascending" }, 200, undefined, context);
+			expect(entries.items.some((entry) => entry.kind === "pi.reset")).toBe(true);
+			expect(entries.items.some((entry) => entry.kind === "pi.tool-result")).toBe(true);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("gives the next round the request, the answer and the open questions (AC-01, AC-02)", async () => {
+		// A handoff *replaces* the model's context, so anything it omits is context
+		// the next round cannot see. The payload is therefore asserted on the reset
+		// entry itself — the thing the next generation actually starts from.
+		const { runtime, service } = await runScript([
+			[{ name: "request_clarification", arguments: { question: "Which file?", reason: "two files match" } }],
+		]);
+		try {
+			await drive(runtime, service, `${MARKER2} plan the work`);
+			const entries = await (await runtime.harness.conversation(1 as never, context))!.entries({ order: "ascending" }, 200, undefined, context);
+			const reset = entries.items.find((entry) => entry.kind === "pi.reset");
+			expect(reset).toBeDefined();
+			// The payload the program built, as the model will receive it.
+			const payload = reset?.model?.[0]?.content;
+			expect(typeof payload).toBe("string");
+			const text = typeof payload === "string" ? payload : "";
+			// The request as the user actually typed it.
+			expect(text).toContain(MARKER2);
+			expect(text).toContain("req-plan v1");
+			// The question and why it was asked.
+			expect(text).toContain("Which file?");
+			expect(text).toContain("two files match");
+			// And it did not invent an answer the user never gave.
+			expect(text).toContain("has not answered yet");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("carries a recorded answer in the handoff the next round reads (AC-01, AC-02)", async () => {
+		// The other half of the same contract: once the user HAS answered, the next
+		// round must start from that answer rather than re-asking. The payload is
+		// read from the reset entry, which is where a reset context begins.
+		const gate = { answered: false };
+		const asked = { done: false };
+		const router: FauxResponseFactory = () => {
+			if (!asked.done) {
+				asked.done = true;
+				return fauxAssistantMessage([fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: "ask-1" })], { stopReason: "toolUse" });
+			}
+			if (!gate.answered) return fauxAssistantMessage([fauxText("waiting for the user")]);
+			return fauxAssistantMessage([fauxText("the user answered, so I can plan now")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER2} plan the work`, requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+
+			// The user answers, and the next round is unlocked.
+			const answer = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
+			expect(answer.kind).toBe("answer");
+			if (answer.kind !== "answer") return;
+			await answer.submission.wait(context);
+			// The handoff for *this* run was built before the answer existed, so the
+			// next round's payload is read after the gate opens.
+			gate.answered = true;
+			const second = await service.submitUserInput({ text: `${MARKER2} now plan it`, requestId: "req-plan", expectedRequestVersion: 1 });
+			if (second.kind !== "request") throw new Error("expected a request");
+			await second.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The answer reached the model, and it is not the question any more.
+			expect((await service.readRequest()).openQuestionIds).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("re-renders the restoration facts from committed state before every request (AC-01, AC-02)", async () => {
+		// The handoff payload is a snapshot taken when the question tool completed; a
+		// sibling tool in the same round can write after it. The restoration section
+		// is therefore asserted on the *provider request itself* — rendered from
+		// whatever is committed at preparation time — rather than only on the reset
+		// entry the payload landed in.
+		//
+		// The proof that it is live state and not a snapshot: turn 1 saves a plan,
+		// turn 2 asks a question, and the round prepared *after* the user's answer
+		// must show both — the plan (written a round earlier) and the answer (written
+		// between the two runs).
+		const requests: string[] = [];
+		let turn = 0;
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			turn += 1;
+			if (turn === 1) {
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-a", goals: ["g"], taskIds: ["t1"] }, { id: "call-1" })], { stopReason: "toolUse" });
+			}
+			if (turn === 2) {
+				return fauxAssistantMessage([fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: "call-2" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("nothing left to do")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+
+			const outcome = await service.submitUserInput({ text: `${MARKER2} plan the work`, requestId: "req-plan" });
+			if (outcome.kind !== "request") throw new Error("expected a request");
+			await outcome.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+
+			// The section as it stood while the question was open, on the request that
+			// asked it: the plan from the previous round is already visible, which a
+			// payload-only view of *that* round would not show.
+			const asking = requests[requests.length - 1] ?? "";
+			expect(asking).toContain("main-restoration");
+			expect(asking).toContain("Request req-plan v1");
+			expect(asking).toContain(MARKER2);
+			expect(asking).toContain("plan-a v1");
+
+			// Now the user answers, and the next run is prepared. Its request must carry
+			// the request, the recorded answer and the plan — read from committed state,
+			// not from the earlier payload.
+			requests.length = 0;
+			const answer = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
+			expect(answer.kind).toBe("answer");
+			if (answer.kind !== "answer") return;
+			await answer.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			const after = requests[requests.length - 1] ?? "";
+			expect(after).toContain("Request req-plan v1");
+			expect(after).toContain("Use report.txt");
+			expect(after).toContain("plan-a v1");
+			expect(after).toContain("Open questions: (none)");
 		} finally {
 			await runtime.close();
 		}

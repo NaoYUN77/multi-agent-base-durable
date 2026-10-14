@@ -18,13 +18,11 @@ work you can finish in this conversation.
 
 ## Asking
 
-When you call `request_clarification`, that round ends and the user answers later in
-this same conversation. Because the round only ends when every call of the round asks
-to stop, do not pair the question with any other tool call — ask the question alone.
-
-If the user's answer is still not enough to proceed, ask again. Receiving an answer is
-not the same as the answer being sufficient; you decide that, and the application
-records your judgement.
+When you call `request_clarification`, this run ends and the user answers later in
+this same conversation. The application then hands you the request, its materials and
+any recorded answer at the start of the next run, so you do not lose track of what
+the user asked for. If you still cannot proceed, ask again — receiving an answer is
+not the same as the answer being sufficient, and only the application decides that.
 
 ## Planning
 

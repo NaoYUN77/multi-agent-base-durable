@@ -19,6 +19,16 @@ export type Plan = {
 	readonly planId: string;
 	/** Starts at 1 and increases by exactly one per accepted save. */
 	readonly version: number;
+	/**
+	 * The request this plan was written for. A plan is a plan *for a requirement*,
+	 * and without this the plan's own `version` is the only thing a dispatcher can
+	 * check — so a plan written against requirement v1 would still execute after
+	 * the user restated the requirement as v2, doing the old goal under the new
+	 * one. Bound by the program at save time; a model payload has no field for it.
+	 */
+	readonly requestId: string;
+	/** The requirement's business version when this plan was saved. */
+	readonly requestVersion: number;
 	readonly goals: string[];
 	/** Task ids the plan dispatches. They must exist in the batch that executes it. */
 	readonly taskIds: string[];
@@ -29,7 +39,7 @@ export type Plan = {
 	readonly savedAt: number;
 };
 
-const KNOWN_FIELDS: readonly string[] = ["schemaVersion", "planId", "version", "goals", "taskIds", "relatedQuestionIds", "supersedes", "savedAt"];
+const KNOWN_FIELDS: readonly string[] = ["schemaVersion", "planId", "version", "requestId", "requestVersion", "goals", "taskIds", "relatedQuestionIds", "supersedes", "savedAt"];
 
 /**
  * Validate one plan document. No IO, pure, idempotent: the same bytes always
@@ -44,6 +54,8 @@ export function validatePlan(input: unknown): ContractValidation<Plan> {
 	const schemaVersion = readSchemaVersion(holder, "$", collect, [PLAN_SCHEMA_VERSION]);
 	const planId = readStableId(holder, "planId", "$.planId", collect);
 	const version = readPositiveInteger(holder, "version", "$.version", collect);
+	const requestId = readStableId(holder, "requestId", "$.requestId", collect);
+	const requestVersion = readPositiveInteger(holder, "requestVersion", "$.requestVersion", collect);
 	const goals = readStringList(holder.goals, "$.goals", collect);
 	const taskIds = readIdArray(holder, "taskIds", "$.taskIds", collect) ?? [];
 	const relatedQuestionIds = readIdArray(holder, "relatedQuestionIds", "$.relatedQuestionIds", collect) ?? [];
@@ -54,13 +66,22 @@ export function validatePlan(input: unknown): ContractValidation<Plan> {
 	if (supersedes !== undefined && version !== undefined && supersedes >= version) {
 		collect.add("plan_supersedes_invalid", "$.supersedes", `a plan may only supersede a lower version (version ${version}, supersedes ${supersedes})`);
 	}
-	if (schemaVersion === undefined || planId === undefined || version === undefined || savedAt === undefined) {
+	if (
+		schemaVersion === undefined ||
+		planId === undefined ||
+		version === undefined ||
+		requestId === undefined ||
+		requestVersion === undefined ||
+		savedAt === undefined
+	) {
 		return collect.finish(undefined as unknown as Plan);
 	}
 	return collect.finish({
 		schemaVersion,
 		planId,
 		version,
+		requestId,
+		requestVersion,
 		goals,
 		taskIds,
 		relatedQuestionIds,

@@ -18,10 +18,9 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
 import { AgentClarificationDoc, AgentRequestDoc } from "../src/agent/contracts/documents.ts";
-import { composeModelResolution } from "../src/agent/contracts/clarification.ts";
+import { composeModelResolution, openQuestionIds, validateClarificationState } from "../src/agent/contracts/clarification.ts";
 import { MainServiceDoc } from "../src/agent/main/service-doc.ts";
 import { deriveQuestionId, stableSlug } from "../src/agent/main/request-id.ts";
-import { openQuestionIds } from "../src/agent/contracts/clarification.ts";
 import { openMainService } from "../src/service/main-service.ts";
 
 /** A stand-in for whatever the model would do when it is not asking a question. */
@@ -66,19 +65,36 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 	});
 
 	/**
-	 * A router that asks a question on the first turn and answers plainly on any
-	 * later turn. It records every request, so a second turn is *observed* rather
-	 * than inferred.
+	 * A router that asks a question on a request and answers plainly on anything
+	 * else. It records every request, so a second turn is *observed* rather than
+	 * inferred.
+	 *
+	 * The turn is decided by the newest user input, not by whether the transcript
+	 * already holds a tool result: in one conversation a *second request* also
+	 * follows a tool result, and keying on that would make it look like a follow-up
+	 * to the first and never get asked about. A request carries the marker, an
+	 * answer does not — and the marker is what tells the two apart.
 	 */
 	const askingRouter: FauxResponseFactory = (request) => {
 		requests.push(flatten(request.messages));
-		// A tool result in the transcript means the ask round already happened.
-		const sawToolResult = request.messages.some((message) => message.role === "toolResult");
-		if (sawToolResult) return fauxAssistantMessage([fauxText("answered after the question")]);
-		return fauxAssistantMessage(
-			[fauxToolCall("request_clarification", { question: "Which file should I use?", reason: "two files match", blockedTaskIds: [] }, { id: "ask-1" })],
-			{ stopReason: "toolUse" },
-		);
+		let newest = -1;
+		for (let index = request.messages.length - 1; index >= 0; index--) {
+			if (request.messages[index]!.role === "user") {
+				newest = index;
+				break;
+			}
+		}
+		const isRequest = newest >= 0 && flatten([request.messages[newest]!]).includes(MARKER);
+		// Once this round has produced a tool result the question has been asked;
+		// asking again would loop.
+		const askedThisRound = request.messages.slice(newest + 1).some((message) => message.role === "toolResult");
+		if (isRequest && !askedThisRound) {
+			return fauxAssistantMessage(
+				[fauxToolCall("request_clarification", { question: "Which file should I use?", reason: "two files match", blockedTaskIds: [] }, { id: "ask-1" })],
+				{ stopReason: "toolUse" },
+			);
+		}
+		return fauxAssistantMessage([fauxText("answered after the question")]);
 	};
 
 	/** Open a service over a fresh database, with the asking router installed. */
@@ -127,14 +143,19 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 		}
 	});
 
-	it("derives the question id from the program's own round count, not the clock", async () => {
-		// Pure: the same round and question always produce the same id, so a replay
-		// after an interruption resumes the same question instead of asking twice.
-		expect(deriveQuestionId(1, "Which file?")).toBe(deriveQuestionId(1, "Which file?"));
-		expect(deriveQuestionId(1, "Which file?")).not.toBe(deriveQuestionId(2, "Which file?"));
+	it("derives the question id from the request and the program's round count, not the clock", async () => {
+		// Pure: the same request, round and question always produce the same id, so a
+		// replay after an interruption resumes the same question instead of asking
+		// twice.
+		expect(deriveQuestionId("req-1", 1, "Which file?")).toBe(deriveQuestionId("req-1", 1, "Which file?"));
+		expect(deriveQuestionId("req-1", 1, "Which file?")).not.toBe(deriveQuestionId("req-1", 2, "Which file?"));
+		// Two requests that ask the same words get different questions. A question id
+		// scoped only by its text would collide across requests on one conversation,
+		// and the second request's answer would dedup against the first.
+		expect(deriveQuestionId("req-a", 1, "Which file?")).not.toBe(deriveQuestionId("req-b", 1, "Which file?"));
 		// Two long questions that share an opening still get distinct ids.
-		const a = deriveQuestionId(1, "Which of the two candidate files should I read first, given the size?");
-		const b = deriveQuestionId(1, "Which of the two candidate files should I read first, given the age?");
+		const a = deriveQuestionId("req-1", 1, "Which of the two candidate files should I read first, given the size?");
+		const b = deriveQuestionId("req-1", 1, "Which of the two candidate files should I read first, given the age?");
 		expect(a).not.toBe(b);
 		expect(stableSlug("Which file?")).toMatch(/^which-file-[0-9a-f]{8}$/);
 	});
@@ -199,15 +220,18 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			const questionId = (await service.readRequest()).openQuestionIds[0]!;
 			requests.length = 0;
 
-			const answer = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId });
+			const answer = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
 			expect(answer.kind).toBe("answer");
 			if (answer.kind !== "answer") return;
 			const settled = await answer.submission.wait(context);
 			await runtime.harness.waitForIdle(context);
 
 			// The answer reached the model as a real request in the SAME conversation.
-			expect(requests).toHaveLength(1);
-			expect(requests[0]).toContain("Use report.txt");
+			// Not asserted as "exactly one request": the answer's own round is free to
+			// take more than one provider turn, and what matters is that the model saw
+			// the words the user typed.
+			expect(requests.length).toBeGreaterThan(0);
+			expect(requests.some((request) => request.includes("Use report.txt"))).toBe(true);
 
 			// The recorded answer is application-sourced and judged sufficient, so the
 			// question no longer blocks.
@@ -249,7 +273,7 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			expect(view.requestId).toBe("req-1");
 			expect(view.openQuestionIds).toEqual([questionId]);
 			// And it can still be answered.
-			const answer = await second.service.submitUserInput({ text: "Use report.txt", answerTo: questionId });
+			const answer = await second.service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
 			expect(answer.kind).toBe("answer");
 		} finally {
 			await second.runtime.close();
@@ -385,7 +409,7 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			// question the first turn asked is still open, so it is answered first:
 			// otherwise the restatement is refused, which the next test covers.
 			const questionId = (await service.readRequest()).openQuestionIds[0]!;
-			const answered = await service.submitUserInput({ text: "report.txt", answerTo: questionId });
+			const answered = await service.submitUserInput({ text: "report.txt", answerTo: questionId, sufficient: true });
 			expect(answered.kind).toBe("answer");
 			if (answered.kind !== "answer") return;
 			await answered.submission.wait(context);
@@ -425,7 +449,7 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			// Settle the question first, so the refusal below is about the version and
 			// not about the open clarification.
 			const questionId = (await service.readRequest()).openQuestionIds[0]!;
-			const answered = await service.submitUserInput({ text: "report.txt", answerTo: questionId });
+			const answered = await service.submitUserInput({ text: "report.txt", answerTo: questionId, sufficient: true });
 			if (answered.kind !== "answer") throw new Error("expected an answer");
 			await answered.submission.wait(context);
 			await runtime.harness.waitForIdle(context);
@@ -435,6 +459,207 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			if (stale.kind !== "refused") return;
 			expect(stale.reason).toContain("stale request version");
 		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses an answer with no sufficiency judgement, and leaves the question open (AC-02, AC-04)", async () => {
+		// There is no default. "The user replied" is not "the reply is sufficient"
+		// (contract §"Main Agent 合同"), so an input that answers without a judgement
+		// is refused rather than treated as settled. Omitting the judgement used to
+		// default to `true`, which unblocked work on a vague reply.
+		const { runtime, service } = await openAsking();
+		try {
+			const first = await service.submitUserInput({ text: `${MARKER} please count`, requestId: "req-1" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+
+			const vague = await service.submitUserInput({ text: "I do not know which file", answerTo: questionId });
+			expect(vague.kind).toBe("refused");
+			if (vague.kind !== "refused") return;
+			expect(vague.reason).toContain("sufficiency judgement");
+
+			// Nothing was recorded and the question still blocks.
+			const stored = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-1", context);
+			expect(stored?.answers).toHaveLength(0);
+			expect(openQuestionIds(stored!)).toEqual([questionId]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("accepts a follow-up answer after an insufficient one and unblocks once sufficient (AC-01, AC-02)", async () => {
+		// The insufficient→sufficient chain, end to end: the first reply is recorded
+		// but does not resolve the question, and the follow-up REPLACES it (the
+		// contract holds exactly one answer per question — a duplicate is a
+		// validation failure) and finally resolves it.
+		const { runtime, service } = await openAsking();
+		try {
+			const first = await service.submitUserInput({ text: `${MARKER} please count`, requestId: "req-1" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+
+			const vague = await service.submitUserInput({ text: "not sure, you decide", answerTo: questionId, sufficient: false });
+			expect(vague.kind).toBe("answer");
+			if (vague.kind !== "answer") throw new Error("expected an answer");
+			await vague.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect((await service.readRequest()).openQuestionIds).toEqual([questionId]);
+
+			// Re-submitting the *same logical answer* while the question is still open
+			// is a replay, not a new input: the attempt count does not grow, and the
+			// submission key is unchanged so the Harness dedups it rather than the model
+			// being asked to consider the same vague reply twice.
+			requests.length = 0;
+			const repeated = await service.submitUserInput({ text: "not sure, you decide", answerTo: questionId, sufficient: false });
+			expect(repeated.kind).toBe("answer");
+			if (repeated.kind !== "answer") throw new Error("expected an answer");
+			await repeated.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(requests).toHaveLength(0);
+			expect((await runtime.harness.snapshot(MainServiceDoc, 1 as never, context))?.answerAttempts).toHaveLength(1);
+
+			// The follow-up must reach the model as its own input, not a replay of the
+			// first answer.
+			requests.length = 0;
+			const precise = await service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
+			expect(precise.kind).toBe("answer");
+			if (precise.kind !== "answer") throw new Error("expected an answer");
+			await precise.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			expect(requests.some((request) => request.includes("Use report.txt"))).toBe(true);
+			expect((await service.readRequest()).openQuestionIds).toEqual([]);
+
+			// Exactly one stored answer (the sufficient one), and both attempts are
+			// kept in the service's own log rather than silently discarded.
+			const stored = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-1", context);
+			expect(stored?.answers).toHaveLength(1);
+			expect(stored?.answers[0]?.text).toBe("Use report.txt");
+			expect(stored?.answers[0]?.sufficient).toBe(true);
+			expect(validateClarificationState(stored!).ok).toBe(true);
+			const service2 = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(service2?.answerAttempts.map((attempt) => attempt.text)).toEqual(["not sure, you decide", "Use report.txt"]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("keeps two requests with the same question from colliding on one answer (AC-01, AC-04)", async () => {
+		// Two requests whose first question is word-for-word identical. The question
+		// id and the answer key are both derived per request, so answering the second
+		// one cannot dedup against the first — and it must actually reach the model.
+		const { runtime, service } = await openAsking();
+		try {
+			// Request A asks, and A's question is answered so A is closed out. The
+			// service refuses a plain input while a question is open (AC-04's "a new
+			// input is not silently reinterpreted"), so A is settled first.
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionA = (await service.readRequest()).openQuestionIds[0]!;
+			expect(questionA).toContain("req-a");
+			const answeredA = await service.submitUserInput({ text: "report.txt", answerTo: questionA, sufficient: true });
+			if (answeredA.kind !== "answer") throw new Error("expected an answer");
+			await answeredA.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// Request B, whose model asks the exact same words as A's did. Two
+			// requests, two questions, one conversation.
+			const second = await service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-b" });
+			if (second.kind !== "request") throw new Error("expected a request");
+			await second.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionB = (await service.readRequest()).openQuestionIds[0]!;
+			expect(questionB).not.toBe(questionA);
+			expect(questionB).toContain("req-b");
+
+			// Answering B's question must reach the model. An answer key scoped only by
+			// the question text would collide with A's answered question and be
+			// deduplicated away — the model would never hear the reply.
+			requests.length = 0;
+			const answer = await service.submitUserInput({ text: "Use report.txt", answerTo: questionB, sufficient: true });
+			expect(answer.kind).toBe("answer");
+			if (answer.kind !== "answer") throw new Error("expected an answer");
+			await answer.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(requests.some((request) => request.includes("Use report.txt"))).toBe(true);
+
+			// The answer landed on request B's document, and A's is untouched.
+			const b = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-b", context);
+			expect(b?.answers.map((entry) => entry.questionId)).toEqual([questionB]);
+			expect(openQuestionIds(b!)).toEqual([]);
+			const a = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-a", context);
+			expect(a?.answers).toHaveLength(1);
+			expect(openQuestionIds(a!)).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("queues, lists and withdraws one input without disturbing another (AC-05)", async () => {
+		// The queue is a persisted record, so it can be listed; and withdrawing one
+		// input must not withdraw the rest. Two different requests that say the same
+		// words are two inputs, so the queue is keyed on identity, not text.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const parkingRouter: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: parkingRouter });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER} go`, requestId: "req-busy" });
+			if (first.kind !== "request") throw new Error("expected a request");
+
+			// Two more inputs, different requests, identical text.
+			const queuedA = await service.submitUserInput({ text: "same words", requestId: "req-q1" });
+			const queuedB = await service.submitUserInput({ text: "same words", requestId: "req-q2" });
+			expect(queuedA.kind).toBe("queued");
+			expect(queuedB.kind).toBe("queued");
+			if (queuedA.kind !== "queued" || queuedB.kind !== "queued") return;
+
+			// Both are listed, and they are two distinct records.
+			const queue = await service.readQueue();
+			expect(queue).toHaveLength(2);
+			expect(new Set(queue.map((entry) => entry.requestId))).toEqual(new Set(["req-q1", "req-q2"]));
+
+			// Withdraw one. The other survives.
+			const withdrawn = await service.withdrawQueued(queue[0]!.submissionId);
+			expect(withdrawn.withdrawn).toBe(true);
+			expect(await service.readQueue()).toHaveLength(1);
+			expect((await service.readQueue())[0]!.requestId).toBe("req-q2");
+
+			// The consume boundary: once the round that was running settles, the
+			// Harness places the surviving input and the queue must stop reporting it.
+			// Without reconciliation the list only ever grew, and a caller could try to
+			// withdraw an input that had already been consumed.
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(await service.readQueue()).toHaveLength(0);
+			// And withdrawing a consumed input is refused, not reported as a withdrawal.
+			const late = await service.withdrawQueued(queue[1]!.submissionId);
+			expect(late.withdrawn).toBe(false);
+		} finally {
+			release?.();
 			await runtime.close();
 		}
 	});

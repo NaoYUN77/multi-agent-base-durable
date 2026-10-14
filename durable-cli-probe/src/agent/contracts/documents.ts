@@ -75,7 +75,20 @@ export const AgentPlanDoc = defineDocFamily<Plan, { readonly planId: string }>({
 	history: "latest",
 	fork: "initial",
 	family: true,
-	initial: (seed) => ({ schemaVersion: PLAN_SCHEMA_VERSION, planId: seed.planId, version: 0, goals: [], taskIds: [], relatedQuestionIds: [], savedAt: 0 }),
+	// `requestId` is empty and `requestVersion` 0 until the program binds the
+	// requirement at save time: an unbound plan is one a dispatcher must refuse, not
+	// one it may execute against whatever requirement happens to be active.
+	initial: (seed) => ({
+		schemaVersion: PLAN_SCHEMA_VERSION,
+		planId: seed.planId,
+		version: 0,
+		requestId: "",
+		requestVersion: 0,
+		goals: [],
+		taskIds: [],
+		relatedQuestionIds: [],
+		savedAt: 0,
+	}),
 });
 
 /** The configuration snapshot a task actually ran with, written once. */
