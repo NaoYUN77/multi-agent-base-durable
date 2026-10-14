@@ -17,7 +17,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory 
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
-import { AgentClarificationDoc, AgentRequestDoc } from "../src/agent/contracts/documents.ts";
+import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../src/agent/contracts/documents.ts";
 import { composeModelResolution, openQuestionIds, validateClarificationState } from "../src/agent/contracts/clarification.ts";
 import { MainServiceDoc } from "../src/agent/main/service-doc.ts";
 import { deriveQuestionId, stableSlug } from "../src/agent/main/request-id.ts";
@@ -272,9 +272,18 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			// The pointer survived, and the question is still open.
 			expect(view.requestId).toBe("req-1");
 			expect(view.openQuestionIds).toEqual([questionId]);
-			// And it can still be answered.
+			// And it can still be answered — and the answer actually reaches the model.
+			// Asserting only that `submit` returned an answer would not show that the
+			// reopened conversation delivered it: the submission has to settle and the
+			// provider has to receive the words.
+			requests.length = 0;
 			const answer = await second.service.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
 			expect(answer.kind).toBe("answer");
+			if (answer.kind !== "answer") return;
+			await answer.submission.wait(context);
+			await second.runtime.harness.waitForIdle(context);
+			expect(requests.some((text) => text.includes("Use report.txt"))).toBe(true);
+			expect((await second.service.readRequest()).openQuestionIds).toEqual([]);
 		} finally {
 			await second.runtime.close();
 		}
@@ -715,6 +724,60 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			expect(view.requestId).toBe("req-busy");
 			expect(view.text).toBe(`${MARKER} go`);
 			expect(view.requestVersion).toBe(1);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("binds a queued input's identity to the run it starts, before any tool in that run (AC-01, AC-03)", async () => {
+		// The reviewer's ordering point: the Harness places a queued input and starts
+		// a run for it, and the service's pointer is only written on a later read. If a
+		// tool resolved the requirement from the pointer, the run's plan and dispatch
+		// would carry the *previous* request's identity. The run resolves the
+		// requirement from its own input instead, so the plan it saves names the queued
+		// request even though nothing has read the queue yet.
+		const requests: string[] = [];
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			// The run for the queued input saves a plan; the earlier run just answers.
+			const said = requests[requests.length - 1] ?? "";
+			if (said.includes("second request")) {
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-b", goals: ["B"], taskIds: ["t1"] }, { id: "b1" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			// A second request arrives while the first run is parked: it is queued.
+			const queued = await service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The plan the queued run saved is bound to req-b, not to req-a — without
+			// anyone having read the queue first.
+			const doc = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-b", context);
+			expect(doc?.requestId).toBe("req-b");
+			expect(doc?.goals).toEqual(["B"]);
 		} finally {
 			release?.();
 			await runtime.close();

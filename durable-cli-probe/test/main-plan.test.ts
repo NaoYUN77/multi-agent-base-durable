@@ -491,6 +491,58 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("refuses to let a second request take over a planId, and never lists another request's plan (AC-04, AC-05)", async () => {
+		// A plan document is keyed by `planId` alone, so two requests that both use one
+		// id share the document. The index says which request a plan was saved for, but
+		// the document is the authority: without an ownership check the second request
+		// silently takes over the first's plan, and the first's index entry then points
+		// at a document describing someone else's goals and tasks.
+		const runtime = await openProbe({
+			databasePath,
+			provider: "faux",
+			fauxRouter: (() => {
+				let turn = 0;
+				return () => {
+					turn += 1;
+					if (turn === 1) return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-a", goals: ["A goal"], taskIds: ["t1"] }, { id: "a1" })], { stopReason: "toolUse" });
+					if (turn === 2) return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-a", goals: ["B goal"], taskIds: ["t2"] }, { id: "b1" })], { stopReason: "toolUse" });
+					return fauxAssistantMessage([fauxText("nothing left to do")]);
+				};
+			})(),
+		});
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			// Request A saves plan-a.
+			const a = await service.submitUserInput({ text: "A work", requestId: "req-a" });
+			if (a.kind !== "request") throw new Error("expected a request");
+			await a.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect((await service.readRequest()).plans.map((plan) => plan.goals)).toEqual([["A goal"]]);
+
+			// Request B tries to take the same planId. It is refused, so A's document is
+			// not overwritten.
+			const b = await service.submitUserInput({ text: "B work", requestId: "req-b" });
+			if (b.kind !== "request") throw new Error("expected a request");
+			await b.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// B has no plans: the plan belongs to A, and the ownership check refused B's
+			// save rather than letting it take over.
+			expect((await service.readRequest()).requestId).toBe("req-b");
+			expect((await service.readRequest()).plans).toEqual([]);
+
+			// The document still describes A's goal.
+			const doc = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context);
+			expect(doc?.requestId).toBe("req-a");
+			expect(doc?.goals).toEqual(["A goal"]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("refuses to dispatch a superseded plan version (AC-03)", async () => {
 		// The contract's "saving is not permission to execute" rule, made concrete:
 		// the plan was saved and is real, but the version the model is dispatching
@@ -635,6 +687,95 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect(text).toContain("not a success");
 			// And it did not run the batch again.
 			expect(dispatched).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("replays a save whose receipt was lost as the original success, not a stale refusal (AC-02)", async () => {
+		// The window the reviewer named: the plan is committed but the process dies
+		// before its receipt lands. A `replay: "safe"` rerun then finds the plan at
+		// version 1 while the original call asked for version 0 — and would refuse the
+		// save that in fact succeeded. The receipt is written in the *same*
+		// transaction as the plan, so this window does not exist; the test proves it by
+		// replaying the same call identity and getting the original result back.
+		const { runtime, service } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+		]);
+		try {
+			await drive(runtime, service);
+			const before = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = before?.receipts.find((entry) => entry.opKey.startsWith("save-plan:"));
+			expect(receipt).toBeDefined();
+			const [, taskId, ...callParts] = receipt!.opKey.split(":");
+
+			// Replay the same call. The plan is already at version 1, so a naive
+			// re-decision would refuse; the receipt returns the original success.
+			const extension = createMainExtension({
+				activeRequest: async () => ({ requestId: "req-plan", requestVersion: 1 }),
+				dispatch: async () => [],
+				readOperation: async (opKey) => {
+					const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+					const found = doc?.receipts.find((entry) => entry.opKey === opKey);
+					return found === undefined ? undefined : { result: found.result, isError: found.isError, control: found.control };
+				},
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const save = extension.tools?.find((tool) => tool.name === "save_plan");
+			const api = {
+				taskId: taskId as never,
+				callId: callParts.join(":"),
+				conversationId: 1 as never,
+				commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+			};
+			const replayed = await save!.execute({ planId: "plan-a", goals: ["g"], taskIds: ["t1"] } as never, api as never, context);
+			expect(replayed.isError).toBeFalsy();
+			expect(JSON.stringify(replayed.output)).toContain("saved plan plan-a version 1");
+			// The plan did not advance a second version: the replay was a replay.
+			expect((await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-a", context))?.version).toBe(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("replays a refused save as an error, not an ordinary tool result (AC-02)", async () => {
+		// The reviewer's point about `isError`: a refusal that replays without its error
+		// flag reads to the model as a success. The flag travels with the receipt.
+		const { runtime, service } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["stale"], taskIds: ["t1"], expectedVersion: 0 } }],
+		]);
+		try {
+			await drive(runtime, service);
+			const before = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipts = before?.receipts.filter((entry) => entry.opKey.startsWith("save-plan:")) ?? [];
+			const refused = receipts.find((entry) => entry.isError === true);
+			expect(refused).toBeDefined();
+			expect(refused!.result).toContain("save_plan refused");
+			const [, taskId, ...callParts] = refused!.opKey.split(":");
+
+			const extension = createMainExtension({
+				activeRequest: async () => ({ requestId: "req-plan", requestVersion: 1 }),
+				dispatch: async () => [],
+				readOperation: async (opKey) => {
+					const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+					const found = doc?.receipts.find((entry) => entry.opKey === opKey);
+					return found === undefined ? undefined : { result: found.result, isError: found.isError, control: found.control };
+				},
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const save = extension.tools?.find((tool) => tool.name === "save_plan");
+			const api = {
+				taskId: taskId as never,
+				callId: callParts.join(":"),
+				conversationId: 1 as never,
+				commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+			};
+			const replayed = await save!.execute({ planId: "plan-a", goals: ["stale"], taskIds: ["t1"], expectedVersion: 0 } as never, api as never, context);
+			expect(replayed.isError).toBe(true);
+			expect(JSON.stringify(replayed.output)).toContain("save_plan refused");
 		} finally {
 			await runtime.close();
 		}
@@ -912,6 +1053,76 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			expect(requests.some((text) => text.includes("Use report.txt"))).toBe(true);
 			expect((await service.readRequest()).openQuestionIds).toEqual([]);
 			expect(dispatched).toEqual([["t1"]]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("ends the run when the model re-asks the same question after an insufficient answer (AC-02)", async () => {
+		// The branch the earlier chain test did not cover: after a vague reply the model
+		// asks the *same words* again. A question with that text is already recorded,
+		// so the re-ask used to hit the duplicate path and return bare text with no
+		// handoff — the run continued instead of waiting for the user. It must end the
+		// run exactly as a first ask does.
+		const requests: string[] = [];
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			let newest = -1;
+			for (let index = request.messages.length - 1; index >= 0; index--) {
+				if (request.messages[index]!.role === "user") {
+					newest = index;
+					break;
+				}
+			}
+			const said = newest >= 0 ? flatten([request.messages[newest]!]) : "";
+			const sawToolResult = request.messages.slice(newest + 1).some((message) => message.role === "toolResult");
+			if (sawToolResult) return fauxAssistantMessage([fauxText("nothing left to do")]);
+			// Both the first ask and the re-ask use the same words, which is the point.
+			if (said.includes("plan the work") || said.includes("not sure")) {
+				return fauxAssistantMessage([fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: `ask-${newest}` })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("nothing left to do")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+
+			const first = await service.submitUserInput({ text: `${MARKER2} plan the work`, requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+
+			// The vague reply: recorded, not sufficient, question stays open. The model's
+			// own run for this answer is where it re-asks — the service refuses a plain
+			// input while a question is open, so the re-ask cannot be a separate submit.
+			const vague = await service.submitUserInput({ text: "not sure", answerTo: questionId, sufficient: false });
+			if (vague.kind !== "answer") throw new Error("expected an answer");
+			await vague.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The question is still the same open question, and it is still answerable —
+			// a re-ask must not create a second, unanswerable copy.
+			const view = await service.readRequest();
+			expect(view.openQuestionIds).toEqual([questionId]);
+			const stored = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-plan", context);
+			expect(stored?.questions.filter((question) => question.question === "Which file?")).toHaveLength(1);
+			// And the re-ask ended its run rather than continuing the model round: the
+			// conversation holds a reset entry per ask (the first ask and the re-ask).
+			const entries = await (await runtime.harness.conversation(1 as never, context))!.entries({ order: "ascending" }, 200, undefined, context);
+			expect(entries.items.filter((entry) => entry.kind === "pi.reset").length).toBeGreaterThanOrEqual(2);
+			// The answer's own run took exactly one provider request: the re-ask ended
+			// it instead of letting the model speak again.
+			expect(requests.filter((text) => text.includes("not sure"))).toHaveLength(1);
 		} finally {
 			await runtime.close();
 		}

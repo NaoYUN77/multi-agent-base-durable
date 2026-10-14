@@ -37,6 +37,7 @@ import {
 	type ConversationId,
 	type Extension,
 	type ToolExecutionResult,
+	type Tx,
 } from "@earendil-works/pi-durable";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../contracts/documents.ts";
 import { openQuestionIds, validateClarificationState, type ClarificationState } from "../contracts/clarification.ts";
@@ -61,7 +62,7 @@ export type MainToolHost = {
 	 * `undefined` when the service has recorded none. A tool that needs a request
 	 * refuses rather than inventing a key.
 	 */
-	readonly activeRequest: () => Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined>;
+	readonly activeRequest: (tx?: Tx) => Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined>;
 	/**
 	 * Execute an admitted batch. Injected: this Issue uses a faux executor and
 	 * never creates a real sub-agent. Called *after* admission, so a refused
@@ -92,23 +93,39 @@ export type MainToolHost = {
 	 * *replaces* the model's context, so anything it omits is context the next
 	 * round cannot see. The service owns this because only it can read the request
 	 * document, the recorded answers and the plan index.
+	 *
+	 * `tx` is passed when the caller is inside its own transaction, so the handoff
+	 * and the write it describes commit together rather than in two steps.
 	 */
-	readonly buildHandoff?: (input: {
-		readonly requestId: string;
-		readonly questionId: string;
-		readonly question: string;
-		readonly reason: string;
-	}) => Promise<string>;
+	readonly buildHandoff?: (
+		input: {
+			readonly requestId: string;
+			readonly questionId: string;
+			readonly question: string;
+			readonly reason: string;
+		},
+		tx?: Tx,
+	) => Promise<string>;
 	/**
 	 * Record a finished management operation so a replay returns the same result
-	 * instead of redoing it. Keyed by the real tool call. `control` is stored with
-	 * the result so a replayed question still ends the run.
+	 * instead of redoing it. Keyed by the real tool call.
+	 *
+	 * `tx` is passed when the caller is inside the transaction that made the
+	 * business change, which is the point: a receipt written in a *second*
+	 * transaction leaves a window where the question or plan is committed but its
+	 * result is not, and a `replay: "safe"` rerun in that window either re-asks or
+	 * fails on a now-stale expected version. Same transaction, no window.
 	 */
-	readonly recordOperation?: (input: {
-		readonly opKey: string;
-		readonly result: string;
-		readonly control?: { readonly handoff?: string };
-	}) => Promise<void>;
+	readonly recordOperation?: (
+		input: {
+			readonly opKey: string;
+			readonly result: string;
+			/** Whether the call reported an error, so a replay stays an error. */
+			readonly isError?: boolean;
+			readonly control?: { readonly handoff?: string };
+		},
+		tx?: Tx,
+	) => Promise<void>;
 	/**
 	 * Record that a management operation has *started* but not finished, before it
 	 * runs its side effect. A crash in that window is then reported as interrupted
@@ -116,7 +133,9 @@ export type MainToolHost = {
 	 */
 	readonly beginOperation?: (input: { readonly opKey: string }) => Promise<void>;
 	/** Read back a recorded operation, or `undefined` when it never ran. */
-	readonly readOperation?: (opKey: string) => Promise<{ readonly result?: string; readonly control?: { readonly handoff?: string } } | undefined>;
+	readonly readOperation?: (
+		opKey: string,
+	) => Promise<{ readonly result?: string; readonly isError?: boolean; readonly control?: { readonly handoff?: string } } | undefined>;
 	/**
 	 * The clock the program stamps with. Injected rather than read from `Date.now`
 	 * so a test can make timestamps deterministic.
@@ -167,6 +186,11 @@ function operationKey(kind: string, taskId: unknown, callId: string): string {
  * that forgot to list a question — or removed it — must not thereby unblock work
  * the question really blocks. The question's persisted scope is the authority.
  */
+/** The ids of questions that already have a resolution. */
+function resolvedIds(state: ClarificationState): ReadonlySet<string> {
+	return new Set(state.resolutions.map((resolution) => resolution.questionId));
+}
+
 export function blockingQuestionIdsFor(state: ClarificationState, taskIds: readonly string[]): readonly string[] {
 	const open = new Set(openQuestionIds(state));
 	const wanted = new Set(taskIds);
@@ -188,7 +212,9 @@ export function createMainExtension(host: MainToolHost): Extension {
 	const clock = host.now ?? Date.now;
 
 	/** The recorded state of this call, when it has one. */
-	async function replayOf(opKey: string): Promise<{ readonly result?: string; readonly control?: { readonly handoff?: string } } | undefined> {
+	async function replayOf(
+		opKey: string,
+	): Promise<{ readonly result?: string; readonly isError?: boolean; readonly control?: { readonly handoff?: string } } | undefined> {
 		return host.readOperation === undefined ? undefined : await host.readOperation(opKey);
 	}
 
@@ -216,6 +242,7 @@ export function createMainExtension(host: MainToolHost): Extension {
 				// already asked.
 				return {
 					output: [{ type: "text", text: replayed.result ?? "clarification already asked" }],
+					isError: replayed.isError === true,
 					...(replayed.control === undefined ? {} : { control: replayed.control }),
 				};
 			}
@@ -228,61 +255,56 @@ export function createMainExtension(host: MainToolHost): Extension {
 			if (!blocked.ok) {
 				return { output: [{ type: "text", text: `clarification refused: blockedTaskIds ${blocked.detail}.` }], isError: true };
 			}
+			// The question write and its receipt are one transaction. Writing the
+			// question first and the receipt second leaves a window where a
+			// `replay: "safe"` rerun finds the question already recorded, takes the
+			// duplicate branch, and loses the handoff — the run would not end.
 			const written = await api.commit(async (tx) => {
 				const state = await tx.doc(AgentClarificationDoc, api.conversationId, active.requestId, { requestId: active.requestId });
-				// Round 1 first. If an identical question is already recorded, this is a
-				// re-ask of that question, not a new one: the contract holds one answer
-				// per question, so a "second" copy of the same words would leave the
-				// first one permanently unanswerable and the user would be asked twice.
+				// A re-ask of the *same words* is the same question, not a new one: the
+				// contract holds one answer per question, so a second copy would leave
+				// the first permanently unanswerable. It must still end the run — the
+				// model asking again after an insufficient answer is exactly AC-02's
+				// "补充仍模糊继续问", and returning bare text would let the round
+				// continue instead.
 				const sameText = state.questions.find((question) => question.question === args.question);
-				if (sameText !== undefined) {
-					return { questionId: sameText.questionId, alreadyOpen: true } as const;
+				const alreadyOpen = sameText !== undefined && !resolvedIds(state).has(sameText.questionId);
+				const questionId = sameText === undefined ? deriveQuestionId(active.requestId, state.questions.length + 1, args.question) : sameText.questionId;
+				if (sameText === undefined) {
+					// A *question* is model-authored by design — the model is what
+					// noticed the ambiguity. What the program owns (the id, the
+					// timestamp, the blocking scope) is stamped here, and the whole state
+					// is re-validated through the shared contract before it is written.
+					state.questions = [
+						...state.questions,
+						{ questionId, question: args.question, reason: args.reason, blockingScope: [...blocked.value], askedAt: clock() },
+					];
+					const checked = validateClarificationState(state);
+					if (!checked.ok) {
+						throw new Error(`clarification state invalid: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}`);
+					}
 				}
-				const round = state.questions.length + 1;
-				const questionId = deriveQuestionId(active.requestId, round, args.question);
-				// A *question* is model-authored by design — the model is what noticed
-				// the ambiguity. What the program owns (the id, the timestamp, the
-				// blocking scope) is stamped here, and the whole state is re-validated
-				// through the shared contract before it is left written.
-				state.questions = [
-					...state.questions,
-					{ questionId, question: args.question, reason: args.reason, blockingScope: [...blocked.value], askedAt: clock() },
-				];
-				const checked = validateClarificationState(state);
-				if (!checked.ok) {
-					throw new Error(`clarification state invalid: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}`);
-				}
-				return { questionId, alreadyOpen: false } as const;
+				const text = alreadyOpen
+					? `question ${questionId} is still open; the user has not answered it yet. This run ends now.`
+					: `asked the user (question ${questionId}). This run ends now.`;
+				// Ending the run is the contract's requirement ("问题结束当前模型轮次"),
+				// and `handoff` is the only public control that guarantees it:
+				// `terminate` fires only when *every* call of the round asks for it, so
+				// one sibling call would silently keep the run going. The payload is
+				// built by the program from persisted facts, because a handoff replaces
+				// the model's context — a bare handoff would drop the request, the
+				// materials and the recorded answers the next round needs.
+				const handoff =
+					host.buildHandoff === undefined
+						? text
+						: await host.buildHandoff({ requestId: active.requestId, questionId, question: args.question, reason: args.reason }, tx);
+				// The receipt is written in this same transaction, so the question and
+				// the result that ends the run can never disagree.
+				await host.recordOperation?.({ opKey, result: text, control: { handoff } }, tx);
+				return { questionId, text, handoff } as const;
 			}, callContext);
 
-			if (written.alreadyOpen) {
-				// A duplicate ask is not a completed operation: recording a receipt for
-				// it would make a later, genuine ask of the same question replay this
-				// refusal instead of ending the run. So this path leaves no receipt.
-				return { output: [{ type: "text", text: `question ${written.questionId} is already open; the user has not answered it yet.` }] };
-			}
-			const text = `asked the user (question ${written.questionId}). This run ends now.`;
-
-			// Ending the run is the contract's requirement ("问题结束当前模型轮次"), and
-			// `handoff` is the only public control that guarantees it: `terminate`
-			// fires only when *every* call of the round asks for it, so one sibling
-			// call would silently keep the run going. The payload is built by the
-			// program from persisted facts, because a handoff replaces the model's
-			// context — a bare handoff would drop the request, the materials and the
-			// recorded answers that the next round needs.
-			const handoff =
-				host.buildHandoff === undefined
-					? text
-					: await host.buildHandoff({
-							requestId: active.requestId,
-							questionId: written.questionId,
-							question: args.question,
-							reason: args.reason,
-						});
-			// The control travels with the receipt, so a replay ends the run the same
-			// way rather than returning bare text and letting the round continue.
-			await host.recordOperation?.({ opKey, result: text, control: { handoff } });
-			return { output: [{ type: "text", text }], control: { handoff } };
+			return { output: [{ type: "text", text: written.text }], control: { handoff: written.handoff } };
 		},
 	});
 
@@ -303,7 +325,11 @@ export function createMainExtension(host: MainToolHost): Extension {
 		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
 			const opKey = operationKey("save-plan", api.taskId, api.callId);
 			const replayed = await replayOf(opKey);
-			if (replayed !== undefined) return { output: [{ type: "text", text: replayed.result ?? "plan already saved" }] };
+			if (replayed !== undefined) {
+				// The stored error flag travels with the result: a refused save that
+				// replayed as an ordinary tool result would read as a success.
+				return { output: [{ type: "text", text: replayed.result ?? "plan already saved" }], isError: replayed.isError === true };
+			}
 
 			const active = await host.activeRequest();
 			if (active === undefined) {
@@ -314,22 +340,39 @@ export function createMainExtension(host: MainToolHost): Extension {
 				return { output: [{ type: "text", text: `save_plan refused: relatedQuestionIds ${related.detail}.` }], isError: true };
 			}
 			const result = await api.commit(async (tx) => {
+				// Every return path records its receipt in this same transaction — the
+				// refusals too. A refusal whose receipt lands in a second transaction
+				// leaves a window where the rerun re-decides against moved state, and a
+				// success whose receipt is missing replays into a stale-version refusal.
+				const finish = async (text: string, ok: boolean): Promise<{ readonly ok: boolean; readonly text: string }> => {
+					await host.recordOperation?.({ opKey, result: text, isError: !ok }, tx);
+					return { ok, text };
+				};
 				const doc = await tx.doc(AgentPlanDoc, api.conversationId, args.planId, { planId: args.planId });
 				const storedVersion = doc.version === 0 ? undefined : doc.version;
 				const expected = args.expectedVersion;
+				// A plan document is keyed by `planId` alone, so two requests that both
+				// use one id share it. Without this check the second request would
+				// silently take over the first's plan — and the first's index entry
+				// would then point at a document describing someone else's goal.
+				if (storedVersion !== undefined && doc.requestId !== active.requestId) {
+					return await finish(
+						`save_plan refused: plan ${args.planId} already belongs to request ${doc.requestId}; use a different planId.`,
+						false,
+					);
+				}
 				// The contract's `assertPlanVersion` rule as a refusal with a stable
 				// reason: "no plan stored yet" is refused for the same reason a stale
 				// one is, because the caller's decision was made against a specific plan.
 				if (storedVersion === undefined) {
 					if (expected !== undefined && expected !== 0) {
-						return { ok: false as const, version: 0, text: `save_plan refused: expected version ${expected}, but no plan ${args.planId} is stored.` };
+						return await finish(`save_plan refused: expected version ${expected}, but no plan ${args.planId} is stored.`, false);
 					}
 				} else if (expected !== storedVersion) {
-					return {
-						ok: false as const,
-						version: 0,
-						text: `save_plan refused: expected version ${String(expected)}, but plan ${args.planId} is at version ${storedVersion}. Re-read it first.`,
-					};
+					return await finish(
+						`save_plan refused: expected version ${String(expected)}, but plan ${args.planId} is at version ${storedVersion}. Re-read it first.`,
+						false,
+					);
 				}
 				const version = storedVersion === undefined ? 1 : nextPlanVersion(storedVersion);
 				const candidate: Plan = {
@@ -349,7 +392,7 @@ export function createMainExtension(host: MainToolHost): Extension {
 				};
 				const checked = validatePlan(candidate);
 				if (!checked.ok) {
-					return { ok: false as const, version: 0, text: `save_plan refused: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}` };
+					return await finish(`save_plan refused: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}`, false);
 				}
 				Object.assign(doc, checked.value);
 				// The index entry is written in this same transaction, so the plan and
@@ -369,13 +412,11 @@ export function createMainExtension(host: MainToolHost): Extension {
 							)
 						: [...service.plans, entry];
 				}
-				return {
-					ok: true as const,
-					version,
-					text: `saved plan ${args.planId} version ${version} for request ${active.requestId} v${active.requestVersion} (${args.taskIds.length} task(s)).`,
-				};
+				return await finish(
+					`saved plan ${args.planId} version ${version} for request ${active.requestId} v${active.requestVersion} (${args.taskIds.length} task(s)).`,
+					true,
+				);
 			}, callContext);
-			await host.recordOperation?.({ opKey, result: result.text });
 			return { output: [{ type: "text", text: result.text }], isError: result.ok === false };
 		},
 	});
@@ -430,9 +471,16 @@ export function createMainExtension(host: MainToolHost): Extension {
 			// requirement identity, the questions that block *these* tasks, the
 			// dependencies the executor reports, and the plan's own task list.
 			const admitted = await api.commit(async (tx) => {
+				// The requirement is read *inside* this transaction. Reading it before
+				// the commit made the check compare a plan against a pointer value that
+				// could already have moved, which is not the same as "the requirement
+				// being served when admission ran".
+				const current = await host.activeRequest(tx);
+				const activeRequestId = current?.requestId ?? active.requestId;
+				const activeRequestVersion = current?.requestVersion ?? active.requestVersion;
 				const planDoc = await tx.doc(AgentPlanDoc, api.conversationId, args.planId, { planId: args.planId });
 				const storedVersion = planDoc.version === 0 ? undefined : planDoc.version;
-				const clarification = await tx.doc(AgentClarificationDoc, api.conversationId, active.requestId, { requestId: active.requestId });
+				const clarification = await tx.doc(AgentClarificationDoc, api.conversationId, activeRequestId, { requestId: activeRequestId });
 				const taskIds = batch.value.map((task) => task.id);
 				const blocking = blockingQuestionIdsFor(clarification, taskIds);
 				const planned = new Set(planDoc.taskIds);
@@ -454,19 +502,23 @@ export function createMainExtension(host: MainToolHost): Extension {
 				// A plan's own version says nothing about *which goal* it serves, so a
 				// plan from v1 would otherwise execute after the user restated the
 				// requirement — doing the old goal under the new one.
-				if (storedVersion !== undefined && (planDoc.requestId !== active.requestId || planDoc.requestVersion !== active.requestVersion)) {
+				if (storedVersion !== undefined && (planDoc.requestId !== activeRequestId || planDoc.requestVersion !== activeRequestVersion)) {
 					reasons.push("plan_request_mismatch");
 				}
 				if (unplanned.length > 0) reasons.push("tasks_not_in_plan");
-				return { reasons, version: storedVersion };
+				// A refusal is a completed decision: a replay of this call must report the
+				// same refusal rather than re-running admission against state that may
+				// have moved. It is recorded in the admission transaction, so the
+				// decision and its receipt cannot disagree.
+				if (reasons.length > 0) {
+					const text = `dispatch refused: ${reasons.join(", ")}. Nothing was executed.`;
+					await host.recordOperation?.({ opKey, result: text, isError: true }, tx);
+					return { reasons, version: storedVersion, refusal: text };
+				}
+				return { reasons, version: storedVersion, refusal: undefined };
 			}, callContext);
-			if (admitted.reasons.length > 0) {
-				const text = `dispatch refused: ${admitted.reasons.join(", ")}. Nothing was executed.`;
-				// A refusal is a completed decision: a replay of this call must report
-				// the same refusal rather than re-running admission against state that
-				// may have moved.
-				await host.recordOperation?.({ opKey, result: text });
-				return { output: [{ type: "text", text }], isError: true };
+			if (admitted.refusal !== undefined) {
+				return { output: [{ type: "text", text: admitted.refusal }], isError: true };
 			}
 			// The call is marked as started *before* the executor runs. A crash between
 			// here and the receipt below therefore leaves a recorded start with no
@@ -488,7 +540,9 @@ export function createMainExtension(host: MainToolHost): Extension {
 			const text = [`dispatched plan ${args.planId} v${String(admitted.version)}:`, ...lines].join("\n");
 			// The receipt is recorded after the executor returns, so a replay of this
 			// call reports what actually happened instead of dispatching a second time.
-			await host.recordOperation?.({ opKey, result: text });
+			// It carries `isError`, so a failed dispatch replays as a failure rather
+			// than as an ordinary tool result.
+			await host.recordOperation?.({ opKey, result: text, isError: refused });
 			return { output: [{ type: "text", text }], isError: refused };
 		},
 	});

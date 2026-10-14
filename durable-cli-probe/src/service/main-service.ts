@@ -34,7 +34,9 @@ import type {
 	Harness,
 	Registry,
 	Submission,
+	Tx,
 } from "@earendil-works/pi-durable";
+import { LiveDoc } from "@earendil-works/pi-durable";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../agent/contracts/documents.ts";
 import { composeUserAnswer, openQuestionIds, type ClarificationState, type UserAnswer } from "../agent/contracts/clarification.ts";
 import { validatePlan, type Plan } from "../agent/contracts/plan.ts";
@@ -155,32 +157,79 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * them would silently not drive the work it is supposed to serve. A commit
 	 * gives the same committed read while keeping the conversation live.
 	 */
-	async function activeRequest(): Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined> {
-		return await handle.commit(async (tx) => {
+	async function activeRequest(tx?: Tx): Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined> {
+		// `tx` when the caller is already inside a transaction: a tool's admission
+		// must read the pointer in *its own* transaction, or it compares a plan
+		// against a value that may already have moved by the time it commits.
+		const read = async (tx: Tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
+			// The requirement a run serves is the one its *own* inputs were admitted
+			// for — not the mutable pointer. The pointer is written when a restatement
+			// is consumed, which happens after the Harness has already placed the
+			// input and started the run; resolving from the pointer alone therefore
+			// lets a run write plans and dispatch under the previous requirement's
+			// identity. The run's inputs are known before any tool in it executes.
+			const live = await tx.doc(LiveDoc, conversationId);
+			const running = live.run?.inputs ?? [];
+			for (let index = running.length - 1; index >= 0; index--) {
+				const admission = doc.admissions.find((entry) => entry.submissionId === String(running[index]));
+				if (admission === undefined) continue;
+				// A rejected input (its version basis went stale while it waited) has no
+				// requirement: the run must refuse, not fall through to the previous
+				// request and act under its identity.
+				if (admission.rejected === true) return undefined;
+				// The basis is re-checked here, at the moment the run resolves its
+				// requirement — not only on a later queue read, which is after the run
+				// may already have written a plan or dispatched.
+				if (admission.expectedRequestVersion !== undefined) {
+					const request = await tx.doc(AgentRequestDoc, conversationId, admission.requestId, { requestId: admission.requestId });
+					const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
+					if (storedVersion !== undefined && storedVersion !== admission.expectedRequestVersion) return undefined;
+				}
+				return { requestId: admission.requestId, requestVersion: admission.requestVersion };
+			}
+			// Nothing running was admitted by this service. Fall back to the pointer
+			// rather than inventing a requirement.
 			return doc.activeRequestId === undefined ? undefined : { requestId: doc.activeRequestId, requestVersion: doc.requestVersion };
-		}, context);
+		};
+		return tx === undefined ? await handle.commit(read, context) : await read(tx);
+	}
+
+	/** Record the requirement identity of one admitted input, so its run can resolve it. */
+	async function recordAdmission(
+		tx: Tx,
+		submissionId: string,
+		requestId: string,
+		requestVersion: number,
+		expectedRequestVersion?: number,
+	): Promise<void> {
+		const doc = await tx.doc(MainServiceDoc, conversationId);
+		// One entry per submission: a replay of the same admission is the same fact.
+		if (doc.admissions.some((entry) => entry.submissionId === submissionId)) return;
+		doc.admissions = [
+			...doc.admissions,
+			{ submissionId, requestId, requestVersion, ...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }) },
+		];
+	}
+
+	async function readClarificationIn(tx: Tx, requestId: string): Promise<ClarificationState> {
+		const state = await tx.doc(AgentClarificationDoc, conversationId, requestId, { requestId });
+		// A deep copy, not a shallow one: the document's nested values are
+		// write overlays that are only readable inside this commit, so a
+		// spread of the arrays would hand the caller objects that throw
+		// "Cannot use a settled overlay" the moment they are touched.
+		return JSON.parse(
+			JSON.stringify({
+				schemaVersion: state.schemaVersion,
+				questions: state.questions,
+				answers: state.answers,
+				resolutions: state.resolutions,
+			}),
+		) as ClarificationState;
 	}
 
 	async function readClarification(requestId: string): Promise<ClarificationState> {
-		return await handle.commit(
-			async (tx) => {
-				const state = await tx.doc(AgentClarificationDoc, conversationId, requestId, { requestId });
-				// A deep copy, not a shallow one: the document's nested values are
-				// write overlays that are only readable inside this commit, so a
-				// spread of the arrays would hand the caller objects that throw
-				// "Cannot use a settled overlay" the moment they are touched.
-				return JSON.parse(
-					JSON.stringify({
-						schemaVersion: state.schemaVersion,
-						questions: state.questions,
-						answers: state.answers,
-						resolutions: state.resolutions,
-					}),
-				) as ClarificationState;
-			},
-			context,
-		);
+		return await handle.commit(async (tx) => await readClarificationIn(tx, requestId), context);
 	}
 
 	/** The plans of one request, read from the persisted index and the plan documents. */
@@ -200,7 +249,12 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			);
 			if (raw.version === 0) continue;
 			const checked = validatePlan(raw);
-			if (checked.ok) plans.push(checked.value);
+			// The index says which request a plan was saved for, but the document is
+			// keyed by `planId` alone — so a later request that reused the id owns the
+			// document now, and the index entry is the *old* claim. Returning the
+			// document on the index's word alone would hand request A a plan whose
+			// goals and tasks belong to request B. The document is the authority.
+			if (checked.ok && checked.value.requestId === requestId) plans.push(checked.value);
 		}
 		return plans;
 	}
@@ -221,14 +275,29 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	/**
 	 * Record one finished management-tool call, so a replay returns its result
 	 * instead of redoing the work. `replay: "safe"` is not exactly-once.
+	 *
+	 * When `tx` is given the receipt is written in the caller's transaction, so the
+	 * business change and the result that describes it commit together. That is what
+	 * closes the window a second transaction leaves: a crash between the two would
+	 * otherwise replay a committed question as a duplicate, or a committed save as a
+	 * stale-version refusal.
 	 */
-	async function recordOperation(input: { readonly opKey: string; readonly result: string; readonly control?: { readonly handoff?: string } }): Promise<void> {
-		await handle.commit(async (tx) => {
+	async function recordOperation(
+		input: {
+			readonly opKey: string;
+			readonly result: string;
+			readonly isError?: boolean;
+			readonly control?: { readonly handoff?: string };
+		},
+		tx?: Tx,
+	): Promise<void> {
+		const write = async (tx: Tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
 			const existing = doc.receipts.find((receipt) => receipt.opKey === input.opKey);
 			// A finished call is never overwritten by a replay: the first result stands.
 			if (existing?.result !== undefined) return;
 			const receipt: OperationReceipt = { opKey: input.opKey, result: input.result, at: now() };
+			if (input.isError !== undefined) (receipt as { isError?: boolean }).isError = input.isError;
 			if (input.control !== undefined) (receipt as { control?: { readonly handoff?: string } }).control = input.control;
 			// A begin-then-finish replaces the started marker in place, so a call has
 			// exactly one receipt whatever path it took.
@@ -236,10 +305,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				existing === undefined
 					? [...doc.receipts, receipt]
 					: doc.receipts.map((entry) => (entry.opKey === input.opKey ? receipt : entry));
-		}, context);
+		};
+		if (tx === undefined) await handle.commit(write, context);
+		else await write(tx);
 	}
 
-	async function readOperation(opKey: string): Promise<{ readonly result?: string; readonly control?: { readonly handoff?: string } } | undefined> {
+	async function readOperation(
+		opKey: string,
+	): Promise<{ readonly result?: string; readonly isError?: boolean; readonly control?: { readonly handoff?: string } } | undefined> {
 		return await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
 			const found = doc.receipts.find((receipt) => receipt.opKey === opKey);
@@ -247,8 +320,9 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			// that throw "Cannot use a settled overlay" once it finishes.
 			return found === undefined
 				? undefined
-				: (JSON.parse(JSON.stringify({ result: found.result, control: found.control })) as {
+				: (JSON.parse(JSON.stringify({ result: found.result, isError: found.isError, control: found.control })) as {
 						readonly result?: string;
+						readonly isError?: boolean;
 						readonly control?: { readonly handoff?: string };
 					});
 		}, context);
@@ -264,23 +338,27 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * the guaranteed round end compatible with a long-lived Main conversation —
 	 * the model's automatic history is reset, the *facts* are not.
 	 */
-	async function buildHandoff(input: {
-		readonly requestId: string;
-		readonly questionId: string;
-		readonly question: string;
-		readonly reason: string;
-	}): Promise<string> {
+	async function buildHandoff(
+		input: {
+			readonly requestId: string;
+			readonly questionId: string;
+			readonly question: string;
+			readonly reason: string;
+		},
+		tx?: Tx,
+	): Promise<string> {
 		// Copied inside the commit, because the document's nested values are write
 		// overlays that throw "Cannot use a settled overlay" once it finishes.
-		const request = await handle.commit(async (tx) => {
+		const readRequest = async (tx: Tx) => {
 			const doc = await tx.doc(AgentRequestDoc, conversationId, input.requestId, { requestId: input.requestId });
 			return JSON.parse(JSON.stringify({ requestVersion: doc.requestVersion, text: doc.text, materials: doc.materials })) as {
 				readonly requestVersion: number;
 				readonly text: string;
 				readonly materials: readonly { readonly source: string; readonly content: string }[];
 			};
-		}, context);
-		const clarification = await readClarification(input.requestId);
+		};
+		const request = tx === undefined ? await handle.commit(readRequest, context) : await readRequest(tx);
+		const clarification = tx === undefined ? await readClarification(input.requestId) : await readClarificationIn(tx, input.requestId);
 		const answer = clarification.answers.find((entry) => entry.questionId === input.questionId);
 		const open = openQuestionIds(clarification).filter((id) => id !== input.questionId);
 		const lines = [
@@ -389,6 +467,12 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// The caller's basis must still hold. A stale one is not applied — the
 				// input was admitted, but it does not become the active requirement.
 				if (entry.expectedRequestVersion !== undefined && storedVersion !== undefined && storedVersion !== entry.expectedRequestVersion) {
+					// It cannot be un-placed from the transcript, but it is denied an
+					// identity: a run made of it resolves no requirement and its tools
+					// refuse, rather than acting under the previous request.
+					doc.admissions = doc.admissions.map((admission) =>
+						admission.submissionId === entry.submissionId ? { ...admission, rejected: true } : admission,
+					);
 					continue;
 				}
 				const nextVersion = storedVersion === undefined ? 1 : Math.max(storedVersion + 1, entry.requestVersion);
@@ -397,6 +481,13 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				request.requestedAt = entry.queuedAt;
 				doc.activeRequestId = entry.requestId;
 				doc.requestVersion = nextVersion;
+				// The admission must name the version the requirement is *at* once the
+				// input is consumed, not the one it was queued against: a run made of
+				// this input binds its plans to the admission's version, and a stale one
+				// would make every such plan mismatch the request document.
+				doc.admissions = doc.admissions.map((admission) =>
+					admission.submissionId === entry.submissionId ? { ...admission, requestVersion: nextVersion } : admission,
+				);
 			}
 			doc.queue = doc.queue.filter((entry) => !consumed.some((gone) => gone.submissionId === entry.submissionId));
 		}, context);
@@ -490,6 +581,10 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					{ type: "input", content: text, requestId: answerInputId(current.requestId, input.answerTo, revision) },
 					context,
 				);
+				await handle.commit(
+					async (tx) => await recordAdmission(tx, String(submission.id), current.requestId, current.requestVersion),
+					context,
+				);
 				return { kind: "answer", questionId: input.answerTo, submission };
 			}
 
@@ -528,6 +623,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				await handle.commit(async (tx) => {
 					const doc = await tx.doc(MainServiceDoc, conversationId);
 					doc.queue = [...doc.queue, record];
+					// The admission is recorded now, so that when the Harness places this
+					// input at the next boundary and starts a run for it, the run resolves
+					// the requirement from its own input rather than from the lagging
+					// pointer.
+					await recordAdmission(tx, String(submission.id), requestId, requestVersion, input.expectedRequestVersion);
 				}, context);
 				return { kind: "queued", submission, reason: "a round is running; the input is queued for the next boundary" };
 			}
@@ -557,6 +657,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				return { kind: "refused", reason: `stale request version: expected ${staleVersion.expected}, stored ${staleVersion.stored}` };
 			}
 			const submission = await handle.submit({ type: "input", content: text, requestId: requestInputId(requestId, requestVersion) }, context);
+			await handle.commit(async (tx) => await recordAdmission(tx, String(submission.id), requestId, requestVersion), context);
 			return { kind: "request", requestId, requestVersion, submission };
 		},
 

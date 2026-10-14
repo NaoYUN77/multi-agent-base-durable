@@ -83,9 +83,44 @@ export type OperationReceipt = {
 	readonly opKey: string;
 	/** The result text. Absent while the call is recorded as started but not finished. */
 	readonly result?: string;
+	/**
+	 * Whether the original call reported an error. A refusal or a failed dispatch
+	 * must replay as an error, not as an ordinary tool result: the machine-readable
+	 * outcome is part of the result, and dropping it turns a refusal into success.
+	 */
+	readonly isError?: boolean;
 	/** The control the original call returned, so a replay ends the run identically. */
 	readonly control?: { readonly handoff?: string };
 	readonly at: number;
+};
+
+/**
+ * One admitted input and the requirement identity it carries.
+ *
+ * The active requirement is *not* only a mutable pointer: while a run is live, the
+ * requirement being served is the one that run's inputs were admitted for. The
+ * pointer is written when a restatement is *consumed*, which is after the Harness
+ * has already placed the input and started the run — so resolving the requirement
+ * from the pointer alone lets a run write plans and dispatch under the previous
+ * requirement's identity. This map is what lets the run's own inputs name the
+ * requirement, before any tool in it executes.
+ */
+export type InputAdmission = {
+	/** The submission the Harness admitted. */
+	readonly submissionId: string;
+	readonly requestId: string;
+	readonly requestVersion: number;
+	/**
+	 * The requirement version the caller's decision was made against, when it gave
+	 * one. Carried so the basis can be checked when a run resolves its requirement —
+	 * synchronously with the run, not lazily on a later queue read. A stale input
+	 * cannot be un-placed from the transcript, but it can be denied an identity, and
+	 * a tool with no resolvable requirement refuses rather than acting under the
+	 * previous request.
+	 */
+	readonly expectedRequestVersion?: number;
+	/** Set when the basis no longer holds, so a run made of this input must refuse. */
+	readonly rejected?: boolean;
 };
 
 /**
@@ -129,6 +164,12 @@ export type MainServiceState = {
 	readonly receipts: OperationReceipt[];
 	/** Answers the application did not judge sufficient, newest last. */
 	readonly answerAttempts: AnswerAttempt[];
+	/**
+	 * The requirement identity of every input the service has admitted, newest
+	 * last. A run resolves its requirement from the inputs it is running rather
+	 * than from the pointer, which lags a placed input.
+	 */
+	readonly admissions: InputAdmission[];
 };
 
 /**
@@ -143,5 +184,5 @@ export const MainServiceDoc = defineDoc<MainServiceState>({
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
-	initial: () => ({ schemaVersion: MAIN_SERVICE_SCHEMA_VERSION, requestVersion: 1, plans: [], queue: [], receipts: [], answerAttempts: [] }),
+	initial: () => ({ schemaVersion: MAIN_SERVICE_SCHEMA_VERSION, requestVersion: 1, plans: [], queue: [], receipts: [], answerAttempts: [], admissions: [] }),
 });
