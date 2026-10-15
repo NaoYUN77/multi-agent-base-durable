@@ -139,6 +139,20 @@ export type MainService = {
 	close(): Promise<void>;
 };
 
+/**
+ * A persisted version field, or `undefined` when it is not a usable one.
+ *
+ * `allocatedVersion` was added to the queue record after the shape had already
+ * been written, so a record from before that carries no value — and a stored
+ * `undefined` must be read as "not recorded", not propagated. Passing one into
+ * `Math.max` yields `NaN`, which is not strict JSON, so the commit would throw
+ * rather than write a wrong version. Non-finite and non-numeric values are
+ * refused for the same reason: a version is a positive integer or nothing.
+ */
+function readableVersion(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 /** Open the Main service over an existing conversation. */
 export async function openMainService(options: MainServiceOptions): Promise<MainService> {
 	const { harness, context, conversationId } = options;
@@ -485,7 +499,13 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// reconciliation ever lands out of order: the version must not move
 				// *backwards*, because a plan already bound to a higher version would then
 				// mismatch the requirement that owns it.
-				const nextVersion = storedVersion === undefined ? entry.allocatedVersion : Math.max(storedVersion, entry.allocatedVersion);
+				//
+				// A record written before this field existed has no usable allocation, so
+				// one is derived for it rather than propagated. Without the guard the
+				// document would be persisted holding `undefined` (or `NaN` through the
+				// `Math.max`), which is a corrupt version rather than a missing one.
+				const allocated = readableVersion(entry.allocatedVersion) ?? (storedVersion === undefined ? 1 : storedVersion + 1);
+				const nextVersion = storedVersion === undefined ? allocated : Math.max(storedVersion, allocated);
 				request.requestVersion = nextVersion;
 				request.text = entry.text;
 				request.requestedAt = entry.queuedAt;
@@ -634,7 +654,10 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// request that has never been written starts at 1 like any other.
 					const request = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
 					const stored = request.requestedAt === 0 ? undefined : request.requestVersion;
-					const alreadyAllocated = doc.queue.filter((entry) => entry.requestId === requestId).map((entry) => entry.allocatedVersion);
+					const alreadyAllocated = doc.queue
+						.filter((entry) => entry.requestId === requestId)
+						.map((entry) => readableVersion(entry.allocatedVersion))
+						.filter((version): version is number => version !== undefined);
 					const highest = Math.max(stored ?? 0, ...alreadyAllocated);
 					return highest === 0 ? 1 : highest + 1;
 				}, context);

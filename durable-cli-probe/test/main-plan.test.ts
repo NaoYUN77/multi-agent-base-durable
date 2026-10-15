@@ -508,6 +508,73 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("consumes a queue record written before the allocation field existed (AC-01, AC-03)", async () => {
+		// `allocatedVersion` was added to the queue record after the shape had already
+		// been persisted, so a record from before that carries no value. Reading it as
+		// a number would persist `undefined` as the requirement version — or `NaN`
+		// through the `Math.max`, which is not strict JSON and makes the commit throw.
+		// Either way the requirement would be left with a corrupt version, so the
+		// missing value has to be read as "not recorded" and derived instead.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async () => {
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+			});
+
+			// A restatement of the *running* request, so its document already exists and
+			// reconciliation takes the `Math.max` path — the one that yields `NaN`.
+			const first = await service.submitUserInput({ text: "plan the work", requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const queued = await service.submitUserInput({ text: "actually do the other thing", requestId: "req-plan" });
+			expect(queued.kind).toBe("queued");
+
+			// Rewrite the record to the older shape: no `allocatedVersion` at all.
+			await runtime.harness.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, 1 as never);
+				doc.queue = doc.queue.map((entry) => {
+					const { allocatedVersion, ...rest } = entry as Record<string, unknown> & { allocatedVersion?: number };
+					void allocatedVersion;
+					return rest as never;
+				});
+			}, context);
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			// Reconciling must not throw, and must leave a real version behind.
+			await service.readQueue();
+
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const view = await service.readRequest();
+			expect(Number.isInteger(view.requestVersion)).toBe(true);
+			expect(view.requestVersion).toBeGreaterThanOrEqual(1);
+			expect(Number.isInteger(doc?.requestVersion)).toBe(true);
+			expect(view.text).toBe("actually do the other thing");
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
 	it("refuses a dispatch whose dependency is not accepted (AC-03)", async () => {
 		const { runtime, service, dispatched } = await runScript(
 			[
