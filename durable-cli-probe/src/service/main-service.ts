@@ -28,6 +28,7 @@
 //      outcome says which of the three things happened.
 
 import type { Context } from "@earendil-works/chord";
+import type { Message } from "@earendil-works/pi-ai";
 import type {
 	Conversation,
 	ConversationId,
@@ -40,9 +41,10 @@ import { LiveDoc } from "@earendil-works/pi-durable";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../agent/contracts/documents.ts";
 import { composeUserAnswer, openQuestionIds, type ClarificationState, type UserAnswer } from "../agent/contracts/clarification.ts";
 import { validatePlan, type Plan } from "../agent/contracts/plan.ts";
-import { MainServiceDoc, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
+import { MainServiceDoc, type InputAdmission, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
 import { answerInputId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
+import { restorationSectionText, withRestorationSection } from "../agent/main/restoration.ts";
 import { mainInstructions } from "../agent/prompts/main.ts";
 
 /** Everything the service needs from its host, injected so tests can drive it. */
@@ -186,7 +188,18 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			const live = await tx.doc(LiveDoc, conversationId);
 			const running = live.run?.inputs ?? [];
 			for (let index = running.length - 1; index >= 0; index--) {
-				const admission = doc.admissions.find((entry) => entry.submissionId === String(running[index]));
+				const submissionId = String(running[index]);
+				// An input whose admission is not linked yet is *not* evidence that the
+				// run has no requirement. `handle.submit` returns before this service's
+				// own identity commit lands, and the Harness places the input and starts
+				// its run at the round boundary in the meantime — so in that window the
+				// run is live while no admission names its submission yet. The submission
+				// itself carries the key the placement was written under, so the identity
+				// is recovered from the run's own input instead of being guessed from the
+				// pointer, which still names the previous request.
+				const admission =
+					doc.admissions.find((entry) => entry.submissionId === submissionId) ??
+					placementOf(doc.admissions, submissionId);
 				if (admission === undefined) continue;
 				// A rejected input (its version basis went stale while it waited) has no
 				// requirement: the run must refuse, not fall through to the previous
@@ -201,32 +214,164 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				if (admission.expectedRequestVersion !== undefined && admission.basisAccepted !== true) {
 					const request = await tx.doc(AgentRequestDoc, conversationId, admission.requestId, { requestId: admission.requestId });
 					const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
-					if (storedVersion !== undefined && storedVersion !== admission.expectedRequestVersion) return undefined;
+					// The same shape as the submission-time check: a requirement that has
+					// never been written is at 1, so a basis that could never have been
+					// observed is refused rather than treated as satisfied.
+					if ((storedVersion ?? 1) !== admission.expectedRequestVersion) return undefined;
 				}
 				return { requestId: admission.requestId, requestVersion: admission.requestVersion };
 			}
-			// Nothing running was admitted by this service. Fall back to the pointer
-			// rather than inventing a requirement.
+			// A live run whose inputs name no requirement must not fall through to the
+			// pointer. The pointer names the requirement that was being served when the
+			// round began, which is exactly the identity this run was *not* admitted
+			// for; acting under it writes plans and dispatches work for the wrong
+			// requirement. Refusing is the only safe answer: the tools report that no
+			// requirement is resolvable rather than resolving the wrong one.
+			if (running.length > 0) return undefined;
+			// No run is live, so this is a control read rather than a run resolving the
+			// requirement it serves. Fall back to the pointer rather than inventing one.
 			return doc.activeRequestId === undefined ? undefined : { requestId: doc.activeRequestId, requestVersion: doc.requestVersion };
 		};
-		return tx === undefined ? await handle.commit(read, context) : await read(tx);
+		if (tx !== undefined) return await read(tx);
+		// Refreshed before the commit, never inside it: the read it makes is the one
+		// that deadlocks behind an open transaction. A control read therefore resolves
+		// the same placements a run's tools will, rather than reporting a run as having
+		// no requirement while its input sits in the link window.
+		await refreshPlacements();
+		return await handle.commit(read, context);
 	}
 
-	/** Record the requirement identity of one admitted input, so its run can resolve it. */
-	async function recordAdmission(
+	/**
+	 * Submission id → the logical key its placement was written under, for the
+	 * inputs whose admission does not name them yet.
+	 *
+	 * The recovery this serves cannot read the Harness where the read is needed.
+	 * `harness.submission()` is serialized behind the Session, so calling it inside
+	 * a tool's transaction does not fail — it waits for a commit that is waiting for
+	 * it, which is a deadlock, and one that a caller only reaches in exactly the
+	 * window this map exists for (an admission that names no submission). The
+	 * submission's key is therefore resolved from `inspect()`, a read this service
+	 * may make *outside* a commit, and cached for the transactions that follow.
+	 *
+	 * `beforeRequest` refreshes it on every generation attempt, which is the moment
+	 * that matters: it runs after preparation and before the provider is called, so
+	 * no tool of that run can execute before the map is current. Entries are never
+	 * evicted — a placed submission leaves `inspect()` once it settles, which is
+	 * after the run that needed it — so the map holds at most one entry per
+	 * submission this conversation has held.
+	 */
+	const placements = new Map<string, string>();
+
+	/** Refresh {@link placements} from the Harness, outside any transaction. */
+	async function refreshPlacements(): Promise<void> {
+		const inspection = await harness.inspect(context);
+		for (const record of inspection.submissions) {
+			if (record.conversationId !== conversationId || record.requestId === undefined) continue;
+			placements.set(String(record.id), record.requestId);
+		}
+	}
+
+	/**
+	 * The identity of an input this service placed but has not linked to its
+	 * submission yet, matched by the key the placement was recorded under.
+	 *
+	 * The admission actually names the requirement; the submission only names the
+	 * key. Matching through the key is what keeps the two from disagreeing: they are
+	 * written by the same placement, so a key that resolves to an admission resolves
+	 * to the request that admission was created for.
+	 */
+	function placementOf(admissions: readonly InputAdmission[], submissionId: string): InputAdmission | undefined {
+		const key = placements.get(submissionId);
+		return key === undefined ? undefined : admissions.find((entry) => entry.key === key);
+	}
+
+	/**
+	 * Record one input's requirement identity *before* the input is submitted.
+	 *
+	 * The identity has to be durable before the submission, not after: the Harness
+	 * answers `handle.submit` with a submission it may already have placed, and the
+	 * run made of that input resolves its requirement from its own inputs. An
+	 * identity written afterwards leaves that run with no requirement of its own.
+	 *
+	 * One entry per logical input key: a retry of the same input derives the same
+	 * key, so it is the same fact and keeps the identity it was first given.
+	 */
+	async function placeIdentity(
 		tx: Tx,
-		submissionId: string,
+		key: string,
 		requestId: string,
 		requestVersion: number,
 		expectedRequestVersion?: number,
 	): Promise<void> {
 		const doc = await tx.doc(MainServiceDoc, conversationId);
-		// One entry per submission: a replay of the same admission is the same fact.
-		if (doc.admissions.some((entry) => entry.submissionId === submissionId)) return;
+		if (doc.admissions.some((entry) => entry.key === key)) return;
 		doc.admissions = [
 			...doc.admissions,
-			{ submissionId, requestId, requestVersion, ...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }) },
+			{ key, requestId, requestVersion, ...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }) },
 		];
+	}
+
+	/** Attach the submission the Harness answered a placement with. */
+	async function linkSubmission(tx: Tx, key: string, submissionId: string): Promise<void> {
+		const doc = await tx.doc(MainServiceDoc, conversationId);
+		doc.admissions = doc.admissions.map((entry) => (entry.key === key ? { ...entry, submissionId } : entry));
+	}
+
+	/**
+	 * Rewrite the restoration section of an attempt's messages so it describes the
+	 * requirement *this run* serves, and return the replacement — or `undefined`
+	 * when the attempt as prepared should be sent unchanged.
+	 *
+	 * The section is rendered in the `prepare` phase, from the service's pointer,
+	 * which names the requirement that was active when the round began. A run
+	 * admitted for a restatement therefore prepares while the pointer still names
+	 * the previous requirement, and without this the run's first provider request
+	 * carries that requirement's text, materials, questions and plans — the facts
+	 * of a request this run was not admitted for. `reconcileQueue` has by now
+	 * consumed the run's input and moved the pointer, but the messages were built
+	 * before that, so they have to be corrected rather than re-read.
+	 *
+	 * The requirement is resolved the same way every tool in the run resolves it —
+	 * from the run's own input, not from the pointer — and re-rendered from
+	 * committed state in a single commit, so the text cannot mix two moments.
+	 * Because the identity comes from the input rather than from the wording, a
+	 * restatement of the *same* requirement is covered as well: it resolves to the
+	 * same request at its new version.
+	 *
+	 * A run that resolves no requirement of its own (an input refused on its version
+	 * basis, or one whose admission is not yet recoverable) loses the section
+	 * entirely. Leaving it would state the previous requirement's facts to a run
+	 * whose own tools are about to refuse; showing none is the honest prompt, and it
+	 * is the same fail-closed answer the tools give.
+	 */
+	async function restoreServedRequirement(
+		messages: readonly Message[],
+	): Promise<{ readonly messages: readonly Message[] } | undefined> {
+		const section = await handle.commit(async (tx) => {
+			const resolved = await activeRequest(tx);
+			if (resolved === undefined) return null;
+			const request = await tx.doc(AgentRequestDoc, conversationId, resolved.requestId, { requestId: resolved.requestId });
+			// `requestedAt === 0` is the contract's "never written" marker: the default
+			// above supplies a document that looks readable, so the field is what
+			// distinguishes a real requirement from the shape of one.
+			if (request.requestedAt === 0 || request.text === "") return null;
+			const service = await tx.doc(MainServiceDoc, conversationId);
+			const clarification = await tx.doc(AgentClarificationDoc, conversationId, resolved.requestId, {
+				requestId: resolved.requestId,
+			});
+			return restorationSectionText({
+				requestId: resolved.requestId,
+				requestVersion: request.requestVersion,
+				text: request.text,
+				materials: request.materials,
+				questions: clarification.questions,
+				answers: clarification.answers,
+				resolutions: clarification.resolutions,
+				plans: (service.plans as readonly PlanIndexEntry[]).filter((plan) => plan.requestId === resolved.requestId),
+			});
+		}, context);
+		const replaced = withRestorationSection(messages, section, now);
+		return replaced === undefined ? undefined : { messages: replaced };
 	}
 
 	async function readClarificationIn(tx: Tx, requestId: string): Promise<ClarificationState> {
@@ -429,9 +574,22 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		// overwrite a newer pointer with an already-finished one. Reconciling here, on
 		// every generation attempt of this conversation, activates the input as its run
 		// begins rather than as a side effect of being queried.
-		beforeRequest: async (api) => {
-			if (String(api.conversationId) !== String(conversationId)) return;
+		//
+		// Reconciling is not enough on its own. This hook runs in the `request` phase,
+		// *after* `prepare` rendered the restoration section from the pointer — which
+		// still named the previous requirement — so the run's first provider request
+		// would carry another requirement's text, materials, questions and plans.
+		// Rewriting the section in the messages this attempt is about to send is what
+		// makes the first request carry the requirement the run actually serves. It
+		// covers a restatement of the *same* requirement too, because the identity comes
+		// from the run's own input rather than from the text.
+		beforeRequest: async (request) => {
+			if (String(request.conversationId) !== String(conversationId)) return undefined;
+			// The placements first, because everything below resolves a requirement and
+			// a tool's own transaction cannot read them for itself.
+			await refreshPlacements();
 			await reconcileQueue();
+			return await restoreServedRequirement(request.messages);
 		},
 		...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
 	});
@@ -514,7 +672,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
 				// The caller's basis must still hold. A stale one is not applied — the
 				// input was admitted, but it does not become the active requirement.
-				if (entry.expectedRequestVersion !== undefined && storedVersion !== undefined && storedVersion !== entry.expectedRequestVersion) {
+				if (entry.expectedRequestVersion !== undefined && (storedVersion ?? 1) !== entry.expectedRequestVersion) {
 					// It cannot be un-placed from the transcript, but it is denied an
 					// identity: a run made of it resolves no requirement and its tools
 					// refuse, rather than acting under the previous request.
@@ -650,14 +808,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// follow-up to the same question is its own input rather than a replay
 				// of the first answer — and two requests that ask the same words cannot
 				// collide on one key.
-				const submission = await handle.submit(
-					{ type: "input", content: text, requestId: answerInputId(current.requestId, input.answerTo, revision) },
-					context,
-				);
-				await handle.commit(
-					async (tx) => await recordAdmission(tx, String(submission.id), current.requestId, current.requestVersion),
-					context,
-				);
+				const key = answerInputId(current.requestId, input.answerTo, revision);
+				// The identity is durable *before* the input: `handle.submit` may place the
+				// input and start its run before this service records anything else, and a
+				// run with no identity of its own would fall back to the previous
+				// requirement.
+				await handle.commit(async (tx) => await placeIdentity(tx, key, current.requestId, current.requestVersion), context);
+				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
+				await handle.commit(async (tx) => await linkSubmission(tx, key, String(submission.id)), context);
 				return { kind: "answer", questionId: input.answerTo, submission };
 			}
 
@@ -685,8 +843,25 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// resolved its requirement. Allocating it now is what lets the run bind
 				// its plans, and admit its dispatch, against the version the requirement
 				// is actually at.
+				// The submission key is the logical identity of the input, not a clock:
+				// keying on `queuedAt` would make the same input a different submission on
+				// a retry, which is the replay the dedup key exists to catch. The version
+				// in the key stays the version the input was queued *against* — the
+				// requirement's version when the caller submitted — because that is the
+				// identity the caller's own decision was made against.
+				const key = queuedInputId(requestId, requestVersion, text);
 				const allocatedVersion = await handle.commit(async (tx) => {
 					const doc = await tx.doc(MainServiceDoc, conversationId);
+					// One logical input has one identity. A retry — the same requirement,
+					// the same words — derives the same key and is the same input, so the
+					// version it becomes was already decided when it was first admitted.
+					// Deciding again counts the retry's own queue record as one more input
+					// and allocates the version *after* it, while the admission already
+					// linked to this key keeps the first: the input's identity would be
+					// split across two versions, and the requirement would end up at the
+					// version no run and no plan ever saw.
+					const placed = doc.admissions.find((entry) => entry.key === key);
+					if (placed !== undefined) return placed.requestVersion;
 					// The allocation is per requirement: a queued input becomes the version
 					// after the one the requirement is at, and a second queued input for the
 					// same requirement takes the version after that. Every input is decided
@@ -705,18 +880,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 						.map((entry) => readableVersion(entry.allocatedVersion))
 						.filter((version): version is number => version !== undefined);
 					const highest = Math.max(stored ?? 0, ...alreadyAllocated);
-					return highest === 0 ? 1 : highest + 1;
+					const version = highest === 0 ? 1 : highest + 1;
+					// Durable before the submission: the Harness may place this input and
+					// start its run as soon as `handle.submit` returns, and that run
+					// resolves its requirement from this record.
+					await placeIdentity(tx, key, requestId, version, input.expectedRequestVersion);
+					return version;
 				}, context);
-				// The submission key is the logical identity of the input, not a clock:
-				// keying on `queuedAt` would make the same input a different submission on
-				// a retry, which is the replay the dedup key exists to catch. The version
-				// in the key stays the version the input was queued *against* — the
-				// requirement's version when the caller submitted — because that is the
-				// identity the caller's own decision was made against.
-				const submission = await handle.submit(
-					{ type: "input", content: text, requestId: queuedInputId(requestId, requestVersion, text) },
-					context,
-				);
+				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
 				const record: QueuedInput = {
 					submissionId: String(submission.id),
 					requestId,
@@ -737,12 +908,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					doc.queue = doc.queue.some((entry) => entry.submissionId === record.submissionId)
 						? doc.queue.map((entry) => (entry.submissionId === record.submissionId ? record : entry))
 						: [...doc.queue, record];
-					// The admission is recorded now, so that when the Harness places this
-					// input at the next boundary and starts a run for it, the run resolves
-					// the requirement from its own input rather than from the lagging
-					// pointer — and resolves the version it was allocated, not the one it
-					// was queued against.
-					await recordAdmission(tx, String(submission.id), requestId, allocatedVersion, input.expectedRequestVersion);
+					// The submission id is linked to the identity that was already placed
+					// under this key, so a run made of this input resolves the requirement
+					// from its own input rather than from the lagging pointer — and resolves
+					// the version it was allocated, not the one it was queued against.
+					await linkSubmission(tx, key, record.submissionId);
 				}, context);
 				return { kind: "queued", submission, reason: "a round is running; the input is queued for the next boundary" };
 			}
@@ -751,12 +921,19 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
 			// The version check and the write happen in ONE commit, so a concurrent
 			// restatement cannot slip between them.
-			let staleVersion: { readonly expected: number; readonly stored: number } | undefined;
+			let staleVersion: { readonly expected: number; readonly stored: number | undefined } | undefined;
 			let requestVersion = 0;
 			await handle.commit(async (tx) => {
 				const doc = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
 				const storedVersion = doc.requestedAt === 0 ? undefined : doc.requestVersion;
-				if (input.expectedRequestVersion !== undefined && storedVersion !== undefined && storedVersion !== input.expectedRequestVersion) {
+				// An explicit `expectedRequestVersion` is a precondition on the version the
+				// requirement is at, and "no requirement recorded yet" is a version like
+				// any other rather than a missing comparison. A request that has never
+				// been written is at 1 — the version this input would create — so a caller
+				// that says it expects version 99 is refused instead of silently having
+				// its premise ignored and a request created.
+				const basis = storedVersion ?? 1;
+				if (input.expectedRequestVersion !== undefined && basis !== input.expectedRequestVersion) {
 					staleVersion = { expected: input.expectedRequestVersion, stored: storedVersion };
 					return;
 				}
@@ -769,10 +946,15 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				pointer.requestVersion = requestVersion;
 			}, context);
 			if (staleVersion !== undefined) {
-				return { kind: "refused", reason: `stale request version: expected ${staleVersion.expected}, stored ${staleVersion.stored}` };
+				return { kind: "refused", reason: `stale request version: expected ${staleVersion.expected}, stored ${staleVersion.stored ?? "none"}` };
 			}
-			const submission = await handle.submit({ type: "input", content: text, requestId: requestInputId(requestId, requestVersion) }, context);
-			await handle.commit(async (tx) => await recordAdmission(tx, String(submission.id), requestId, requestVersion), context);
+			const key = requestInputId(requestId, requestVersion);
+			// Durable before the input, for the same reason as an answer: the run made of
+			// this input resolves its requirement from its own inputs, and those inputs
+			// have to name it before the run can start.
+			await handle.commit(async (tx) => await placeIdentity(tx, key, requestId, requestVersion), context);
+			const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
+			await handle.commit(async (tx) => await linkSubmission(tx, key, String(submission.id)), context);
 			return { kind: "request", requestId, requestVersion, submission };
 		},
 

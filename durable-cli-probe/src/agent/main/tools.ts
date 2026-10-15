@@ -30,7 +30,7 @@
 //     interruption re-executes, so every tool first looks for a persisted
 //     operation receipt keyed by the real tool call and returns that instead.
 
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type Message } from "@earendil-works/pi-ai";
 import {
 	defineExtension,
 	defineTool,
@@ -152,18 +152,36 @@ export type MainToolHost = {
 	 */
 	readonly indexPlans?: boolean;
 	/**
-	 * Called at the start of every generation attempt of this conversation, before
-	 * the provider request. The service uses it as its **consumption boundary**: a
-	 * queued input is placed and its run started by the Harness before any service
-	 * call observes the queue, so activating it here — rather than when a caller
-	 * happens to read the queue — is what keeps the requirement current for the run
-	 * that is actually serving it.
+	 * Called during every generation attempt of this conversation, before the
+	 * provider request is issued. The service uses it as its **consumption
+	 * boundary**: a queued input is placed and its run started by the Harness before
+	 * any service call observes the queue, so activating it here — rather than when
+	 * a caller happens to read the queue — is what keeps the requirement current for
+	 * the run that is actually serving it.
 	 *
-	 * Awaited, so the activation lands before the prompt for this attempt is built.
-	 * Absent means the caller drives reconciliation itself.
+	 * It runs *after* the attempt's prompt has been built: Pi renders the system
+	 * sections and appends the system entries in the `prepare` phase
+	 * (`generation.ts:150`) and runs this hook in the `request` phase (`:197`).
+	 * Reconciling here therefore cannot change what preparation already wrote, so
+	 * it is handed the messages this attempt is about to send and may return a
+	 * replacement for them — which is what lets a run whose requirement the
+	 * pointer did not yet name correct the prompt it was prepared with.
+	 *
+	 * Awaited, so the activation is committed before the request is issued. Absent
+	 * means the caller drives reconciliation itself.
 	 */
-	readonly beforeRequest?: (api: { readonly conversationId: ConversationId }) => Promise<void>;
+	readonly beforeRequest?: (request: BeforeRequest) => Promise<BeforeRequestResult>;
 };
+
+/** One generation attempt, offered to the host before the provider request is issued. */
+export type BeforeRequest = {
+	readonly conversationId: ConversationId;
+	/** The exact messages this attempt will send, before any host correction. */
+	readonly messages: readonly Message[];
+};
+
+/** `undefined` sends the attempt's own messages; a value replaces them for this request only. */
+export type BeforeRequestResult = { readonly messages: readonly Message[] } | undefined;
 
 /** Read a model-supplied string list, refusing a non-array rather than coercing it. */
 function readStringList(value: unknown): { readonly ok: true; readonly value: string[] } | { readonly ok: false; readonly detail: string } {
@@ -273,14 +291,22 @@ export function createMainExtension(host: MainToolHost): Extension {
 			// duplicate branch, and loses the handoff — the run would not end.
 			const written = await api.commit(async (tx) => {
 				const state = await tx.doc(AgentClarificationDoc, api.conversationId, active.requestId, { requestId: active.requestId });
-				// A re-ask of the *same words* is the same question, not a new one: the
-				// contract holds one answer per question, so a second copy would leave
-				// the first permanently unanswerable. It must still end the run — the
-				// model asking again after an insufficient answer is exactly AC-02's
-				// "补充仍模糊继续问", and returning bare text would let the round
-				// continue instead.
-				const sameText = state.questions.find((question) => question.question === args.question);
-				const alreadyOpen = sameText !== undefined && !resolvedIds(state).has(sameText.questionId);
+				// A re-ask of the *same words* is the same question only while that
+				// question is still open: the contract holds one answer per question, so
+				// a second copy would leave the first permanently unanswerable. It must
+				// still end the run — the model asking again after an insufficient answer
+				// is exactly AC-02's "补充仍模糊继续问", and returning bare text would
+				// let the round continue instead.
+				//
+				// Once the question has been *resolved*, the same words are a new
+				// question: the requirement has moved on, and reusing the resolved id
+				// would ask the user for something the service then refuses as "question
+				// ... is not open" — the ask and the answer disagree about which question
+				// is being answered. The new question gets its own id, and the resolved
+				// one keeps its answer and its history.
+				const resolved = resolvedIds(state);
+				const sameText = state.questions.find((question) => question.question === args.question && !resolved.has(question.questionId));
+				const alreadyOpen = sameText !== undefined;
 				const questionId = sameText === undefined ? deriveQuestionId(active.requestId, state.questions.length + 1, args.question) : sameText.questionId;
 				if (sameText === undefined) {
 					// A *question* is model-authored by design — the model is what
@@ -575,10 +601,10 @@ export function createMainExtension(host: MainToolHost): Extension {
 		name: "main-management",
 		tools: [requestClarification, savePlan, dispatchTasks],
 		// The restoration facts ride on a *section* rather than only on the handoff
-		// payload, so they are re-read from committed state before every provider
-		// request. The payload is a snapshot taken when the question tool completed,
-		// and a sibling tool in the same round may write after it; the section is
-		// never one write behind.
+		// payload, so they are rendered from committed state for every attempt, during
+		// that attempt's preparation. The payload is a snapshot taken when the question
+		// tool completed, and a sibling tool in the same round may write after it; the
+		// section is never one write behind the payload.
 		sections: [mainRestorationSection],
 		// The consumption boundary, on the built-in generation task. Registered only
 		// when the host supplies one, so a test that drives reconciliation itself is
@@ -590,8 +616,11 @@ export function createMainExtension(host: MainToolHost): Extension {
 						{
 							task: "pi.generation",
 							handlers: {
-								beforeRequest: async (_request: unknown, api: { readonly conversationId: ConversationId }) => {
-									await host.beforeRequest?.({ conversationId: api.conversationId });
+								beforeRequest: async (
+									request: { readonly messages: readonly Message[] },
+									api: { readonly conversationId: ConversationId },
+								) => {
+									return await host.beforeRequest?.({ conversationId: api.conversationId, messages: request.messages });
 								},
 							},
 						},

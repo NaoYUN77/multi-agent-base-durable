@@ -38,17 +38,47 @@ const MARKER = "CLARIFY-MARKER-3B7E";
 function flatten(messages: readonly unknown[]): string {
 	return messages
 		.map((message) => {
-			const content = (message as { content?: unknown }).content;
-			if (typeof content === "string") return content;
-			if (!Array.isArray(content)) return "";
-			return content
-				.map((part) => (typeof part === "object" && part !== null && "text" in part ? String((part as { text?: string }).text ?? "") : ""))
+			const record = message as { content?: unknown; sections?: Record<string, string | null> };
+			// A system message carries prompt sections in a `sections` field beside
+			// `content`, and the provider renders those sections into the text it sends,
+			// so a helper that reads only `content` reports a rendered section as
+			// absent. Both halves belong in "what the provider actually received".
+			const sections = Object.values(record.sections ?? {})
+				.filter((value): value is string => typeof value === "string")
 				.join("\n");
+			const content = record.content;
+			if (typeof content === "string") return `${content}\n${sections}`;
+			if (!Array.isArray(content)) return sections;
+			return [
+				content
+					.map((part) => (typeof part === "object" && part !== null && "text" in part ? String((part as { text?: string }).text ?? "") : ""))
+					.join("\n"),
+				sections,
+			].join("\n");
 		})
 		.join("\n");
 }
 
+/**
+ * The restoration section of a request, folded the way the prompt replays it: a
+ * later system message's value replaces an earlier one, `null` removes it.
+ *
+ * Needed in addition to `flatten` because a request carries the whole transcript,
+ * so the previous request's *words* are in it as ordinary user content. Only the
+ * section says which requirement the prompt claims to be serving.
+ */
+function restorationOf(messages: readonly unknown[]): string {
+	let shown: string | null = null;
+	for (const message of messages) {
+		const sections = (message as { sections?: Record<string, string | null> }).sections;
+		if (sections === undefined || !("main-restoration" in sections)) continue;
+		shown = sections["main-restoration"] ?? null;
+	}
+	return shown ?? "";
+}
+
 describe("TASK-005.2 clarification — a question ends the round (AC-02)", { timeout: 30_000 }, () => {
+
 	let directory: string;
 	let databasePath: string;
 	/** Every request the provider actually received, in order. */
@@ -472,6 +502,67 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 		}
 	});
 
+	it("treats a requirement that was never written as version 1 for the version precondition (AC-04)", async () => {
+		// `expectedRequestVersion` is a precondition on the version the requirement is
+		// at, and "nothing recorded yet" is one of the versions it can be at — not a
+		// missing comparison. Treating it as missing lets a caller whose premise could
+		// never have been observed have it silently ignored, and a request created on
+		// top of that. All three shapes are checked here: absent, matching, mismatching.
+		const router: FauxResponseFactory = () => fauxAssistantMessage([fauxText("done")]);
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			// Absent: no precondition at all, so the request is created.
+			const absent = await service.submitUserInput({ text: `${MARKER} first`, requestId: "req-x" });
+			expect(absent.kind).toBe("request");
+			if (absent.kind !== "request") return;
+			await absent.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// Mismatching on a requirement that was never written: the basis is 1, so a
+			// caller expecting 99 is refused — and the refusal writes nothing, leaving the
+			// requirement exactly as absent as it was.
+			const wrong = await service.submitUserInput({ text: `${MARKER} other`, requestId: "req-never", expectedRequestVersion: 99 });
+			expect(wrong.kind).toBe("refused");
+			if (wrong.kind !== "refused") return;
+			expect(wrong.reason).toContain("stale request version");
+			expect(wrong.reason).toContain("stored none");
+			const never = await runtime.harness.snapshot(AgentRequestDoc, 1 as never, "req-never", context);
+			expect(never?.requestedAt ?? 0).toBe(0);
+			expect(never?.text ?? "").toBe("");
+			expect((await service.readRequest()).requestId).toBe("req-x");
+
+			// Matching on a requirement that was never written: 1 is the version it is at.
+			const matching = await service.submitUserInput({ text: `${MARKER} second`, requestId: "req-y", expectedRequestVersion: 1 });
+			expect(matching.kind).toBe("request");
+			if (matching.kind !== "request") return;
+			expect(matching.requestVersion).toBe(1);
+			await matching.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// And matching on a requirement that *has* been written: it is at v1, so the
+			// restatement is accepted and moves it to v2.
+			const restated = await service.submitUserInput({ text: `${MARKER} second, restated`, requestId: "req-y", expectedRequestVersion: 1 });
+			expect(restated.kind).toBe("request");
+			if (restated.kind !== "request") return;
+			expect(restated.requestVersion).toBe(2);
+			await restated.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The same basis a second time is now stale: the requirement moved under it.
+			const late = await service.submitUserInput({ text: `${MARKER} second, again`, requestId: "req-y", expectedRequestVersion: 1 });
+			expect(late.kind).toBe("refused");
+			if (late.kind !== "refused") return;
+			expect(late.reason).toContain("stored 2");
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("refuses an answer with no sufficiency judgement, and leaves the question open (AC-02, AC-04)", async () => {
 		// There is no default. "The user replied" is not "the reply is sufficient"
 		// (contract §"Main Agent 合同"), so an input that answers without a judgement
@@ -606,6 +697,81 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			const a = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-a", context);
 			expect(a?.answers).toHaveLength(1);
 			expect(openQuestionIds(a!)).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("asks a resolved question's words again as a new, answerable question (AC-02, AC-04)", async () => {
+		// The contract holds one answer per question, and a question is closed once it
+		// has one. So the *same words* are two different questions depending on when
+		// they are asked: while the first is still open a repeat is that same question,
+		// and once it has been resolved the repeat is a new one. Reusing the resolved
+		// id would make the ask and the answer disagree about what is being answered —
+		// the model would name a question the service has closed, and the user's reply
+		// to it would be refused as "question ... is not open".
+		//
+		// Both halves are asserted: the id is new, and the new question can actually be
+		// answered and reach the model.
+		let asked = 0;
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			let newest = -1;
+			for (let index = request.messages.length - 1; index >= 0; index--) {
+				if (request.messages[index]!.role === "user") {
+					newest = index;
+					break;
+				}
+			}
+			const askedThisRound = request.messages.slice(newest + 1).some((message) => message.role === "toolResult");
+			// The first turn of each of the first two runs asks the identical words.
+			if (asked < 2 && !askedThisRound) {
+				asked += 1;
+				return fauxAssistantMessage(
+					[fauxToolCall("request_clarification", { question: "Which file should I use?", reason: "two files match", blockedTaskIds: [] }, { id: `ask-${asked}` })],
+					{ stopReason: "toolUse" },
+				);
+			}
+			return fauxAssistantMessage([fauxText("nothing more to ask")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} please count`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const firstQuestion = (await service.readRequest()).openQuestionIds[0]!;
+
+			// Answering it sufficiently resolves it, which is what makes the next ask a
+			// different question rather than a repeat.
+			const answered = await service.submitUserInput({ text: "Use report.txt", answerTo: firstQuestion, sufficient: true });
+			if (answered.kind !== "answer") throw new Error("expected an answer");
+			await answered.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			const doc = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-a", context);
+			const questions = doc?.questions ?? [];
+			expect(questions).toHaveLength(2);
+			// The same words, asked twice, as two questions.
+			expect(questions[0]!.question).toBe(questions[1]!.question);
+			expect(questions[1]!.questionId).not.toBe(questions[0]!.questionId);
+			// The resolution stayed with the first question, and only the second is open.
+			expect((await service.readRequest()).openQuestionIds).toEqual([questions[1]!.questionId]);
+
+			// And the new question is answerable: the reply is accepted, and it reaches
+			// the model rather than being deduplicated against the answered first one.
+			requests.length = 0;
+			const second = await service.submitUserInput({ text: "Use the second file", answerTo: questions[1]!.questionId, sufficient: true });
+			expect(second.kind).toBe("answer");
+			if (second.kind !== "answer") return;
+			await second.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect(requests.some((said) => said.includes("Use the second file"))).toBe(true);
 		} finally {
 			await runtime.close();
 		}
@@ -783,6 +949,276 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			await runtime.close();
 		}
 	});
+	it("sends a queued run's own requirement in its first provider request, not the previous one's (AC-01, AC-03)", async () => {
+		// The reviewer's prompt point, and the reason a section alone is not enough.
+		// The restoration section is rendered in the `prepare` phase, and the service
+		// only consumes a queued input at the request boundary — so the run that starts
+		// for a restatement prepares while the pointer still names the requirement of
+		// the round before it, and its *first* provider request would carry that
+		// requirement's text, materials, questions and plans. Correcting the pointer
+		// afterwards cannot fix a prompt that is already built, so the service rewrites
+		// the section in the messages the attempt is about to send.
+		//
+		// The assertion is on the request the provider actually received, and on the
+		// section rather than the whole transcript: the previous request's *words* are
+		// in the transcript as ordinary user content and are supposed to be there. What
+		// must not be there is a restoration that names the wrong requirement.
+		const requests: (readonly unknown[])[] = [];
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(request.messages);
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const queued = await service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The run the queue produced: the first request whose restoration names req-b.
+			const index = requests.findIndex((messages) => restorationOf(messages).includes("Request req-b"));
+			expect(index).toBeGreaterThanOrEqual(0);
+			const section = restorationOf(requests[index]!);
+
+			// Its own requirement, at its own version, with its own words — and no trace
+			// of the requirement the pointer still named while this prompt was prepared.
+			expect(section).toContain("Request req-b v1");
+			expect(section).toContain(`${MARKER} second request`);
+			expect(section).not.toContain("req-a");
+			expect(section).not.toContain(`${MARKER} first request`);
+
+			// And the section is in the *leading* system message, which is the only
+			// placement every provider renders: a trailing system message is an update
+			// for APIs that accept mid-conversation system messages and is folded away
+			// by the rest.
+			const leading = requests[index]![0] as { role?: string; sections?: Record<string, string | null> };
+			expect(leading.role).toBe("system");
+			expect(leading.sections?.["main-restoration"]).toContain("Request req-b v1");
+
+			// The first run's own request is unchanged in kind: it names req-a, because
+			// that is the requirement it was admitted for.
+			expect(restorationOf(requests[0]!)).toContain("Request req-a v1");
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("resolves a queued run's requirement from its own input while its admission is still unlinked (AC-01, AC-03)", async () => {
+		// The placement window, made deterministic. `handle.submit` returns before the
+		// service's own link commit lands, and the Harness may place the input and start
+		// its run in between — so a live run can have an input whose admission names no
+		// submission. Resolving from the admission list alone finds nothing there, and
+		// falling back to the pointer would hand that run the *previous* requirement.
+		// The submission carries the key the placement was written under, so the
+		// identity is recovered from the run's own input rather than guessed.
+		//
+		// The window is opened here by clearing the link the service wrote, because
+		// racing a thread through the real gap cannot be made deterministic. The link is
+		// asserted gone before the run starts, so a test that passes did so through the
+		// recovery path and not through the field it just cleared.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		let askedOnce = false;
+		const requests: string[] = [];
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			// Asked once: a refused `save_plan` does not end the round the way a saved one
+			// does, so an unguarded script would call it again on every subsequent request
+			// and never reach a stop reason.
+			if (!askedOnce && (requests[requests.length - 1] ?? "").includes("second request")) {
+				askedOnce = true;
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-b", goals: ["B"], taskIds: ["t1"] }, { id: "b1" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const queued = await service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+
+			// Open the window: the identity is placed and the submission is admitted, but
+			// the run that starts for it will find no admission naming its submission.
+			await runtime.harness.commit(async (tx) => {
+				const doc = await tx.doc(MainServiceDoc, 1 as never);
+				doc.admissions = doc.admissions.map((admission) => {
+					if (admission.requestId !== "req-b") return admission;
+					// Dropped rather than set to `undefined`: the document is JSON, and an
+					// explicit `undefined` is not a value it can hold.
+					const { submissionId: _unlinked, ...rest } = admission;
+					return rest;
+				});
+			}, context);
+			const unlinked = (await runtime.harness.snapshot(MainServiceDoc, 1 as never, context))?.admissions ?? [];
+			expect(unlinked.find((admission) => admission.requestId === "req-b")?.submissionId).toBeUndefined();
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The plan the queued run saved names req-b, so the run resolved its own
+			// requirement through the recovery rather than falling back to req-a.
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-b", context);
+			expect(saved?.requestId).toBe("req-b");
+			expect(saved?.goals).toEqual(["B"]);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("refuses a queued run that resolves no requirement of its own instead of serving the previous one (AC-01, AC-04)", async () => {
+		// The other half of the same rule. A queued restatement whose version basis went
+		// stale while it waited is placed in the transcript — nothing can un-place it —
+		// but it is denied an identity. Its run must then refuse, not fall through to the
+		// pointer: the pointer still names the requirement the round before it was
+		// serving, and a tool acting under that identity would write the *old* goal's
+		// plan for a run the user had already restated.
+		//
+		// The refusal is asserted where it matters — on the text the provider was
+		// actually handed after the tool ran — and again on the durable fact that no plan
+		// was written under req-a's name.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		let askedOnce = false;
+		const requests: string[] = [];
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			if (!askedOnce && (requests[requests.length - 1] ?? "").includes("stale restatement")) {
+				askedOnce = true;
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-stale", goals: ["g"], taskIds: ["t1"] }, { id: "s1" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			// Queued against a basis that is already stale: the requirement is at v1.
+			const stale = await service.submitUserInput({ text: "stale restatement", requestId: "req-a", expectedRequestVersion: 99 });
+			expect(stale.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The tool ran and refused; the provider was told so, in the run that was
+			// denied the identity.
+			expect(requests.some((said) => said.includes("save_plan refused: no active request is recorded"))).toBe(true);
+
+			// And durably: nothing was written under the previous requirement's name.
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-stale", context);
+			expect(saved?.requestId ?? "").not.toBe("req-a");
+			expect(saved?.goals ?? []).toEqual([]);
+
+			// The requirement itself did not move: the stale input never became it.
+			const view = await service.readRequest();
+			expect(view.text).toBe(`${MARKER} first request`);
+			expect(view.requestVersion).toBe(1);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("refuses a run whose input carries no requirement of this service's, rather than serving the previous one (AC-01, AC-04)", async () => {
+		// The fail-closed half of the identity rule, and the one a pointer fallback
+		// gets wrong. A run can be live whose inputs name no requirement *this service*
+		// admitted — an input placed by another writer, or one replayed after a
+		// restart. The pointer still names whatever the round before it was serving, so
+		// falling back to it lets that run save a plan and dispatch work under a
+		// requirement it was never admitted for. Refusing is the only safe answer, and
+		// the refusal is asserted where it lands: on the text the provider was handed,
+		// and on the requirement document that was not written.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		let askedOnce = false;
+		const requests: string[] = [];
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			if (!askedOnce && (requests[requests.length - 1] ?? "").includes("foreign input")) {
+				askedOnce = true;
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-f", goals: ["g"], taskIds: ["t1"] }, { id: "f1" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			// Submitted straight to the Harness, the way another writer would: the
+			// service never placed an identity for it, so its run has none to resolve.
+			await root.submit({ type: "input", content: `${MARKER} foreign input`, requestId: "req-foreign" }, context);
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			expect(requests.some((said) => said.includes("save_plan refused: no active request is recorded"))).toBe(true);
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-f", context);
+			expect(saved?.version ?? 0).toBe(0);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
 	it("activates a consumed queued input at its run's boundary, without a queue read (AC-01, AC-03)", async () => {
 		// The consumption boundary is the run, not a query. A queued input is placed
 		// and its run started by the Harness before any service call observes the
@@ -913,6 +1349,69 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			const queue = await service.readQueue();
 			expect(queue).toHaveLength(1);
 			expect(queue[0]?.submissionId).toBe(String(once.submission.id));
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("allocates a queued retry's version once, so consuming it moves the requirement once (AC-05, AC-01)", async () => {
+		// The consequence of the record above, and the reason the allocation lives in
+		// the admission rather than being derived at consume time. A retry is the same
+		// logical input — the same requirement and the same words — so it derives the
+		// same key and the Harness answers it with the same submission. Reserving a
+		// version per *call* would count the retry as a second queued input and allocate
+		// the version after it, while the admission the run resolves from keeps the
+		// first: the input's identity would be split across two versions, and the
+		// requirement would end at a version no run and no plan ever saw.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		let askedOnce = false;
+		const requests: string[] = [];
+		const router: FauxResponseFactory = async (request) => {
+			requests.push(flatten(request.messages));
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			if (!askedOnce && (requests[requests.length - 1] ?? "").includes("restated words")) {
+				askedOnce = true;
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-r", goals: ["g"], taskIds: ["t1"] }, { id: "r1" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} busy`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const once = await service.submitUserInput({ text: "restated words", requestId: "req-a" });
+			const twice = await service.submitUserInput({ text: "restated words", requestId: "req-a" });
+			expect(once.kind).toBe("queued");
+			expect(twice.kind).toBe("queued");
+			if (once.kind !== "queued" || twice.kind !== "queued") return;
+			expect(String(twice.submission.id)).toBe(String(once.submission.id));
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// One input was consumed, so the requirement moved one version — to v2, the
+			// version the run resolved and the version its plan was written against.
+			const view = await service.readRequest();
+			expect(view.text).toBe("restated words");
+			expect(view.requestVersion).toBe(2);
+
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-r", context);
+			expect(saved?.requestId).toBe("req-a");
+			expect(saved?.requestVersion).toBe(2);
 		} finally {
 			release?.();
 			await runtime.close();

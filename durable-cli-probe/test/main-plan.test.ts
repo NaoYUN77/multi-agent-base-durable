@@ -1295,6 +1295,72 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("answers a simple, unambiguous request directly, asking nothing and creating no sub-task (AC-02)", async () => {
+		// The contract's other AC-02 branch, and the one no test covered: a request
+		// clear enough to serve as it stands. The evidence has to be the *absence* of
+		// work rather than the model's word for it — the provider is asked once, no
+		// question is recorded, and the executor (the only surface that can create a
+		// sub-task) never runs — while the user still gets the answer itself.
+		const answer = "The file holds 3 markers.";
+		const requests: string[] = [];
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			return fauxAssistantMessage([fauxText(answer)]);
+		};
+		const dispatched: (readonly TaskSpec[])[] = [];
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async ({ tasks }) => {
+					dispatched.push([...tasks]);
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				now: () => 1_700_000_000_000,
+			});
+
+			const outcome = await service.submitUserInput({ text: "count the markers in report.txt", requestId: "req-plan" });
+			if (outcome.kind !== "request") throw new Error("expected a request");
+			await outcome.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// One provider request carrying the user's words: the run did not go round
+			// again looking for work to delegate.
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toContain("count the markers in report.txt");
+
+			// Nothing was delegated, and no plan was recorded to delegate from.
+			expect(dispatched).toEqual([]);
+			const view = await service.readRequest();
+			expect(view.requestId).toBe("req-plan");
+			expect(view.text).toBe("count the markers in report.txt");
+			// Not one question, so the direct answer was not a vague request quietly
+			// served as if it were clear.
+			expect(view.questions).toEqual([]);
+			expect(view.openQuestionIds).toEqual([]);
+			expect(view.plans).toEqual([]);
+
+			// And the answer reached the conversation as an assistant turn: a run that
+			// creates no sub-task still has to have served the user.
+			const entries = await (await runtime.harness.conversation(1 as never, context))!.entries({ order: "ascending" }, 200, undefined, context);
+			const spoken = entries.items
+				.filter((entry) => entry.kind === "pi.assistant")
+				.map((entry) => flatten(entry.model ?? []))
+				.join("\n");
+			expect(spoken).toContain(answer);
+			// No tool ran at all, so `save_plan` / `dispatch_tasks` cannot have been
+			// called and then rolled back.
+			expect(entries.items.filter((entry) => entry.kind === "pi.tool-result")).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("ends the run when the model re-asks the same question after an insufficient answer (AC-02)", async () => {
 		// The branch the earlier chain test did not cover: after a vague reply the model
 		// asks the *same words* again. A question with that text is already recorded,

@@ -118,8 +118,24 @@ export type OperationReceipt = {
  * requirement, before any tool in it executes.
  */
 export type InputAdmission = {
-	/** The submission the Harness admitted. */
-	readonly submissionId: string;
+	/**
+	 * The logical submission key this service placed the input under, exactly as it
+	 * was passed to `handle.submit`.
+	 *
+	 * Written *before* the submission is made, so the binding is durable from the
+	 * moment the Harness can start a run for the input. `handle.submit` returns
+	 * before this service records anything else, and the Harness places the input
+	 * and starts its run at the round boundary in the meantime — so a binding
+	 * written only after `handle.submit` returns leaves a window in which the run
+	 * has no identity and falls back to the previous request. The key is what makes
+	 * the binding recoverable within that window: the submission itself carries it.
+	 */
+	readonly key: string;
+	/**
+	 * The submission the Harness admitted. Absent while the input is placed but its
+	 * submission id has not been linked back yet — the window above.
+	 */
+	readonly submissionId?: string;
 	readonly requestId: string;
 	readonly requestVersion: number;
 	/**
