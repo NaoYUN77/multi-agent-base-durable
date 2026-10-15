@@ -259,7 +259,13 @@ export function createMainExtension(host: MainToolHost): Extension {
 			question: Type.String({ description: "The single question to ask, in the user's language." }),
 			options: Type.Optional(Type.Array(Type.String(), { description: "Suggested answers, when a short list helps." })),
 			reason: Type.String({ description: "Why the answer is needed — what cannot be decided without it." }),
-			blockedTaskIds: Type.Optional(Type.Array(Type.String(), { description: "Task ids that stay blocked while this is open. Omit to block the whole request." })),
+			blockedTaskIds: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"Task ids that stay blocked while this is open. Omit to block the whole request. " +
+						"Re-asking the same question with this set narrows the scope you already declared, so tasks that turn out not to depend on the answer can still run.",
+				}),
+			),
 		}),
 		replay: "safe",
 		executionMode: "parallel",
@@ -317,6 +323,25 @@ export function createMainExtension(host: MainToolHost): Extension {
 						...state.questions,
 						{ questionId, question: args.question, reason: args.reason, blockingScope: [...blocked.value], askedAt: clock() },
 					];
+					const checked = validateClarificationState(state);
+					if (!checked.ok) {
+						throw new Error(`clarification state invalid: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}`);
+					}
+				} else if (Array.isArray(args.blockedTaskIds)) {
+					// An explicit scope on a re-ask *narrows* the open question. Without
+					// this the scope was frozen at the first ask: a model that first asked
+					// without `blockedTaskIds` (scope empty = blocks the whole request) could
+					// never narrow it to the one task really in doubt, and AC-03's
+					// independent tasks stayed blocked for as long as the question remained
+					// open — which, after an insufficient answer, is indefinitely.
+					//
+					// Only an explicit list changes it: a re-ask that omits `blockedTaskIds`
+					// leaves the recorded scope alone, so asking again can never silently
+					// widen a scope the model had already narrowed. Widening stays possible,
+					// but has to be asked for.
+					state.questions = state.questions.map((question) =>
+						question.questionId === questionId ? { ...question, blockingScope: [...blocked.value] } : question,
+					);
 					const checked = validateClarificationState(state);
 					if (!checked.ok) {
 						throw new Error(`clarification state invalid: ${checked.violations.map((v) => `${v.path}:${v.code}`).join(", ")}`);

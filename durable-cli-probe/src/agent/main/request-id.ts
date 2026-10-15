@@ -77,6 +77,25 @@ export function deriveQuestionId(requestId: string, round: number, question: str
 }
 
 /**
+ * The request id when the caller did not name one.
+ *
+ * Derived from the requirement's own words, never from the clock. A
+ * clock-derived id (the shape this replaced) makes the same logical submission a
+ * *different* submission when it is retried after an interruption — so a retry
+ * whose reply was lost becomes a second requirement with its own document and
+ * its own plan index, instead of settling as the replay the Harness's dedup key
+ * exists to catch (rule 1).
+ *
+ * The trade-off is explicit and is the caller's to manage: with no `requestId`
+ * given, two *different* requirements told in exactly the same words are one
+ * requirement — the second submission restates it at the next version. Naming
+ * the two is what a caller does when they are two.
+ */
+export function derivedRequestId(text: string): string {
+	return `req-${stableSlug(text)}`;
+}
+
+/**
  * A short, collision-resistant slug of `text`: enough of the text to read in a
  * ledger, plus a 32-bit FNV-1a hash so two long questions with the same opening
  * words stay distinct. Deterministic across processes and platforms.

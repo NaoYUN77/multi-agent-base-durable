@@ -1361,6 +1361,103 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("narrows a still-open question's scope on a re-ask, so an independent task runs (AC-03)", async () => {
+		// A question asked *without* `blockedTaskIds` blocks the whole request. The
+		// model then works out that only t1 is really in doubt, and the only way it can
+		// say so is to ask the same question again. That re-ask used to hit the
+		// duplicate branch and write nothing, so the scope stayed empty and t2 stayed
+		// blocked for as long as the question was open — indefinitely, once an answer
+		// is judged insufficient. The evidence is the executor: t2 runs while the
+		// question is still open and scoped to t1 alone.
+		const requests: string[] = [];
+		const dispatched: string[][] = [];
+		const router: FauxResponseFactory = (request) => {
+			requests.push(flatten(request.messages));
+			let newest = -1;
+			for (let index = request.messages.length - 1; index >= 0; index--) {
+				if (request.messages[index]!.role === "user") {
+					newest = index;
+					break;
+				}
+			}
+			const said = newest >= 0 ? flatten([request.messages[newest]!]) : "";
+			const sawToolResult = request.messages.slice(newest + 1).some((message) => message.role === "toolResult");
+			if (sawToolResult) return fauxAssistantMessage([fauxText("nothing left to do")]);
+			if (said.includes("plan the work")) {
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("save_plan", { planId: "plan-a", goals: ["g"], taskIds: ["t1", "t2"] }, { id: "save-0" }),
+						fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: "ask-1" }),
+					],
+					{ stopReason: "toolUse" },
+				);
+			}
+			if (said.includes("not sure")) {
+				// The re-ask: same words, now naming what actually depends on the answer.
+				return fauxAssistantMessage(
+					[fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match", blockedTaskIds: ["t1"] }, { id: "ask-2" })],
+					{ stopReason: "toolUse" },
+				);
+			}
+			if (said.includes("still unsure")) {
+				// t2 does not depend on the answer, so it is dispatched while the question
+				// is still open.
+				return fauxAssistantMessage(
+					[fauxToolCall("dispatch_tasks", { planId: "plan-a", version: 1, tasks: [taskSpec("t2")] }, { id: "disp-t2" })],
+					{ stopReason: "toolUse" },
+				);
+			}
+			return fauxAssistantMessage([fauxText("nothing left to do")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async ({ tasks }) => {
+					dispatched.push(tasks.map((task) => task.id));
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				now: () => 1_700_000_000_000,
+			});
+
+			const first = await service.submitUserInput({ text: "plan the work", requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const questionId = (await service.readRequest()).openQuestionIds[0]!;
+			// The premise: the question as first asked blocks the entire request.
+			const opened = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-plan", context);
+			expect(opened?.questions[0]?.blockingScope).toEqual([]);
+
+			// An insufficient answer, whose run re-asks with the narrower scope. It is the
+			// same question — one answer per question — so no second copy is created.
+			const vague = await service.submitUserInput({ text: "not sure", answerTo: questionId, sufficient: false });
+			if (vague.kind !== "answer") throw new Error("expected an answer");
+			await vague.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const narrowed = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-plan", context);
+			expect(narrowed?.questions.filter((question) => question.question === "Which file?")).toHaveLength(1);
+			expect(narrowed?.questions[0]?.blockingScope).toEqual(["t1"]);
+
+			// A second insufficient answer: the question is still open, and t2 — which the
+			// question no longer blocks — is admitted and actually executed.
+			const again = await service.submitUserInput({ text: "still unsure", answerTo: questionId, sufficient: false });
+			if (again.kind !== "answer") throw new Error("expected an answer");
+			await again.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			expect((await service.readRequest()).openQuestionIds).toEqual([questionId]);
+			expect(dispatched).toEqual([["t2"]]);
+			expect(requests.some((text) => text.includes("still unsure"))).toBe(true);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("ends the run when the model re-asks the same question after an insufficient answer (AC-02)", async () => {
 		// The branch the earlier chain test did not cover: after a vague reply the model
 		// asks the *same words* again. A question with that text is already recorded,

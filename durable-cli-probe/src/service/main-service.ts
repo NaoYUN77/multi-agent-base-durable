@@ -42,7 +42,7 @@ import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../agent/c
 import { composeUserAnswer, openQuestionIds, type ClarificationState, type UserAnswer } from "../agent/contracts/clarification.ts";
 import { validatePlan, type Plan } from "../agent/contracts/plan.ts";
 import { MainServiceDoc, type InputAdmission, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
-import { answerInputId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
+import { answerInputId, derivedRequestId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
 import { restorationSectionText, withRestorationSection } from "../agent/main/restoration.ts";
 import { mainInstructions } from "../agent/prompts/main.ts";
@@ -833,7 +833,12 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			// would collapse them into one and drop the second. The queue is a
 			// persisted record, so it can be queried and withdrawn.
 			if (await busy()) {
-				const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
+				// The requirement the input belongs to: the caller's, else the one
+				// already active, else one derived from the input's own words — never
+				// from the clock, so a retry of the same input is the same submission
+				// (see `derivedRequestId`). A caller that means two requirements told in
+				// the same words names both.
+				const requestId = input.requestId ?? current?.requestId ?? derivedRequestId(text);
 				const requestVersion = current?.requestVersion ?? 1;
 				const queuedAt = now();
 				// The version this input *becomes*, allocated here rather than at the
@@ -918,7 +923,10 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			}
 
 			// ── A new request (or a restatement of the current one) ───────────────
-			const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
+			// Same derivation as the queue branch above: a requirement the caller did
+			// not name is derived from its words, so re-sending the same input after an
+			// interruption restates the requirement instead of forking a second one.
+			const requestId = input.requestId ?? current?.requestId ?? derivedRequestId(text);
 			// The version check and the write happen in ONE commit, so a concurrent
 			// restatement cannot slip between them.
 			let staleVersion: { readonly expected: number; readonly stored: number | undefined } | undefined;

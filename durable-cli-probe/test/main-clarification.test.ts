@@ -20,7 +20,7 @@ import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../src/agent/contracts/documents.ts";
 import { composeModelResolution, openQuestionIds, validateClarificationState } from "../src/agent/contracts/clarification.ts";
 import { MainServiceDoc } from "../src/agent/main/service-doc.ts";
-import { deriveQuestionId, stableSlug } from "../src/agent/main/request-id.ts";
+import { derivedRequestId, deriveQuestionId, stableSlug } from "../src/agent/main/request-id.ts";
 import { openMainService } from "../src/service/main-service.ts";
 
 /** A stand-in for whatever the model would do when it is not asking a question. */
@@ -127,10 +127,19 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 		return fauxAssistantMessage([fauxText("answered after the question")]);
 	};
 
-	/** Open a service over a fresh database, with the asking router installed. */
-	async function openAsking(): Promise<{ runtime: ProbeRuntime; service: Awaited<ReturnType<typeof openMainService>> }> {
+	/**
+	 * Open a service over a fresh database, with the asking router installed.
+	 *
+	 * `now` and the database path are overridable so a test can open a *second*,
+	 * independent conversation — the only way to exercise a derivation that must
+	 * not depend on the clock, since within one conversation the active requirement
+	 * short-circuits it.
+	 */
+	async function openAsking(
+		options: { readonly databasePath?: string; readonly now?: () => number } = {},
+	): Promise<{ runtime: ProbeRuntime; service: Awaited<ReturnType<typeof openMainService>> }> {
 		const runtime = await openProbe({
-			databasePath,
+			databasePath: options.databasePath ?? databasePath,
 			provider: "faux",
 			fauxRouter: askingRouter,
 			extensions: [defineExtension({ name: "test-extra", tools: [answerTool] })],
@@ -143,7 +152,7 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			context,
 			conversationId: root.id,
 			dispatch: async () => [],
-			now: () => 1_700_000_000_000,
+			now: options.now ?? (() => 1_700_000_000_000),
 		});
 		return { runtime, service };
 	}
@@ -188,6 +197,45 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 		const b = deriveQuestionId("req-1", 1, "Which of the two candidate files should I read first, given the age?");
 		expect(a).not.toBe(b);
 		expect(stableSlug("Which file?")).toMatch(/^which-file-[0-9a-f]{8}$/);
+	});
+
+	it("derives an unnamed requirement's id from its words, not the clock, so a retry cannot fork it (AC-04)", async () => {
+		// `requestId` is optional, so the service derives one when the caller does not
+		// name the requirement. A clock-derived id — the shape this replaced — made the
+		// same logical input a *different* submission on a retry after an interruption:
+		// a second requirement with its own document and its own plan index, instead of
+		// the replay the Harness's dedup key exists to catch.
+		expect(derivedRequestId("count the markers in report.txt")).toBe(derivedRequestId("count the markers in report.txt"));
+		expect(derivedRequestId("count the markers in report.txt")).not.toBe(derivedRequestId("count the markers in the annex.txt"));
+		// A derived id still has to be a legal id: it is embedded in question ids and
+		// persisted in the clarification document.
+		expect(derivedRequestId("count the markers in report.txt")).toMatch(/^req-[a-z0-9][a-z0-9._-]{0,127}$/);
+
+		// Two independent conversations, whose clocks differ by a wide margin. The
+		// identity is the same, which is what makes the retry a replay.
+		const first = await openAsking();
+		let one: string;
+		try {
+			const outcome = await first.service.submitUserInput({ text: "count the markers in report.txt" });
+			if (outcome.kind !== "request") throw new Error(`expected a request, got ${outcome.kind}`);
+			await outcome.submission.wait(context);
+			await first.runtime.harness.waitForIdle(context);
+			one = outcome.requestId;
+			expect(one).toBe(derivedRequestId("count the markers in report.txt"));
+		} finally {
+			await first.runtime.close();
+		}
+
+		const second = await openAsking({ databasePath: join(directory, "other.sqlite"), now: () => 1_999_999_999_999 });
+		try {
+			const outcome = await second.service.submitUserInput({ text: "count the markers in report.txt" });
+			if (outcome.kind !== "request") throw new Error(`expected a request, got ${outcome.kind}`);
+			await outcome.submission.wait(context);
+			await second.runtime.harness.waitForIdle(context);
+			expect(outcome.requestId).toBe(one);
+		} finally {
+			await second.runtime.close();
+		}
 	});
 
 	it("refuses a plain input while a question is open instead of reinterpreting it (AC-04)", async () => {
