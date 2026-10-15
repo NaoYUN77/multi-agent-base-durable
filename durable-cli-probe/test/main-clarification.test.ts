@@ -1803,7 +1803,10 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 				context,
 				conversationId: root.id,
 				dispatch: async () => [],
-				now: () => (clock += 1000),
+				now: () => {
+				clock += 1000;
+				return clock;
+			},
 			});
 
 			const first = await service.submitUserInput({ text: `${MARKER} unnamed` });
