@@ -957,6 +957,67 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("replays a refused dispatch as an error, not an ordinary tool result (AC-03)", async () => {
+		// The dispatch half of the same rule the save replay follows: a refusal
+		// recorded `isError: true`, and a replay that drops the flag turns a refused
+		// dispatch into an ordinary tool result the model reads as a success.
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+			// A stale version: refused at admission, nothing executed.
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 9, tasks: [taskSpec("t1")] } }],
+		]);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+			const before = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = before?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt).toBeDefined();
+			expect(receipt!.isError).toBe(true);
+			const [, taskId, ...callParts] = receipt!.opKey.split(":");
+
+			const extension = createMainExtension({
+				activeRequest: async () => ({ requestId: "req-plan", requestVersion: 1 }),
+				dispatch: async () => [],
+				readOperation: async (opKey) => {
+					const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+					const found = doc?.receipts.find((entry) => entry.opKey === opKey);
+					return found === undefined ? undefined : { result: found.result, isError: found.isError, control: found.control };
+				},
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const dispatch = extension.tools?.find((tool) => tool.name === "dispatch_tasks");
+			const api = {
+				taskId: taskId as never,
+				callId: callParts.join(":"),
+				conversationId: 1 as never,
+				commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+			};
+			const replayed = await dispatch!.execute({ planId: "plan-a", version: 9, tasks: [taskSpec("t1")] } as never, api as never, context);
+			expect(replayed.isError).toBe(true);
+			expect(JSON.stringify(replayed.output)).toContain("dispatch refused");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses a dependency-bearing dispatch when no checker can vouch for it (AC-03)", async () => {
+		// "No unaccepted dependencies" is only a fact when something established it.
+		// With no `unacceptedDependencies` supplied, the absence of the check must not
+		// read as the absence of blockers — otherwise a batch that declares a
+		// dependency reaches the executor unverified.
+		const { runtime, service, dispatched } = await runScript([
+			[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1", "t2"] } }],
+			[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1"), taskSpec("t2", ["t1"])] } }],
+		]);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("ends the run when the question shares its round with another tool (AC-02)", async () => {
 		// The reason `handoff` replaced `terminate`: `terminate` fires only when
 		// *every* call of the round asks for it, so one sibling call silently kept

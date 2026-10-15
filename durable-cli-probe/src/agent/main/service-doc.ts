@@ -131,6 +131,16 @@ export type InputAdmission = {
 	 * previous request.
 	 */
 	readonly expectedRequestVersion?: number;
+	/**
+	 * Set once that basis check has been *performed and passed*.
+	 *
+	 * The check cannot be re-derived later from `expectedRequestVersion` alone: the
+	 * requirement's version moves on when this very input is consumed, so the stored
+	 * version no longer equals the basis the caller gave, and re-comparing them would
+	 * deny the accepted run its own requirement — every remaining tool in it would
+	 * refuse. This records the *outcome* of the check, which does not move.
+	 */
+	readonly basisAccepted?: boolean;
 	/** Set when the basis no longer holds, so a run made of this input must refuse. */
 	readonly rejected?: boolean;
 };

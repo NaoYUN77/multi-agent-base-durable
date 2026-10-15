@@ -194,8 +194,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				if (admission.rejected === true) return undefined;
 				// The basis is re-checked here, at the moment the run resolves its
 				// requirement — not only on a later queue read, which is after the run
-				// may already have written a plan or dispatched.
-				if (admission.expectedRequestVersion !== undefined) {
+				// may already have written a plan or dispatched. Once the check has
+				// *passed* it is recorded as such and not repeated: consuming this input
+				// moves the requirement's version past the caller's basis, so comparing
+				// the two again would refuse the very run the basis was accepted for.
+				if (admission.expectedRequestVersion !== undefined && admission.basisAccepted !== true) {
 					const request = await tx.doc(AgentRequestDoc, conversationId, admission.requestId, { requestId: admission.requestId });
 					const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
 					if (storedVersion !== undefined && storedVersion !== admission.expectedRequestVersion) return undefined;
@@ -418,6 +421,18 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		// plan list survives a reopen instead of belonging to the process that saved
 		// it.
 		indexPlans: true,
+		// The consumption boundary. A queued input is placed by the Harness and its run
+		// starts at the round boundary — before any service call observes the queue — so
+		// activating it only when a caller happens to read the queue leaves the
+		// requirement pointing at the previous request for that whole run: the
+		// restoration section would present the old request, and a later read could
+		// overwrite a newer pointer with an already-finished one. Reconciling here, on
+		// every generation attempt of this conversation, activates the input as its run
+		// begins rather than as a side effect of being queried.
+		beforeRequest: async (api) => {
+			if (String(api.conversationId) !== String(conversationId)) return;
+			await reconcileQueue();
+		},
 		...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
 	});
 	options.registry.install(extension);
@@ -469,8 +484,27 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				.filter((record) => record.conversationId === conversationId && record.type === "input" && record.status === "queued")
 				.map((record) => String(record.id)),
 		);
-		const consumed = held.filter((entry) => !stillQueued.has(String(entry.submissionId)));
-		if (consumed.length === 0) return;
+		// An input that left the queue was not necessarily *consumed*. `requestCancel`
+		// aborts the conversation, which withdraws every queued input: the Harness
+		// settles it `unanswered` and drops it from the inbox, so it leaves the queue
+		// without ever being placed. Treating that as consumption would write a
+		// cancelled requirement's text and identity into the active request. A placed
+		// input is distinguishable — placement appends it to the transcript, so its
+		// record carries an `entry` — and only a placed one may be activated.
+		const placed = new Set<string>();
+		const gone = new Set<string>();
+		for (const entry of held) {
+			if (stillQueued.has(String(entry.submissionId))) continue;
+			const record = await harness.submission(entry.submissionId as never, context);
+			const status = record === undefined ? undefined : await record.status(context);
+			if (status?.type === "input" && status.entry !== undefined) placed.add(entry.submissionId);
+			// It left the queue without being placed: withdrawn by a cancel, or never
+			// admitted at all. Its record is dropped — reporting a withdrawn input as
+			// still queued would offer a caller a withdrawal that cannot happen.
+			else gone.add(entry.submissionId);
+		}
+		const consumed = held.filter((entry) => placed.has(entry.submissionId));
+		if (consumed.length === 0 && gone.size === 0) return;
 		await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
 			// Apply each consumed input's requirement identity, oldest first, so the
@@ -515,8 +549,20 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// way at admission time), so there is nothing to rewrite here. Rewriting it
 				// from a value derived at consume time is what made the run's own plans
 				// mismatch the request document.
+				//
+				// The basis check has now passed for this input — it reached here without
+				// the stale branch above — so the outcome is recorded. Leaving it to be
+				// re-derived would compare the requirement's *new* version against the
+				// caller's original basis and refuse the run this input just started.
+				doc.admissions = doc.admissions.map((admission) =>
+					admission.submissionId === entry.submissionId && admission.expectedRequestVersion !== undefined
+						? { ...admission, basisAccepted: true }
+						: admission,
+				);
 			}
-			doc.queue = doc.queue.filter((entry) => !consumed.some((gone) => gone.submissionId === entry.submissionId));
+			// Consumed inputs and withdrawn ones both leave the record: the first has
+			// become the active requirement, the second never will.
+			doc.queue = doc.queue.filter((entry) => !consumed.some((done) => done.submissionId === entry.submissionId) && !gone.has(entry.submissionId));
 		}, context);
 	}
 
@@ -682,7 +728,15 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				};
 				await handle.commit(async (tx) => {
 					const doc = await tx.doc(MainServiceDoc, conversationId);
-					doc.queue = [...doc.queue, record];
+					// One record per submission. A retry of the same logical input derives
+					// the same submission key, and the Harness answers it with the same
+					// submission id — so appending again would leave two records for one
+					// input, and consuming it would apply that input twice: bumping the
+					// requirement twice, or marking the shared admission rejected on the
+					// second pass. The existing record stands.
+					doc.queue = doc.queue.some((entry) => entry.submissionId === record.submissionId)
+						? doc.queue.map((entry) => (entry.submissionId === record.submissionId ? record : entry))
+						: [...doc.queue, record];
 					// The admission is recorded now, so that when the Harness places this
 					// input at the next boundary and starts a run for it, the run resolves
 					// the requirement from its own input rather than from the lagging

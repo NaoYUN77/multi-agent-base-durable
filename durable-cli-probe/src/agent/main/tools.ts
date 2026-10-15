@@ -151,6 +151,18 @@ export type MainToolHost = {
 	 * mixed one request's plans into another's view.
 	 */
 	readonly indexPlans?: boolean;
+	/**
+	 * Called at the start of every generation attempt of this conversation, before
+	 * the provider request. The service uses it as its **consumption boundary**: a
+	 * queued input is placed and its run started by the Harness before any service
+	 * call observes the queue, so activating it here — rather than when a caller
+	 * happens to read the queue — is what keeps the requirement current for the run
+	 * that is actually serving it.
+	 *
+	 * Awaited, so the activation lands before the prompt for this attempt is built.
+	 * Absent means the caller drives reconciliation itself.
+	 */
+	readonly beforeRequest?: (api: { readonly conversationId: ConversationId }) => Promise<void>;
 };
 
 /** Read a model-supplied string list, refusing a non-array rather than coercing it. */
@@ -451,7 +463,11 @@ export function createMainExtension(host: MainToolHost): Extension {
 						`Its outcome is unknown — this is not a success and not a completion receipt. Do not treat the tasks as done.`;
 					return { output: [{ type: "text", text }], isError: true };
 				}
-				return { output: [{ type: "text", text: replayed.result }] };
+				// The stored error flag travels with the result, as `save_plan`'s replay
+				// does: a dispatch refused at admission, or one whose batch failed or
+				// blocked, recorded `isError: true`, and replaying it as an ordinary tool
+				// result would turn that refusal into a success.
+				return { output: [{ type: "text", text: replayed.result }], isError: replayed.isError === true };
 			}
 
 			const active = await host.activeRequest();
@@ -485,7 +501,14 @@ export function createMainExtension(host: MainToolHost): Extension {
 				const blocking = blockingQuestionIdsFor(clarification, taskIds);
 				const planned = new Set(planDoc.taskIds);
 				const unplanned = taskIds.filter((id) => !planned.has(id));
-				const unaccepted = host.unacceptedDependencies?.(batch.value) ?? [];
+				// A batch that declares dependencies is only admissible when something can
+				// actually vouch for them. With no checker supplied, "no unaccepted
+				// dependencies" is not a fact that was established — it is the absence of
+				// the check — so the batch is refused rather than waved through. A batch
+				// with no dependencies needs no checker and is unaffected.
+				const dependsOn = batch.value.some((task) => task.dependencies.length > 0);
+				const checkerMissing = dependsOn && host.unacceptedDependencies === undefined;
+				const unaccepted = checkerMissing ? [] : (host.unacceptedDependencies?.(batch.value) ?? []);
 				const reasons: string[] = [
 					...admissionBlockReasons({
 						expectedPlanVersion: args.version,
@@ -506,6 +529,7 @@ export function createMainExtension(host: MainToolHost): Extension {
 					reasons.push("plan_request_mismatch");
 				}
 				if (unplanned.length > 0) reasons.push("tasks_not_in_plan");
+				if (checkerMissing) reasons.push("dependency_check_unavailable");
 				// A refusal is a completed decision: a replay of this call must report the
 				// same refusal rather than re-running admission against state that may
 				// have moved. It is recorded in the admission transaction, so the
@@ -556,6 +580,23 @@ export function createMainExtension(host: MainToolHost): Extension {
 		// and a sibling tool in the same round may write after it; the section is
 		// never one write behind.
 		sections: [mainRestorationSection],
+		// The consumption boundary, on the built-in generation task. Registered only
+		// when the host supplies one, so a test that drives reconciliation itself is
+		// unaffected.
+		...(host.beforeRequest === undefined
+			? {}
+			: {
+					hooks: [
+						{
+							task: "pi.generation",
+							handlers: {
+								beforeRequest: async (_request: unknown, api: { readonly conversationId: ConversationId }) => {
+									await host.beforeRequest?.({ conversationId: api.conversationId });
+								},
+							},
+						},
+					],
+				}),
 	});
 }
 

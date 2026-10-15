@@ -783,4 +783,204 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			await runtime.close();
 		}
 	});
+	it("activates a consumed queued input at its run's boundary, without a queue read (AC-01, AC-03)", async () => {
+		// The consumption boundary is the run, not a query. A queued input is placed
+		// and its run started by the Harness before any service call observes the
+		// queue, so activating it only when a caller happens to read the queue leaves
+		// the requirement pointing at the previous request for that whole run — the
+		// restoration section would present the old request, and readRequest would
+		// report it too. The service reconciles on every generation attempt, so the
+		// input is active as its run begins, with nothing having read the queue.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async () => {
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const queued = await service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// No readQueue() call anywhere in this test: the activation came from the
+			// boundary, not from a query.
+			const view = await service.readRequest();
+			expect(view.requestId).toBe("req-b");
+			expect(view.text).toBe(`${MARKER} second request`);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("does not activate a queued input that was cancelled rather than placed (AC-01, AC-04)", async () => {
+		// `requestCancel` aborts the conversation, which withdraws every queued input:
+		// the Harness settles it `unanswered` and drops it from the inbox, so it leaves
+		// the queue without ever being placed. Treating that as consumption would write
+		// a cancelled requirement's text and identity into the active request. Only a
+		// placed input — one the transcript actually received — may be activated.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async () => {
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER} keep me`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const queued = await service.submitUserInput({ text: `${MARKER} cancelled`, requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+
+			// Cancel while the round is parked: the queued input is withdrawn, not placed.
+			const cancelPromise = service.requestCancel("changed my mind");
+			release?.();
+			await cancelPromise;
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			const view = await service.readRequest();
+			expect(view.requestId).toBe("req-a");
+			expect(view.text).toBe(`${MARKER} keep me`);
+			// And the queue no longer reports it: it was withdrawn, not consumed.
+			expect(await service.readQueue()).toHaveLength(0);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("records one queue entry when the same input is submitted twice (AC-05)", async () => {
+		// A retry of the same logical input derives the same submission key, and the
+		// Harness answers it with the same submission id. Appending a second record
+		// would make one input look like two, and consuming it would apply it twice.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async () => {
+			if (!parkedOnce) {
+				parkedOnce = true;
+				await parked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [] });
+
+			const first = await service.submitUserInput({ text: `${MARKER} busy`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const once = await service.submitUserInput({ text: "same words", requestId: "req-b" });
+			const twice = await service.submitUserInput({ text: "same words", requestId: "req-b" });
+			expect(once.kind).toBe("queued");
+			expect(twice.kind).toBe("queued");
+			if (once.kind !== "queued" || twice.kind !== "queued") return;
+			// The Harness deduplicated the submission; the queue record follows it.
+			expect(String(once.submission.id)).toBe(String(twice.submission.id));
+			const queue = await service.readQueue();
+			expect(queue).toHaveLength(1);
+			expect(queue[0]?.submissionId).toBe(String(once.submission.id));
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+	it("keeps the accepted run's requirement after its own version increment (AC-01, AC-04)", async () => {
+		// A restatement queued against `expectedRequestVersion` 1 is legitimately
+		// consumed, and consuming it moves the requirement to v2. Re-comparing the
+		// stored v2 against the caller's original basis would then deny the very run
+		// the basis was accepted for, so every remaining tool in it would refuse. The
+		// outcome of the check is recorded rather than re-derived.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async (request) => {
+			const text = flatten(request.messages);
+			if (!parkedOnce) {
+				// Run 1: save a plan so the requirement document exists, then park so the
+				// restatement queues.
+				if (!text.includes("saved plan")) {
+					return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-one", goals: ["one"], taskIds: ["t1"] }, { id: "save-one" })], { stopReason: "toolUse" });
+				}
+				parkedOnce = true;
+				await parked;
+				return fauxAssistantMessage([fauxText("run 1 done")]);
+			}
+			// Run 2 (the accepted restatement): its tools must still resolve a
+			// requirement after the increment.
+			if (!text.includes("saved plan plan-two")) {
+				await new Promise((resolve) => setTimeout(resolve, 120));
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-two", goals: ["two"], taskIds: ["t1"] }, { id: "save-two" })], { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({ harness: runtime.harness, registry: runtime.registry, context, conversationId: root.id, dispatch: async () => [], now: () => 1_700_000_000_000 });
+
+			const first = await service.submitUserInput({ text: `${MARKER} original`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			const deadline = Date.now() + 5_000;
+			while (Date.now() < deadline) {
+				const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+				if ((doc?.plans.length ?? 0) > 0) break;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			const queued = await service.submitUserInput({ text: `${MARKER} restated`, requestId: "req-a", expectedRequestVersion: 1 });
+			expect(queued.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The run's own plan was saved, which is only possible if its tools could
+			// still resolve a requirement after the requirement moved to v2.
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-two", context);
+			expect(saved?.requestId).toBe("req-a");
+			expect(saved?.requestVersion).toBe(2);
+			const admissions = (await runtime.harness.snapshot(MainServiceDoc, 1 as never, context))?.admissions ?? [];
+			expect(admissions.some((admission) => admission.basisAccepted === true)).toBe(true);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
 });
