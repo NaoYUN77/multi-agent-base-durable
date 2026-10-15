@@ -199,9 +199,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// itself carries the key the placement was written under, so the identity
 				// is recovered from the run's own input instead of being guessed from the
 				// pointer, which still names the previous request.
-				const admission =
-					doc.admissions.find((entry) => entry.submissionId === submissionId) ??
-					placementOf(doc.admissions, submissionId);
+				const admission = admissionOfSubmission(doc.admissions, submissionId);
 				if (admission === undefined) continue;
 				// A rejected input (its version basis went stale while it waited) has no
 				// requirement: the run must refuse, not fall through to the previous
@@ -293,6 +291,19 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	}
 
 	/**
+	 * The admission that placed `submissionId`.
+	 *
+	 * The link first, then the process-local placement map for the window where the
+	 * link has not been written yet. A reopen needs neither: activation is driven
+	 * from the admissions themselves (see {@link reconcileQueue}), so by the time a
+	 * reopened process resolves a requirement there is no live run to resolve it
+	 * for — the pointer already names it.
+	 */
+	function admissionOfSubmission(admissions: readonly InputAdmission[], submissionId: string): InputAdmission | undefined {
+		return admissions.find((entry) => entry.submissionId === submissionId) ?? placementOf(admissions, submissionId);
+	}
+
+	/**
 	 * Record one input's requirement identity *before* the input is submitted.
 	 *
 	 * The identity has to be durable before the submission, not after: the Harness
@@ -306,10 +317,24 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	async function placeIdentity(
 		tx: Tx,
 		key: string,
-		requestId: string,
-		requestVersion: number,
-		text?: string,
-		expectedRequestVersion?: number,
+		identity: {
+			readonly requestId: string;
+			readonly requestVersion: number;
+			readonly text?: string;
+			readonly expectedRequestVersion?: number;
+			/**
+			 * Whether the request document and the active pointer already name this
+			 * input's requirement — true for an input admitted while no round was
+			 * running, because that path writes both *before* it submits, and for an
+			 * answer, whose requirement is the one already active.
+			 *
+			 * Such an input needs no activation later, and recording that here is what
+			 * keeps {@link reconcileQueue} from applying it a second time: the basis
+			 * check it would run compares the caller's version against a requirement
+			 * this very input has already moved.
+			 */
+			readonly applied?: boolean;
+		},
 	): Promise<void> {
 		const doc = await tx.doc(MainServiceDoc, conversationId);
 		if (doc.admissions.some((entry) => entry.key === key)) return;
@@ -317,15 +342,22 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			...doc.admissions,
 			{
 				key,
-				requestId,
-				requestVersion,
+				requestId: identity.requestId,
+				requestVersion: identity.requestVersion,
+				// The moment the requirement was stated. An admission that has to write
+				// the requirement document itself — because the caller of
+				// `submitUserInput` never came back to do it — records this as
+				// `requestedAt`; "never written" is the contract's marker, so a document
+				// activated from an admission needs a real moment rather than a zero.
+				at: now(),
 				// The words go in *with* the identity, in this commit: an input admitted
 				// while a round is running has no other record of them before
 				// `handle.submit` returns, and the run the Harness starts for it in that
 				// window would otherwise resolve the right identity against the previous
 				// version's words.
-				...(text === undefined ? {} : { text }),
-				...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }),
+				...(identity.text === undefined ? {} : { text: identity.text }),
+				...(identity.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: identity.expectedRequestVersion }),
+				...(identity.applied === true ? { activated: true } : {}),
 			},
 		];
 	}
@@ -663,97 +695,128 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	}
 
 	/**
-	 * The consume boundary for the queue.
+	 * The consume boundary: make the requirement an admitted input established the
+	 * active one, and keep the queue honest about what the Harness still holds.
 	 *
 	 * A queued input is placed into the transcript by the Harness when the round it
 	 * was waiting on reaches its boundary — that is not something this service
-	 * drives. So the persisted queue is reconciled against what the Harness
-	 * actually holds before it is reported: an input the Harness no longer lists as
-	 * `queued` has been placed (or settled), and its record is removed. Without
-	 * this the queue only ever grew, and a caller could withdraw an input that had
-	 * already been consumed.
+	 * drives, and *no service call observes it happening*. The queue record and the
+	 * submission link are written by `submitUserInput` after `handle.submit`
+	 * returns, so a caller that never comes back — a crash, a dropped continuation,
+	 * a reopen — leaves an input that was placed and ran while the request document
+	 * and the pointer still name the previous requirement. Activation therefore
+	 * cannot be driven by the queue: it is driven by the two records that survive
+	 * that, the *admission* (written before the submission) and the Harness's own
+	 * committed submission record, read through `tx.submissionByRequest` under the
+	 * admission's key.
 	 *
-	 * Removing the record is not the whole job. A queued restatement carries *its
-	 * own* requirement identity, and the service's active pointer still names
-	 * whatever was being served when the round began. Consuming the input therefore
-	 * also applies that identity to the request document and the pointer — in the
-	 * same commit — and re-checks the version basis the caller gave: a restatement
-	 * whose `expectedRequestVersion` went stale while it waited is dropped rather
-	 * than applied as if it were current. "Left the queue" and "became the active
-	 * requirement" are different facts, and only the second one is correctness.
+	 * Three states, and only one of them activates:
+	 *
+	 *   * **placed** — the record carries an `entry`, so the input is in the
+	 *     transcript and its run has started or finished. Its requirement is applied
+	 *     to the document and the pointer, oldest first, so the pointer ends at the
+	 *     newest restatement the boundary admitted.
+	 *   * **gone** — settled without ever being placed, which is what a cancel does
+	 *     to a queued input. It never becomes the requirement, and is marked so it is
+	 *     not examined again.
+	 *   * **waiting** — still queued, or not submitted yet. Nothing happens; the
+	 *     boundary that places it is what makes it eligible.
+	 *
+	 * Applying an input is a one-way decision, recorded on the admission. It has to
+	 * be, for two reasons: re-applying an older admission would write its words back
+	 * over a newer requirement's, and the version basis the caller gave is checked
+	 * *here*, against a document this very input may already have moved — so the
+	 * outcome is recorded (`basisAccepted`) rather than re-derived.
+	 *
+	 * Reading the submission record is what makes this work after a reopen, where
+	 * the process-local placement map is empty and the queue record was never
+	 * written. `tx.submissionByRequest` is a storage read on the transaction's own
+	 * line, not `harness.submission()`, which serializes behind the Session and
+	 * would deadlock if it were called from inside a commit.
 	 */
 	async function reconcileQueue(): Promise<void> {
-		const held = await handle.commit(async (tx) => {
+		// One read commit: the persisted admissions and queue, and — for each input
+		// still undecided — what the Harness actually holds for it.
+		const snapshot = await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
-			return JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[];
+			// Copied inside the commit: the document's nested values are write overlays
+			// that throw "Cannot use a settled overlay" once it finishes.
+			const admissions = JSON.parse(JSON.stringify(doc.admissions)) as InputAdmission[];
+			const queue = JSON.parse(JSON.stringify(doc.queue)) as QueuedInput[];
+
+			const decide = async (key: string): Promise<"placed" | "gone" | "waiting"> => {
+				const record = await tx.submissionByRequest(conversationId, key);
+				if (record === undefined || record.type !== "input") return "waiting";
+				// Placement is what appends the input to the transcript, so a record with
+				// an `entry` is one the boundary took — whether it is still running
+				// (`placed`) or has settled (`done`). An input that left the queue without
+				// one was withdrawn, not consumed: `requestCancel` aborts the conversation
+				// and settles every queued input `unanswered`, which must not write a
+				// cancelled requirement's words into the active request.
+				if (record.entry !== undefined) return "placed";
+				return record.status === "unanswered" ? "gone" : "waiting";
+			};
+
+			const pending: { readonly admission: InputAdmission; readonly state: "placed" | "gone" | "waiting" }[] = [];
+			for (const admission of admissions) {
+				if (admission.activated === true || admission.rejected === true) continue;
+				pending.push({ admission, state: await decide(admission.key) });
+			}
+			// The queue's own records are resolved the same way, so a record for an input
+			// the Harness no longer holds as queued stops being reported — otherwise a
+			// caller would be offered a withdrawal that cannot happen.
+			const queueState: { readonly submissionId: string; readonly state: "placed" | "gone" | "waiting" }[] = [];
+			for (const entry of queue) {
+				const admission = admissions.find((candidate) => candidate.submissionId === entry.submissionId);
+				queueState.push({ submissionId: entry.submissionId, state: admission === undefined ? "waiting" : await decide(admission.key) });
+			}
+			return { queue, pending, queueState };
 		}, context);
-		if (held.length === 0) return;
-		const inspection = await harness.inspect(context);
-		const stillQueued = new Set(
-			inspection.submissions
-				.filter((record) => record.conversationId === conversationId && record.type === "input" && record.status === "queued")
-				.map((record) => String(record.id)),
-		);
-		// An input that left the queue was not necessarily *consumed*. `requestCancel`
-		// aborts the conversation, which withdraws every queued input: the Harness
-		// settles it `unanswered` and drops it from the inbox, so it leaves the queue
-		// without ever being placed. Treating that as consumption would write a
-		// cancelled requirement's text and identity into the active request. A placed
-		// input is distinguishable — placement appends it to the transcript, so its
-		// record carries an `entry` — and only a placed one may be activated.
-		const placed = new Set<string>();
-		const gone = new Set<string>();
-		for (const entry of held) {
-			if (stillQueued.has(String(entry.submissionId))) continue;
-			const record = await harness.submission(entry.submissionId as never, context);
-			const status = record === undefined ? undefined : await record.status(context);
-			if (status?.type === "input" && status.entry !== undefined) placed.add(entry.submissionId);
-			// It left the queue without being placed: withdrawn by a cancel, or never
-			// admitted at all. Its record is dropped — reporting a withdrawn input as
-			// still queued would offer a caller a withdrawal that cannot happen.
-			else gone.add(entry.submissionId);
-		}
-		const consumed = held.filter((entry) => placed.has(entry.submissionId));
-		if (consumed.length === 0 && gone.size === 0) return;
+
+		const undecided =
+			snapshot.pending.some((item) => item.state !== "waiting") || snapshot.queueState.some((item) => item.state !== "waiting");
+		if (!undecided) return;
+
 		await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
-			// Apply each consumed input's requirement identity, oldest first, so the
-			// pointer ends at the newest restatement the round's boundary admitted.
-			for (const entry of consumed) {
-				const request = await tx.doc(AgentRequestDoc, conversationId, entry.requestId, { requestId: entry.requestId });
+			const mark = (key: string, patch: Partial<InputAdmission>): void => {
+				doc.admissions = doc.admissions.map((entry) => (entry.key === key ? { ...entry, ...patch } : entry));
+			};
+			// Oldest first, so the pointer ends at the newest requirement admitted.
+			for (const { admission, state } of snapshot.pending) {
+				if (state === "waiting") continue;
+				if (state === "gone") {
+					// Never placed, so it never becomes the requirement. Recorded as applied
+					// so it is not examined on every later reconciliation.
+					mark(admission.key, { activated: true });
+					continue;
+				}
+				const request = await tx.doc(AgentRequestDoc, conversationId, admission.requestId, { requestId: admission.requestId });
 				const storedVersion = request.requestedAt === 0 ? undefined : request.requestVersion;
 				// The caller's basis must still hold. A stale one is not applied — the
 				// input was admitted, but it does not become the active requirement.
-				if (entry.expectedRequestVersion !== undefined && (storedVersion ?? 1) !== entry.expectedRequestVersion) {
+				if (admission.expectedRequestVersion !== undefined && (storedVersion ?? 1) !== admission.expectedRequestVersion) {
 					// It cannot be un-placed from the transcript, but it is denied an
 					// identity: a run made of it resolves no requirement and its tools
 					// refuse, rather than acting under the previous request.
-					doc.admissions = doc.admissions.map((admission) =>
-						admission.submissionId === entry.submissionId ? { ...admission, rejected: true } : admission,
-					);
+					mark(admission.key, { rejected: true });
 					continue;
 				}
-				// The version was allocated when the input was admitted, not here: the
-				// run made of this input already resolved it, and a version derived now
-				// would land *after* that run saved its plans — invalidating them. The
-				// document is written to the allocated version so the requirement, the
-				// pointer and the run's own admission all agree.
-				//
-				// `Math.max` with the stored version keeps the requirement monotonic if
-				// reconciliation ever lands out of order: the version must not move
-				// *backwards*, because a plan already bound to a higher version would then
-				// mismatch the requirement that owns it.
-				//
-				// A record written before this field existed has no usable allocation, so
-				// one is derived for it rather than propagated. Without the guard the
-				// document would be persisted holding `undefined` (or `NaN` through the
-				// `Math.max`), which is a corrupt version rather than a missing one.
-				const allocated = readableVersion(entry.allocatedVersion) ?? (storedVersion === undefined ? 1 : storedVersion + 1);
+				// The version was allocated when the input was admitted, not here: the run
+				// made of this input already resolved it, and a version derived now would
+				// land *after* that run saved its plans — invalidating them. `Math.max`
+				// with the stored version keeps the requirement monotonic if this ever
+				// lands out of order, because a plan already bound to a higher version
+				// would otherwise mismatch the requirement that owns it.
+				const allocated = readableVersion(admission.requestVersion) ?? (storedVersion === undefined ? 1 : storedVersion + 1);
 				const nextVersion = storedVersion === undefined ? allocated : Math.max(storedVersion, allocated);
 				request.requestVersion = nextVersion;
-				request.text = entry.text;
-				request.requestedAt = entry.queuedAt;
-				doc.activeRequestId = entry.requestId;
+				// The words, when this input stated any of its own. An answer states none:
+				// it replies to a question the active requirement already asked, so the
+				// document keeps the words it has.
+				if (admission.text !== undefined && admission.text !== "") request.text = admission.text;
+				request.requestedAt = admission.at ?? now();
+				doc.activeRequestId = admission.requestId;
 				doc.requestVersion = nextVersion;
 				// The admission already names the allocated version (it was recorded that
 				// way at admission time), so there is nothing to rewrite here. Rewriting it
@@ -764,15 +827,15 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// the stale branch above — so the outcome is recorded. Leaving it to be
 				// re-derived would compare the requirement's *new* version against the
 				// caller's original basis and refuse the run this input just started.
-				doc.admissions = doc.admissions.map((admission) =>
-					admission.submissionId === entry.submissionId && admission.expectedRequestVersion !== undefined
-						? { ...admission, basisAccepted: true }
-						: admission,
-				);
+				mark(admission.key, {
+					activated: true,
+					...(admission.expectedRequestVersion === undefined ? {} : { basisAccepted: true }),
+				});
 			}
+			const decided = new Map(snapshot.queueState.map((item) => [item.submissionId, item.state]));
 			// Consumed inputs and withdrawn ones both leave the record: the first has
 			// become the active requirement, the second never will.
-			doc.queue = doc.queue.filter((entry) => !consumed.some((done) => done.submissionId === entry.submissionId) && !gone.has(entry.submissionId));
+			doc.queue = doc.queue.filter((entry) => (decided.get(entry.submissionId) ?? "waiting") === "waiting");
 		}, context);
 	}
 
@@ -783,6 +846,13 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			const text = input.text;
 			if (text.trim() === "") return { kind: "refused", reason: "empty input" };
 
+			// Activation first. An input the boundary placed may have established the
+			// requirement that is active now while its document and the pointer were
+			// never written — the caller that submitted it never came back. Resolving
+			// from the stale pointer would refuse this input as "no active request to
+			// answer" or "question is not open", when the question belongs to a
+			// requirement the service has not applied yet.
+			await reconcileQueue();
 			const current = await activeRequest();
 			const openIds = current === undefined ? [] : openQuestionIds(await readClarification(current.requestId));
 
@@ -865,7 +935,10 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// input and start its run before this service records anything else, and a
 				// run with no identity of its own would fall back to the previous
 				// requirement.
-				await handle.commit(async (tx) => await placeIdentity(tx, key, current.requestId, current.requestVersion), context);
+				await handle.commit(
+					async (tx) => await placeIdentity(tx, key, { requestId: current.requestId, requestVersion: current.requestVersion, applied: true }),
+					context,
+				);
 				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
 				await handle.commit(async (tx) => await linkSubmission(tx, key, String(submission.id)), context);
 				return { kind: "answer", questionId: input.answerTo, submission };
@@ -952,7 +1025,12 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// it — late by design, so that an input admitted against a basis that is
 					// still current is not refused for a version the requirement reaches only
 					// because of the input itself (`basisAccepted`).
-					await placeIdentity(tx, key, requestId, version, text, input.expectedRequestVersion);
+					await placeIdentity(tx, key, {
+						requestId,
+						requestVersion: version,
+						text,
+						...(input.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: input.expectedRequestVersion }),
+					});
 					return version;
 				}, context);
 				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
@@ -1023,13 +1101,30 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			// Durable before the input, for the same reason as an answer: the run made of
 			// this input resolves its requirement from its own inputs, and those inputs
 			// have to name it before the run can start.
-			await handle.commit(async (tx) => await placeIdentity(tx, key, requestId, requestVersion), context);
+			await handle.commit(
+				async (tx) => await placeIdentity(tx, key, { requestId, requestVersion, text, applied: true }),
+				context,
+			);
 			const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
 			await handle.commit(async (tx) => await linkSubmission(tx, key, String(submission.id)), context);
 			return { kind: "request", requestId, requestVersion, submission };
 		},
 
 		async readRequest() {
+			// Activation first, for the same reason the generation hook does it: an input
+			// the boundary placed may have established a requirement whose document and
+			// pointer were never written, because the caller that submitted it never came
+			// back. Reporting the pointer without applying it would answer with the
+			// previous requirement — and would leave the input's own question looking
+			// unanswerable, since the answer path reads the same pointer.
+			// Activation first. The generation hook activates the requirement of the run
+			// it is about to start, but placement and that first generation are not the
+			// same moment: an input the boundary placed is in the transcript while its
+			// run has not yet reached the provider. A control read in that gap would
+			// otherwise report the previous requirement — and the answer path reads this
+			// same pointer, so it would refuse the new requirement's own question as
+			// "not open".
+			await reconcileQueue();
 			const current = await activeRequest();
 			if (current === undefined) {
 				return { requestId: undefined, requestVersion: 0, text: "", openQuestionIds: [], questions: [], answers: [], plans: [] };
@@ -1053,6 +1148,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		},
 
 		async status() {
+			// Reconciled like `readRequest`: `status` reports the open questions of the
+			// *active* requirement, so it resolves that requirement the same way. It
+			// still never waits on a model — reconciliation reads documents and
+			// submission records, not a round.
+			await reconcileQueue();
 			const current = await activeRequest();
 			const clarification = current === undefined ? undefined : await readClarification(current.requestId);
 			return {

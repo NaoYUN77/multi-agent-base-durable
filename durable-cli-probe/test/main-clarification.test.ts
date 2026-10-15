@@ -142,8 +142,28 @@ async function driveSubmitWindow(options: {
 	readonly router: FauxResponseFactory;
 	readonly first: { readonly text: string; readonly requestId: string };
 	readonly queued: { readonly text: string; readonly requestId: string; readonly expectedRequestVersion?: number };
-	readonly assert: (input: {
+	/**
+	 * Run *while the second caller is still parked*, after its run has finished.
+	 *
+	 * This is the state the queue-driven design could not recover from: the input has
+	 * been placed and its run has ended, while `submitUserInput` has not yet written
+	 * the queue record or the link. `assert` cannot see it — the helper releases the
+	 * caller before calling it — so a test about that boundary has to use this.
+	 */
+	readonly parked?: (input: {
 		readonly runtime: ProbeRuntime;
+		readonly service: Awaited<ReturnType<typeof openMainService>>;
+		readonly requests: readonly (readonly unknown[])[];
+		/** Close this runtime here to model a caller that never comes back. */
+		readonly close: () => Promise<void>;
+	}) => Promise<void>;
+	/**
+	 * Run after the parked caller has returned. Optional: a test about the window
+	 * itself asserts from `parked` and has nothing left to check here.
+	 */
+	readonly assert?: (input: {
+		readonly runtime: ProbeRuntime;
+		readonly service: Awaited<ReturnType<typeof openMainService>>;
 		readonly requests: readonly (readonly unknown[])[];
 		readonly outcome: SubmitOutcome;
 	}) => Promise<void>;
@@ -202,6 +222,9 @@ async function driveSubmitWindow(options: {
 			requestId: options.queued.requestId,
 			...(options.queued.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: options.queued.expectedRequestVersion }),
 		});
+		// A test that closes from `parked` is modelling a caller that never comes back,
+		// so this call is never resumed and must not surface as an unhandled rejection.
+		queued.catch(() => undefined);
 		// The Harness now holds the input as runnable and the service has recorded
 		// nothing about what it says. Releasing the first round is what lets the
 		// boundary place it and start the run that has to be served from the input.
@@ -209,14 +232,28 @@ async function driveSubmitWindow(options: {
 		releaseFirst?.();
 		await first.submission.wait(context);
 		await runtime.harness.waitForIdle(context);
+
+		let closed = false;
+		const close = async (): Promise<void> => {
+			if (closed) return;
+			closed = true;
+			await runtime.close();
+		};
+		// Still parked: the second call has not returned, so nothing it would have
+		// written exists yet.
+		if (options.parked !== undefined) await options.parked({ runtime, service, requests, close });
+		// A `parked` that closed the runtime is a caller that never came back: the
+		// submission's continuation is gone, and so is the runtime it would have used.
+		if (closed) return;
 		releaseQueued?.();
 		const outcome = await queued;
 
-		await options.assert({ runtime, requests, outcome });
+		if (options.assert !== undefined) await options.assert({ runtime, service, requests, outcome });
+		await close();
 	} finally {
 		releaseFirst?.();
 		releaseQueued?.();
-		await runtime.close();
+		await runtime.close().catch(() => undefined);
 	}
 }
 
@@ -1781,6 +1818,158 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 				expect(text).toContain("req-b v1");
 				expect(text).toContain(`${MARKER} second request`);
 				expect(text).not.toContain("req-a");
+			},
+		});
+	});
+
+	it("activates a requirement established inside the submit window from the admission, with the caller still parked (AC-01, AC-04)", async () => {
+		// The queue record and the submission link are written by `submitUserInput`
+		// *after* `handle.submit` returns. A caller that never comes back — a crash, a
+		// dropped continuation, a reopen — therefore leaves an input that was placed
+		// and ran while the request document and the pointer still named the previous
+		// requirement. Activation cannot be driven by the queue; it is driven by the
+		// admission, which is written *before* the submission, and by the Harness's own
+		// committed submission record.
+		//
+		// This asserts it inside the window: the second call is still parked in
+		// `handle.submit`, so nothing it would have written exists.
+		await driveSubmitWindow({
+			databasePath,
+			router: async () => fauxAssistantMessage([fauxText("done")]),
+			first: { text: `${MARKER} first request`, requestId: "req-a" },
+			queued: { text: `${MARKER} second request`, requestId: "req-b" },
+			parked: async ({ service, requests }) => {
+				// The run the boundary started really did run, and served B.
+				const index = requests.findIndex((messages) => flatten(messages).includes(`${MARKER} second request`));
+				expect(index).toBeGreaterThanOrEqual(0);
+				expect(restorationOf(requests[index]!)).toContain("Request req-b v1");
+
+				// And the *control* state agrees, with the caller still parked and so no
+				// queue record and no link written by it.
+				const view = await service.readRequest();
+				expect(view.requestId).toBe("req-b");
+				expect(view.requestVersion).toBe(1);
+				expect(view.text).toBe(`${MARKER} second request`);
+				expect((await service.status()).requestId).toBe("req-b");
+			},
+		});
+	});
+
+	it("keeps the new requirement answerable and its continuation correct after a reopen that dropped the caller (AC-01, AC-04)", async () => {
+		// The same window, taken all the way through: the new run asks a question and
+		// ends, the submitting caller is discarded without ever writing the queue record
+		// or the link, the process is reopened, and the question is answered through a
+		// *new* service. The answer's continuation round must be served the new
+		// requirement — the failure the review measured was that it fell back to
+		// `Request req-a v1: OLD-REQUIREMENT`.
+		let asked = false;
+		await driveSubmitWindow({
+			databasePath,
+			router: async (request) => {
+				if (!asked && flatten(request.messages).includes(`${MARKER} second request`)) {
+					asked = true;
+					return fauxAssistantMessage(
+						[fauxToolCall("request_clarification", { question: "Which file?", reason: "two files match" }, { id: "ask-b" })],
+						{ stopReason: "toolUse" },
+					);
+				}
+				return fauxAssistantMessage([fauxText("done")]);
+			},
+			first: { text: `${MARKER} OLD-REQUIREMENT`, requestId: "req-a" },
+			queued: { text: `${MARKER} second request`, requestId: "req-b" },
+			parked: async ({ close }) => {
+				// Closed with the caller still parked and *nothing read*: the review's
+				// scenario is a caller that never comes back, so no service call has
+				// activated the input and no queue record or link exists. Whatever the
+				// reopened process reports, it recovered on its own.
+				await close();
+
+				// Reopened: the process-local placement map is empty and no queue record
+				// was ever written, so only the persisted admission and the Harness's own
+				// committed submission record can resolve the requirement.
+				const after: (readonly unknown[])[] = [];
+				const reopened = await openProbe({
+					databasePath,
+					provider: "faux",
+					// The reopened round answers the question; nothing here asks again.
+					fauxRouter: async (request) => {
+						after.push(request.messages);
+						return fauxAssistantMessage([fauxText("answered after the question")]);
+					},
+				});
+				try {
+					const root = await openRoot(reopened);
+					const second = await openMainService({
+						harness: reopened.harness,
+						registry: reopened.registry,
+						context,
+						conversationId: root.id,
+						dispatch: async () => [],
+					});
+
+					// Read *before* resuming: with scheduling still paused no generation
+					// hook can have run, so the requirement the new run established has to
+					// come from the persisted admission and the Harness's own submission
+					// record — not from a round this process has not started.
+					const afterReopen = await second.readRequest();
+					expect(afterReopen.requestId).toBe("req-b");
+					expect(afterReopen.requestVersion).toBe(1);
+					expect(afterReopen.text).toBe(`${MARKER} second request`);
+					// And the question that run asked is open on it, so it can be answered.
+					expect(afterReopen.openQuestionIds).toHaveLength(1);
+					const questionId = afterReopen.openQuestionIds[0]!;
+					reopened.harness.resume();
+
+					const answer = await second.submitUserInput({ text: "Use report.txt", answerTo: questionId, sufficient: true });
+					expect(answer.kind).toBe("answer");
+					if (answer.kind !== "answer") return;
+					await answer.submission.wait(context);
+					await reopened.harness.waitForIdle(context);
+
+					// The answer's continuation round is served the new requirement, not the
+					// one the pointer happened to name before activation.
+					const round = after.findIndex((messages) => flatten(messages).includes("Use report.txt"));
+					expect(round).toBeGreaterThanOrEqual(0);
+					const section = restorationOf(after[round]!);
+					expect(section).toContain("req-b");
+					expect(section).not.toContain("OLD-REQUIREMENT");
+				} finally {
+					await reopened.close();
+				}
+			},
+		});
+	});
+
+	it("keeps an activated requirement after a second reconciliation, rather than re-checking its own basis (AC-01, AC-04)", async () => {
+		// Activation is one-way, and this is why. A restatement admitted against
+		// `expectedRequestVersion: 1` is activated *as* it moves the requirement to v2,
+		// so a later reconciliation that re-applied it would compare the stored v2
+		// against the caller's original v1 basis and mark the input rejected — denying
+		// the very requirement it established, after the run that established it has
+		// already used it. The record is therefore marked once, and the mark is what
+		// makes a repeated read idempotent rather than destructive.
+		await driveSubmitWindow({
+			databasePath,
+			router: async () => fauxAssistantMessage([fauxText("done")]),
+			first: { text: `${MARKER} first request`, requestId: "req-a" },
+			queued: { text: `${MARKER} second request`, requestId: "req-a", expectedRequestVersion: 1 },
+			parked: async ({ service, runtime }) => {
+				const first = await service.readRequest();
+				expect(first.requestId).toBe("req-a");
+				expect(first.requestVersion).toBe(2);
+				expect(first.text).toBe(`${MARKER} second request`);
+
+				// Reconciled again, and again: the requirement must not move, and the
+				// input must not be marked rejected by its own basis.
+				await service.readRequest();
+				await service.status();
+				const again = await service.readRequest();
+				expect(again.requestId).toBe("req-a");
+				expect(again.requestVersion).toBe(2);
+				expect(again.text).toBe(`${MARKER} second request`);
+
+				const admissions = (await runtime.harness.snapshot(MainServiceDoc, 1 as never, context))?.admissions ?? [];
+				expect(admissions.some((admission) => admission.rejected === true)).toBe(false);
 			},
 		});
 	});

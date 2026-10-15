@@ -139,6 +139,17 @@ export type InputAdmission = {
 	readonly requestId: string;
 	readonly requestVersion: number;
 	/**
+	 * When the input was admitted.
+	 *
+	 * Carried so the request document can be written with a timestamp of its own
+	 * even when the submit caller never comes back to write it. `requestedAt === 0`
+	 * is the contract's "never written" marker, so a document that learns its
+	 * requirement from an admission needs a real moment to record — and the moment
+	 * the requirement was stated is the admission's, not the moment some later
+	 * reader happened to notice.
+	 */
+	readonly at?: number;
+	/**
 	 * The requirement's own words as *this input* states them, for an input admitted
 	 * while a round was running.
 	 *
@@ -178,6 +189,23 @@ export type InputAdmission = {
 	readonly basisAccepted?: boolean;
 	/** Set when the basis no longer holds, so a run made of this input must refuse. */
 	readonly rejected?: boolean;
+	/**
+	 * Set once this input's requirement has been *applied* to the request document
+	 * and the active pointer — or once it is settled that it never will be.
+	 *
+	 * This is what makes activation independent of the caller that submitted the
+	 * input. The queue record and the submission link are written by
+	 * `submitUserInput` *after* `handle.submit` returns, so a caller that never
+	 * comes back — a crash, a dropped continuation, a reopen — leaves an input that
+	 * was placed and ran while the request document and the pointer still name the
+	 * previous requirement. The admission is written *before* the submission, so it
+	 * is the one record that survives that; reading the real submission's placement
+	 * against it is what lets a later reader complete the activation on its own.
+	 *
+	 * Applied at most once: re-applying an older admission would write its words
+	 * back over a newer requirement's.
+	 */
+	readonly activated?: boolean;
 };
 
 /**
