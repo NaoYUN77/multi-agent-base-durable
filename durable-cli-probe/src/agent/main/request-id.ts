@@ -86,10 +86,28 @@ export function deriveQuestionId(requestId: string, round: number, question: str
  * its own plan index, instead of settling as the replay the Harness's dedup key
  * exists to catch (rule 1).
  *
- * The trade-off is explicit and is the caller's to manage: with no `requestId`
- * given, two *different* requirements told in exactly the same words are one
- * requirement — the second submission restates it at the next version. Naming
- * the two is what a caller does when they are two.
+ * **When this is reached, and when it is not.** The service computes a request id
+ * as `input.requestId ?? current?.requestId ?? derivedRequestId(text)`, so this
+ * fallback applies only when the caller named no `requestId` *and* no requirement
+ * is active. A caller that names one always wins; a caller that names none while a
+ * requirement is active is *restating that requirement*, not starting one, and its
+ * words never reach this function. The precise preconditions matter because the
+ * guarantees below hold only here.
+ *
+ * **What it guarantees, and what it does not.** It guarantees that the same words
+ * always name the *same* requirement, so a retry cannot fork a second one: the
+ * decision is a pure function of what the caller already knows. It does **not**
+ * guarantee that a retry leaves the version where it was. Once a requirement is
+ * recorded, the same words are a restatement — the identity is stable, the version
+ * moves to the next one, and that is true within a single conversation as well as
+ * across two. A caller that must not restate has to name a different request, or
+ * pass the version basis it means (`expectedRequestVersion`) and be refused when
+ * that basis no longer holds.
+ *
+ * The trade-off follows and is the caller's to manage: with no `requestId` given,
+ * two *different* requirements told in exactly the same words are one
+ * requirement — the second submission restates it at the next version. Naming the
+ * two is what a caller does when they are two.
  */
 export function derivedRequestId(text: string): string {
 	return `req-${stableSlug(text)}`;

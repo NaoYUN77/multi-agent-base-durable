@@ -139,6 +139,25 @@ export type InputAdmission = {
 	readonly requestId: string;
 	readonly requestVersion: number;
 	/**
+	 * The requirement's own words as *this input* states them, for an input admitted
+	 * while a round was running.
+	 *
+	 * Identity and content have to be persisted together. The identity alone is not
+	 * enough to recover a run: `handle.submit` returns before this service records
+	 * anything else, and the Harness places the input and starts its run at the round
+	 * boundary in the meantime, so the input's text is still only in a record written
+	 * *after* that call returns. The request document learns the words even later —
+	 * when the input is applied at the consume boundary. A run that resolves its
+	 * requirement from this record therefore used to get the right identity from the
+	 * *previous* version's words, or no words at all.
+	 *
+	 * Absent for an input that states no requirement of its own — an answer, whose
+	 * words are a reply rather than a restatement. Such a run reads the requirement's
+	 * words from the request document, which is the same thing the version it was
+	 * admitted for already holds.
+	 */
+	readonly text?: string;
+	/**
 	 * The requirement version the caller's decision was made against, when it gave
 	 * one. Carried so the basis can be checked when a run resolves its requirement —
 	 * synchronously with the run, not lazily on a later queue read. A stale input

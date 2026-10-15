@@ -173,7 +173,9 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * them would silently not drive the work it is supposed to serve. A commit
 	 * gives the same committed read while keeping the conversation live.
 	 */
-	async function activeRequest(tx?: Tx): Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined> {
+	async function activeRequest(
+		tx?: Tx,
+	): Promise<{ readonly requestId: string; readonly requestVersion: number; readonly text?: string } | undefined> {
 		// `tx` when the caller is already inside a transaction: a tool's admission
 		// must read the pointer in *its own* transaction, or it compares a plan
 		// against a value that may already have moved by the time it commits.
@@ -219,7 +221,12 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// observed is refused rather than treated as satisfied.
 					if ((storedVersion ?? 1) !== admission.expectedRequestVersion) return undefined;
 				}
-				return { requestId: admission.requestId, requestVersion: admission.requestVersion };
+				// The input's own words travel with its identity. They are part of what
+				// this run serves, not a detail the request document owns: the document
+				// is written at the consume boundary, which the Harness reaches after it
+				// has already placed the input and started this run, and an input admitted
+				// during a round has no document of its own until then.
+				return { requestId: admission.requestId, requestVersion: admission.requestVersion, ...(admission.text === undefined ? {} : { text: admission.text }) };
 			}
 			// A live run whose inputs name no requirement must not fall through to the
 			// pointer. The pointer names the requirement that was being served when the
@@ -301,13 +308,25 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		key: string,
 		requestId: string,
 		requestVersion: number,
+		text?: string,
 		expectedRequestVersion?: number,
 	): Promise<void> {
 		const doc = await tx.doc(MainServiceDoc, conversationId);
 		if (doc.admissions.some((entry) => entry.key === key)) return;
 		doc.admissions = [
 			...doc.admissions,
-			{ key, requestId, requestVersion, ...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }) },
+			{
+				key,
+				requestId,
+				requestVersion,
+				// The words go in *with* the identity, in this commit: an input admitted
+				// while a round is running has no other record of them before
+				// `handle.submit` returns, and the run the Harness starts for it in that
+				// window would otherwise resolve the right identity against the previous
+				// version's words.
+				...(text === undefined ? {} : { text }),
+				...(expectedRequestVersion === undefined ? {} : { expectedRequestVersion }),
+			},
 		];
 	}
 
@@ -338,6 +357,13 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * restatement of the *same* requirement is covered as well: it resolves to the
 	 * same request at its new version.
 	 *
+	 * Identity, version and words all come from that one record. The request document
+	 * is not a substitute for it: a queued input's words are written to the document at
+	 * the consume boundary, which the Harness only reaches after the run it started has
+	 * been built, so a section rendered from the document alone names the right
+	 * requirement with the version and wording of the one before it — or, for a
+	 * requirement the input itself creates, carries no section at all.
+	 *
 	 * A run that resolves no requirement of its own (an input refused on its version
 	 * basis, or one whose admission is not yet recoverable) loses the section
 	 * entirely. Leaving it would state the previous requirement's facts to a run
@@ -351,18 +377,30 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			const resolved = await activeRequest(tx);
 			if (resolved === undefined) return null;
 			const request = await tx.doc(AgentRequestDoc, conversationId, resolved.requestId, { requestId: resolved.requestId });
+			// The words come from the run's own input first and from the document
+			// second, because the two are written at different moments: an input admitted
+			// during a round carries its requirement's words with its identity, while the
+			// document learns them only when the input is applied at the consume boundary
+			// — which the Harness reaches *after* it has placed the input and started the
+			// run. Reading the document alone therefore states the previous version's
+			// words to the run that serves the new ones, and for a requirement the input
+			// creates it states none at all.
+			//
 			// `requestedAt === 0` is the contract's "never written" marker: the default
 			// above supplies a document that looks readable, so the field is what
-			// distinguishes a real requirement from the shape of one.
-			if (request.requestedAt === 0 || request.text === "") return null;
+			// distinguishes a real requirement from the shape of one. A run with no
+			// requirement of its own resolves none, and keeps no section.
+			const recorded = request.requestedAt === 0 ? undefined : request.text;
+			const text = resolved.text ?? recorded;
+			if (text === undefined || text === "") return null;
 			const service = await tx.doc(MainServiceDoc, conversationId);
 			const clarification = await tx.doc(AgentClarificationDoc, conversationId, resolved.requestId, {
 				requestId: resolved.requestId,
 			});
 			return restorationSectionText({
 				requestId: resolved.requestId,
-				requestVersion: request.requestVersion,
-				text: request.text,
+				requestVersion: resolved.requestVersion,
+				text,
 				materials: request.materials,
 				questions: clarification.questions,
 				answers: clarification.answers,
@@ -513,7 +551,21 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		// overlays that throw "Cannot use a settled overlay" once it finishes.
 		const readRequest = async (tx: Tx) => {
 			const doc = await tx.doc(AgentRequestDoc, conversationId, input.requestId, { requestId: input.requestId });
-			return JSON.parse(JSON.stringify({ requestVersion: doc.requestVersion, text: doc.text, materials: doc.materials })) as {
+			// Resolved exactly as the restoration section resolves it, and for the same
+			// reason: a run admitted while a round was running was given its requirement's
+			// words together with its identity, and the document only receives them at the
+			// consume boundary. A handoff *replaces* the next round's context, so one built
+			// from the document alone would hand that round the previous version's wording
+			// as if it were the request being served.
+			const resolved = await activeRequest(tx);
+			const served = resolved !== undefined && resolved.requestId === input.requestId ? resolved : undefined;
+			return JSON.parse(
+				JSON.stringify({
+					requestVersion: served?.requestVersion ?? doc.requestVersion,
+					text: served?.text ?? doc.text,
+					materials: doc.materials,
+				}),
+			) as {
 				readonly requestVersion: number;
 				readonly text: string;
 				readonly materials: readonly { readonly source: string; readonly content: string }[];
@@ -886,10 +938,21 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 						.filter((version): version is number => version !== undefined);
 					const highest = Math.max(stored ?? 0, ...alreadyAllocated);
 					const version = highest === 0 ? 1 : highest + 1;
-					// Durable before the submission: the Harness may place this input and
-					// start its run as soon as `handle.submit` returns, and that run
-					// resolves its requirement from this record.
-					await placeIdentity(tx, key, requestId, version, input.expectedRequestVersion);
+					// Durable before the submission, and the *words* with it: the Harness
+					// may place this input and start its run as soon as `handle.submit`
+					// returns, and that run resolves its requirement — identity, version and
+					// text — from this record. The queue record below is written after that
+					// call returns, and the request document only learns the words at the
+					// consume boundary, so neither is readable in time. Identity and content
+					// are one fact here rather than two: persisting only the identity leaves
+					// the run it starts with the previous version's words.
+					//
+					// The caller's version basis is *not* checked here. It is checked when
+					// this input is consumed, and when a run resolves its requirement from
+					// it — late by design, so that an input admitted against a basis that is
+					// still current is not refused for a version the requirement reaches only
+					// because of the input itself (`basisAccepted`).
+					await placeIdentity(tx, key, requestId, version, text, input.expectedRequestVersion);
 					return version;
 				}, context);
 				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
