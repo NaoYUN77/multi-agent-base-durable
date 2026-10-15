@@ -1447,6 +1447,13 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			if (once.kind !== "queued" || twice.kind !== "queued") return;
 			expect(String(twice.submission.id)).toBe(String(once.submission.id));
 
+			// The queue record and the admission agree on the version this input
+			// *becomes*. The defect the review found was exactly a split here — the
+			// record at one version, the admission the run resolves from at another — and
+			// a length-1 queue does not show it, so the two are read separately.
+			const record = (await service.readQueue()).find((entry) => entry.submissionId === String(once.submission.id));
+			expect(record?.allocatedVersion).toBe(2);
+
 			release?.();
 			await first.submission.wait(context);
 			await runtime.harness.waitForIdle(context);
@@ -1460,6 +1467,12 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-r", context);
 			expect(saved?.requestId).toBe("req-a");
 			expect(saved?.requestVersion).toBe(2);
+
+			// And the admission the run resolved from agrees with the document and the
+			// plan: all three at v2, so no read point is a version out of step.
+			const admissionDoc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const admission = admissionDoc?.admissions.find((entry) => entry.key.startsWith("queued:") && entry.requestId === "req-a");
+			expect(admission?.requestVersion).toBe(2);
 		} finally {
 			release?.();
 			await runtime.close();
