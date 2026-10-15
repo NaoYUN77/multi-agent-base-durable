@@ -475,19 +475,26 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					);
 					continue;
 				}
-				const nextVersion = storedVersion === undefined ? 1 : Math.max(storedVersion + 1, entry.requestVersion);
+				// The version was allocated when the input was admitted, not here: the
+				// run made of this input already resolved it, and a version derived now
+				// would land *after* that run saved its plans — invalidating them. The
+				// document is written to the allocated version so the requirement, the
+				// pointer and the run's own admission all agree.
+				//
+				// `Math.max` with the stored version keeps the requirement monotonic if
+				// reconciliation ever lands out of order: the version must not move
+				// *backwards*, because a plan already bound to a higher version would then
+				// mismatch the requirement that owns it.
+				const nextVersion = storedVersion === undefined ? entry.allocatedVersion : Math.max(storedVersion, entry.allocatedVersion);
 				request.requestVersion = nextVersion;
 				request.text = entry.text;
 				request.requestedAt = entry.queuedAt;
 				doc.activeRequestId = entry.requestId;
 				doc.requestVersion = nextVersion;
-				// The admission must name the version the requirement is *at* once the
-				// input is consumed, not the one it was queued against: a run made of
-				// this input binds its plans to the admission's version, and a stale one
-				// would make every such plan mismatch the request document.
-				doc.admissions = doc.admissions.map((admission) =>
-					admission.submissionId === entry.submissionId ? { ...admission, requestVersion: nextVersion } : admission,
-				);
+				// The admission already names the allocated version (it was recorded that
+				// way at admission time), so there is nothing to rewrite here. Rewriting it
+				// from a value derived at consume time is what made the run's own plans
+				// mismatch the request document.
 			}
 			doc.queue = doc.queue.filter((entry) => !consumed.some((gone) => gone.submissionId === entry.submissionId));
 		}, context);
@@ -605,9 +612,38 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				const requestId = input.requestId ?? current?.requestId ?? `req-${now().toString(36)}`;
 				const requestVersion = current?.requestVersion ?? 1;
 				const queuedAt = now();
+				// The version this input *becomes*, allocated here rather than at the
+				// consume boundary. The Harness places a queued input and starts its run
+				// at the round boundary — before any service call reads the queue — so a
+				// version derived at consume time arrives after that run has already
+				// resolved its requirement. Allocating it now is what lets the run bind
+				// its plans, and admit its dispatch, against the version the requirement
+				// is actually at.
+				const allocatedVersion = await handle.commit(async (tx) => {
+					const doc = await tx.doc(MainServiceDoc, conversationId);
+					// The allocation is per requirement: a queued input becomes the version
+					// after the one the requirement is at, and a second queued input for the
+					// same requirement takes the version after that. Every input is decided
+					// from persisted state, so the same admission allocates the same version
+					// on a retry.
+					//
+					// The *request document* is the authority for the version, not the
+					// pointer: the pointer is only moved when an input is consumed, so it
+					// lags, and the request document is what a plan is compared against.
+					// `requestedAt === 0` is the contract's "nothing recorded yet", so a
+					// request that has never been written starts at 1 like any other.
+					const request = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
+					const stored = request.requestedAt === 0 ? undefined : request.requestVersion;
+					const alreadyAllocated = doc.queue.filter((entry) => entry.requestId === requestId).map((entry) => entry.allocatedVersion);
+					const highest = Math.max(stored ?? 0, ...alreadyAllocated);
+					return highest === 0 ? 1 : highest + 1;
+				}, context);
 				// The submission key is the logical identity of the input, not a clock:
 				// keying on `queuedAt` would make the same input a different submission on
-				// a retry, which is the replay the dedup key exists to catch.
+				// a retry, which is the replay the dedup key exists to catch. The version
+				// in the key stays the version the input was queued *against* — the
+				// requirement's version when the caller submitted — because that is the
+				// identity the caller's own decision was made against.
 				const submission = await handle.submit(
 					{ type: "input", content: text, requestId: queuedInputId(requestId, requestVersion, text) },
 					context,
@@ -616,6 +652,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					submissionId: String(submission.id),
 					requestId,
 					requestVersion,
+					allocatedVersion,
 					...(input.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: input.expectedRequestVersion }),
 					text,
 					queuedAt,
@@ -626,8 +663,9 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// The admission is recorded now, so that when the Harness places this
 					// input at the next boundary and starts a run for it, the run resolves
 					// the requirement from its own input rather than from the lagging
-					// pointer.
-					await recordAdmission(tx, String(submission.id), requestId, requestVersion, input.expectedRequestVersion);
+					// pointer — and resolves the version it was allocated, not the one it
+					// was queued against.
+					await recordAdmission(tx, String(submission.id), requestId, allocatedVersion, input.expectedRequestVersion);
 				}, context);
 				return { kind: "queued", submission, reason: "a round is running; the input is queued for the next boundary" };
 			}

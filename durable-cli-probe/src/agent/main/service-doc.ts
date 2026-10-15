@@ -52,6 +52,18 @@ export type QueuedInput = {
 	 */
 	readonly requestVersion: number;
 	/**
+	 * The requirement version this input *becomes* when it is consumed, allocated
+	 * while the input is admitted rather than when it is later read back.
+	 *
+	 * The allocation has to happen at admission time because the Harness places a
+	 * queued input and starts its run at the round boundary, before any service call
+	 * observes the queue. A version derived at consume time therefore arrives *after*
+	 * that run has already resolved its requirement: the run binds its plans to the
+	 * previous version, can dispatch the previous version's plan, and then has those
+	 * plans invalidated when the consume-time bump finally lands.
+	 */
+	readonly allocatedVersion: number;
+	/**
 	 * The requirement version the caller's decision was made against, when it gave
 	 * one. Re-checked at the consume boundary: a queued restatement whose basis went
 	 * stale while it waited must not be applied as if it were current.

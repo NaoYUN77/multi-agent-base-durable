@@ -399,6 +399,115 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		}
 	});
 
+	it("refuses the old plan and keeps its own plan valid when a restatement is consumed (AC-03, AC-04)", async () => {
+		// The reviewer's ordering point, made mechanical. A restatement queued while a
+		// round runs is placed by the Harness and its run *starts* before any service
+		// call reads the queue. The requirement version therefore has to be allocated
+		// when the input is admitted, not when the queue is later reconciled:
+		//
+		//   * derived late, the run resolves the *pre-restatement* version, so the old
+		//     v1 plan still matches and is admitted — the old goal runs under the new
+		//     instructions;
+		//   * the late bump also lands *after* the run saved its own plan, leaving that
+		//     plan at v1 while the requirement moved to v2, so the work the restatement
+		//     actually asked for can never be dispatched.
+		//
+		// Both are asserted against persisted facts and the injected executor, not
+		// against what a tool printed.
+		const dispatched: string[][] = [];
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let parkedOnce = false;
+		const router: FauxResponseFactory = async (request) => {
+			const text = flatten(request.messages);
+			if (!parkedOnce) {
+				// Run 1 (the original requirement): save the plan for the OLD goal, then
+				// park so the user's restatement is queued rather than submitted.
+				if (!text.includes("saved plan")) {
+					return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-old", goals: ["old goal"], taskIds: ["t1"] }, { id: "save-old" })], {
+						stopReason: "toolUse",
+					});
+				}
+				parkedOnce = true;
+				await parked;
+				return fauxAssistantMessage([fauxText("run 1 done")]);
+			}
+			// Run 2: the run made of the queued restatement. It saves a plan for the NEW
+			// goal, then tries to dispatch the OLD plan — which must be refused, because
+			// the plan was written for the requirement the user has now replaced.
+			if (!text.includes("saved plan plan-new")) {
+				return fauxAssistantMessage([fauxToolCall("save_plan", { planId: "plan-new", goals: ["new goal"], taskIds: ["t1"] }, { id: "save-new" })], {
+					stopReason: "toolUse",
+				});
+			}
+			if (!text.includes("dispatched plan") && !text.includes("dispatch refused")) {
+				return fauxAssistantMessage([fauxToolCall("dispatch_tasks", { planId: "plan-old", version: 1, tasks: [taskSpec("t1")] }, { id: "dispatch-old" })], {
+					stopReason: "toolUse",
+				});
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async ({ tasks }) => {
+					dispatched.push(tasks.map((task) => task.id));
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				now: () => 1_700_000_000_000,
+			});
+
+			const first = await service.submitUserInput({ text: "plan the old work", requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+
+			// Wait until run 1 has saved its plan and is parked, so the restatement is
+			// admitted to the queue rather than submitted.
+			const deadline = Date.now() + 5_000;
+			while (Date.now() < deadline) {
+				const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+				if ((doc?.plans.length ?? 0) > 0) break;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			const restated = await service.submitUserInput({ text: "actually do the new work", requestId: "req-plan" });
+			expect(restated.kind).toBe("queued");
+
+			release?.();
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+
+			// The old plan was never executed: its requirement version is not the one the
+			// restatement's run serves.
+			expect(dispatched).toHaveLength(0);
+			// The plan the restatement's run saved is bound to the version the
+			// requirement will be at — the allocated one — not to the pre-restatement v1.
+			const savedNew = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-new", context);
+			expect(savedNew?.requestId).toBe("req-plan");
+			expect(savedNew?.requestVersion).toBe(2);
+
+			// Reconciling the queue (any readQueue/withdrawQueued does this) must not move
+			// the requirement off that version: the allocation happened at admission, so
+			// there is nothing left to bump. A late derivation here is exactly what used
+			// to invalidate the plan the run had just saved.
+			await service.readQueue();
+			const view = await service.readRequest();
+			expect(view.requestVersion).toBe(2);
+			expect(view.text).toBe("actually do the new work");
+			expect((await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-new", context))?.requestVersion).toBe(2);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
 	it("refuses a dispatch whose dependency is not accepted (AC-03)", async () => {
 		const { runtime, service, dispatched } = await runScript(
 			[
