@@ -22,6 +22,7 @@ import {
 	type ConversationId,
 	type Harness,
 	type InputSubmissionDraft,
+	type Tx,
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
@@ -108,6 +109,70 @@ function harnessParkingSubmits(harness: Harness, onSubmitted: () => Promise<void
 						const submission = await target.submit(draft, ctx);
 						await onSubmitted();
 						return submission;
+					};
+				}
+				const value = Reflect.get(target, property, target) as unknown;
+				return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+			},
+		}) as Conversation;
+	return new Proxy(harness, {
+		get(target, property) {
+			if (property === "conversation") {
+				return async (id: ConversationId, ctx: Context) => {
+					const conversation = await target.conversation(id, ctx);
+					return conversation === undefined ? undefined : park(conversation);
+				};
+			}
+			const value = Reflect.get(target, property, target) as unknown;
+			return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+		},
+	}) as Harness;
+}
+
+/**
+ * A Harness that pauses a `reconcileQueue` *read* commit once its snapshot holds
+ * a placed input, so a second reconciliation can be driven through the gap
+ * before the first one writes.
+ *
+ * `reconcileQueue` is two commits: a read that snapshots the admissions and each
+ * one's placement state, then a write that applies them. The Harness serializes
+ * each commit but not the pair, so `read1 → read2 → write1 → write2` is a real
+ * interleaving — the second read's snapshot predates the first write. Releasing
+ * the writes out of order is what exposes a write that re-applies a stale copy
+ * of an input the other write already decided.
+ *
+ * The gate fires on the read commit whose returned snapshot contains a `placed`
+ * input, which is the only state that can activate one. Every other member is
+ * forwarded bound to the real object: the Harness and its conversations carry
+ * private state, and a method invoked on the proxy receiver throws on its first
+ * private-field read.
+ */
+function harnessGatingPlacedSnapshot(
+	harness: Harness,
+	onSubmitted: () => Promise<void>,
+	gate: { readonly armed: () => boolean; readonly onPlaced: (index: number) => Promise<void> },
+): Harness {
+	let placedReads = 0;
+	const park = (conversation: Conversation): Conversation =>
+		new Proxy(conversation, {
+			get(target, property) {
+				if (property === "submit") {
+					return async (draft: InputSubmissionDraft, ctx: Context) => {
+						const submission = await target.submit(draft, ctx);
+						await onSubmitted();
+						return submission;
+					};
+				}
+				if (property === "commit") {
+					return async (change: (tx: Tx) => unknown, ctx: Context) => {
+						const result = await target.commit(change, ctx);
+						// The reconcile *read* commit returns `{ pending, queueState, ... }`; only
+						// a snapshot with a `placed` entry can lead to an activation.
+						const snapshot = result as { pending?: readonly { state?: string }[] } | undefined;
+						if (gate.armed() && snapshot?.pending?.some((item) => item.state === "placed") === true) {
+							await gate.onPlaced(placedReads++);
+						}
+						return result;
 					};
 				}
 				const value = Reflect.get(target, property, target) as unknown;
@@ -1972,6 +2037,225 @@ describe("TASK-005.2 clarification — a question ends the round (AC-02)", { tim
 				expect(admissions.some((admission) => admission.rejected === true)).toBe(false);
 			},
 		});
+	});
+
+	it("does not let a second reconciliation reject an input the first already accepted (AC-01, AC-04)", async () => {
+		// `reconcileQueue` is two commits, and the Harness serializes each *commit*,
+		// not the pair. Two reconciliations can therefore interleave as
+		// read1 → read2 → write1 → write2: the second read's snapshot predates the
+		// first write, so write2 re-applies a copy of an input write1 has already
+		// activated — and compares the requirement's *new* version against the
+		// caller's original basis, marking the input rejected. A run built from it
+		// then resolves no requirement at all, losing its restoration section and
+		// having its tools refuse. This drives exactly that order: the generation
+		// hook's reconcile read and a control read are both held before their writes,
+		// the generation write lands, and only then is the control write released.
+		let releaseFirst: (() => void) | undefined;
+		const firstParked = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let releaseQueued: (() => void) | undefined;
+		const queuedParked = new Promise<void>((resolve) => {
+			releaseQueued = resolve;
+		});
+		let reachedBarrier: (() => void) | undefined;
+		const atBarrier = new Promise<void>((resolve) => {
+			reachedBarrier = resolve;
+		});
+
+		let armed = false;
+		const releases: (() => void)[] = [];
+		const paused: (() => void)[] = [];
+		const pausedReads = [0, 1].map(() => new Promise<void>((resolve) => paused.push(resolve)));
+		let parkNextSubmit = false;
+		let run2Section: string | undefined;
+
+		let parkedFirstOnce = false;
+		const router: FauxResponseFactory = async (request) => {
+			if (!parkedFirstOnce) {
+				parkedFirstOnce = true;
+				await firstParked;
+				return fauxAssistantMessage([fauxText("done")]);
+			}
+			// Run 2 (the accepted restatement) must be served req-a v2 and be able to
+			// save a plan, which is only possible if its tools resolve a requirement.
+			run2Section = restorationOf(request.messages);
+			return fauxAssistantMessage(
+				[fauxToolCall("save_plan", { planId: "plan-b", goals: ["B"], taskIds: ["t1"] }, { id: "b1" })],
+				{ stopReason: "toolUse" },
+			);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: harnessGatingPlacedSnapshot(
+					runtime.harness,
+					async () => {
+						if (!parkNextSubmit) return;
+						reachedBarrier?.();
+						await queuedParked;
+					},
+					{
+						armed: () => armed,
+						onPlaced: async (index) => {
+							if (index >= 2) return;
+							paused[index]?.();
+							await new Promise<void>((resolve) => releases.push(resolve));
+						},
+					},
+				),
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			parkNextSubmit = true;
+			const queued = service.submitUserInput({ text: `${MARKER} second request`, requestId: "req-a", expectedRequestVersion: 1 });
+			queued.catch(() => undefined);
+			await atBarrier;
+			parkNextSubmit = false;
+
+			// Armed now: the next reconcile read that sees a placed input is run2's
+			// generation hook. Hold it before its write.
+			armed = true;
+			releaseFirst?.();
+			await pausedReads[0]!;
+			// A control read's reconcile, whose snapshot also sees the input as placed and
+			// still undecided. Hold it too, before its write.
+			const control = service.readRequest();
+			control.catch(() => undefined);
+			await pausedReads[1]!;
+
+			// Let the generation write land: the input is activated as v2, its run saves
+			// plan-b and ends.
+			releases[0]?.();
+			await runtime.harness.waitForIdle(context);
+
+			// Now release the control write, which holds the pre-activation snapshot.
+			releases[1]?.();
+			await control;
+
+			// The input is not rejected, and the run served req-a v2.
+			const admissions = (await runtime.harness.snapshot(MainServiceDoc, 1 as never, context))?.admissions ?? [];
+			expect(admissions.some((admission) => admission.rejected === true)).toBe(false);
+			expect(run2Section).toContain("req-a v2");
+			const saved = await runtime.harness.snapshot(AgentPlanDoc, 1 as never, "plan-b", context);
+			expect(saved?.requestId).toBe("req-a");
+			expect(saved?.requestVersion).toBe(2);
+		} finally {
+			releaseFirst?.();
+			releaseQueued?.();
+			await runtime.close().catch(() => undefined);
+		}
+	});
+
+	it("does not let a stale reconciliation overwrite a newer requirement's words (AC-01, AC-04)", async () => {
+		// The same two-commit race, on the path that has *no* version basis: write2's
+		// stale copy of a placed input carries the old words and the old `requestedAt`,
+		// and applying it after a newer restatement would write them back over the
+		// newer requirement's text and pointer. The terminal mark is what must stop it:
+		// once write1 has activated the input, write2 has nothing left to apply.
+		let releaseFirst: (() => void) | undefined;
+		const firstParked = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let releaseQueued: (() => void) | undefined;
+		const queuedParked = new Promise<void>((resolve) => {
+			releaseQueued = resolve;
+		});
+		let reachedBarrier: (() => void) | undefined;
+		const atBarrier = new Promise<void>((resolve) => {
+			reachedBarrier = resolve;
+		});
+
+		let armed = false;
+		const releases: (() => void)[] = [];
+		const paused: (() => void)[] = [];
+		const pausedReads = [0, 1].map(() => new Promise<void>((resolve) => paused.push(resolve)));
+		let parkNextSubmit = false;
+
+		let parkedFirstOnce = false;
+		const router: FauxResponseFactory = async () => {
+			if (!parkedFirstOnce) {
+				parkedFirstOnce = true;
+				await firstParked;
+			}
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: harnessGatingPlacedSnapshot(
+					runtime.harness,
+					async () => {
+						if (!parkNextSubmit) return;
+						reachedBarrier?.();
+						await queuedParked;
+					},
+					{
+						armed: () => armed,
+						onPlaced: async (index) => {
+							if (index >= 2) return;
+							paused[index]?.();
+							await new Promise<void>((resolve) => releases.push(resolve));
+						},
+					},
+				),
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+
+			const first = await service.submitUserInput({ text: `${MARKER} first request`, requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			parkNextSubmit = true;
+			const queued = service.submitUserInput({ text: `${MARKER} X`, requestId: "req-a" });
+			queued.catch(() => undefined);
+			await atBarrier;
+			parkNextSubmit = false;
+
+			armed = true;
+			releaseFirst?.();
+			await pausedReads[0]!;
+			const control = service.readRequest();
+			control.catch(() => undefined);
+			await pausedReads[1]!;
+
+			// The generation write applies X (v2), and its run ends.
+			releases[0]?.();
+			await runtime.harness.waitForIdle(context);
+
+			// A newer, direct restatement W lands while idle, at v3 with its own words.
+			const restated = await service.submitUserInput({ text: `${MARKER} W`, requestId: "req-a" });
+			if (restated.kind !== "request") throw new Error("expected a restatement");
+			await runtime.harness.waitForIdle(context);
+
+			// Release the stale control write: it must not put X's words or pointer back.
+			releases[1]?.();
+			await control;
+
+			const view = await service.readRequest();
+			expect(view.requestVersion).toBe(3);
+			expect(view.text).toBe(`${MARKER} W`);
+			const request = await runtime.harness.snapshot(AgentRequestDoc, 1 as never, "req-a", context);
+			expect(request?.text).toBe(`${MARKER} W`);
+		} finally {
+			releaseFirst?.();
+			releaseQueued?.();
+			await runtime.close().catch(() => undefined);
+		}
 	});
 
 	it("names one requirement for an unnamed input resubmitted in the same conversation, at the next version (AC-04)", async () => {

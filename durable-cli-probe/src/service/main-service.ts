@@ -779,12 +779,33 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 
 		await handle.commit(async (tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
+			// The snapshot was read in an earlier transaction, and the Harness
+			// serializes each *commit* but not this function. `reconcileQueue` is entered
+			// from control reads, `status` and the generation hook, so two reconciliations
+			// can interleave as read1 → read2 → write1 → write2. Re-applying write2's
+			// stale copy of an input write1 has already decided would compare the
+			// requirement's version — moved by write1 — against the caller's original
+			// basis, marking the input rejected and denying a requirement that is already
+			// accepted and served by a live run. The terminal marks are therefore re-read
+			// here, from the document as it stands, and only an input that is *still*
+			// undecided is applied.
+			const current = new Map(doc.admissions.map((entry) => [entry.key, entry]));
 			const mark = (key: string, patch: Partial<InputAdmission>): void => {
-				doc.admissions = doc.admissions.map((entry) => (entry.key === key ? { ...entry, ...patch } : entry));
+				doc.admissions = doc.admissions.map((entry) => {
+					if (entry.key !== key) return entry;
+					const next = { ...entry, ...patch };
+					current.set(key, next);
+					return next;
+				});
 			};
 			// Oldest first, so the pointer ends at the newest requirement admitted.
-			for (const { admission, state } of snapshot.pending) {
+			for (const { admission: seen, state } of snapshot.pending) {
 				if (state === "waiting") continue;
+				const admission = current.get(seen.key);
+				// Decided by a reconciliation that committed first: its terminal mark is
+				// final, and neither applying it again nor re-judging its basis from an
+				// older snapshot may overturn it.
+				if (admission === undefined || admission.activated === true || admission.rejected === true) continue;
 				if (state === "gone") {
 					// Never placed, so it never becomes the requirement. Recorded as applied
 					// so it is not examined on every later reconciliation.
