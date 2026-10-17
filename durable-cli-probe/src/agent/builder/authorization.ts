@@ -75,8 +75,9 @@ export type AuthorizedCapabilities = {
  * - `tool_not_allowed` — a requested tool is catalogued but not allowed;
  * - `skill_required_tool_not_requested` — the skill needs a tool the spec omits
  *   (granting it silently would widen the task's authority);
- * - `tool_catalog_duplicate` / `tool_catalog_mismatch` — the policy itself is
- *   inconsistent, which is an application error reported instead of guessed at.
+ * - `tool_catalog_duplicate` / `tool_catalog_mismatch` / `tool_extension_mismatch`
+ *   — the policy itself is inconsistent, which is an application error reported
+ *   instead of guessed at.
  */
 export function authorizeTask(spec: TaskSpec, policy: TaskAuthorizationPolicy): ContractValidation<AuthorizedCapabilities> {
 	const collect = new Violations();
@@ -90,6 +91,13 @@ export function authorizeTask(spec: TaskSpec, policy: TaskAuthorizationPolicy): 
 		}
 		if (tool.registration.name !== tool.name) {
 			collect.add("tool_catalog_mismatch", "$.tools", `catalog name ${tool.name} does not match registration ${tool.registration.name}`);
+			continue;
+		}
+		// `configure` enables the extension and the tool name independently; a
+		// catalog entry whose extension does not actually provide the tool would
+		// authorize a tool the child never receives.
+		if (!(tool.extension.tools ?? []).some((registered) => registered.name === tool.name)) {
+			collect.add("tool_extension_mismatch", "$.tools", `extension ${tool.extension.name} does not provide tool ${tool.name}`);
 			continue;
 		}
 		catalog.set(tool.name, tool);

@@ -8,9 +8,10 @@
 //
 // Two properties are load-bearing:
 //
-//   1. **Containment.** The entrypoint is resolved with `realpath`, and the
-//      result must stay under the real root. Checking the raw string for `..`
-//      is not enough: a symlink inside the skill directory can point anywhere.
+//   1. **Containment.** The skill directory is resolved with `realpath` and must
+//      stay under the real root; the entrypoint is resolved the same way and
+//      must stay under the real skill directory. Checking the raw string for
+//      `..` is not enough: a symlink can point anywhere.
 //   2. **A stable identity.** `version` is the manifest's own revision and
 //      `hash` is the SHA-256 of the instructions file. A running child records
 //      both in its config snapshot, so a later registry change can be detected
@@ -18,7 +19,7 @@
 //      §"任务、Skill、工厂与权限").
 
 import { createHash } from "node:crypto";
-import { readdir, readFile, realpath } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ContractViolationError } from "../contracts/errors.ts";
 import { Violations, readIdArray, readNoUnknownKeys, readObject, readSchemaVersion, readStableId, readString } from "../contracts/validate.ts";
@@ -139,15 +140,26 @@ export async function loadSkillRegistry(options: LoadSkillRegistryOptions): Prom
 	const skills: SkillDefinition[] = [];
 	const seen = new Set<string>();
 
-	for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((left, right) => left.name.localeCompare(right.name))) {
+	// Symlinked skill directories (including Windows junctions) report
+	// `isSymbolicLink()`, not `isDirectory()`. Resolve them and keep the ones
+	// that really are directories, so an installed link is not silently dropped.
+	const candidates = entries
+		.filter((candidate) => candidate.isDirectory() || candidate.isSymbolicLink())
+		.sort((left, right) => left.name.localeCompare(right.name));
+	for (const entry of candidates) {
 		const directory = join(root, entry.name);
+		const info = await stat(directory).catch(() => undefined);
+		if (info?.isDirectory() !== true) continue;
 		const manifestPath = join(directory, SKILL_MANIFEST_FILE);
 		const raw = await readFile(manifestPath, "utf8").catch((error: unknown) => {
 			throw new Error(`skill ${entry.name}: cannot read ${SKILL_MANIFEST_FILE}: ${(error as Error).message}`);
 		});
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(raw);
+			// Editors on Windows may save UTF-8 with a BOM; `JSON.parse` rejects it.
+			// One malformed manifest aborts the whole registry, so strip it first.
+			const text = raw.startsWith(String.fromCharCode(0xfeff)) ? raw.slice(1) : raw;
+			parsed = JSON.parse(text);
 		} catch (error) {
 			collect.add("skill_manifest_json", `$.skills.${entry.name}`, `${SKILL_MANIFEST_FILE} is not valid JSON: ${(error as Error).message}`);
 			continue;
@@ -168,8 +180,8 @@ export async function loadSkillRegistry(options: LoadSkillRegistryOptions): Prom
 		const target = await realpath(candidate).catch((error: unknown) => {
 			throw new Error(`skill ${manifest.id}: cannot resolve entrypoint ${manifest.entrypoint}: ${(error as Error).message}`);
 		});
-		if (!isInside(root, target)) {
-			collect.add("skill_entrypoint_escape", `$.skills.${entry.name}.entrypoint`, "entrypoint resolves outside the skill root");
+		if (!isInside(realDirectory, target)) {
+			collect.add("skill_entrypoint_escape", `$.skills.${entry.name}.entrypoint`, "entrypoint resolves outside its skill directory");
 			continue;
 		}
 		const instructions = await readFile(target, "utf8");

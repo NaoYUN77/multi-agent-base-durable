@@ -7,7 +7,7 @@
 // `skills/` directory for the two shipped skills, so the shipped manifests are
 // part of the verification rather than a fixture that can drift from them.
 
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,6 +123,44 @@ describe("TASK-005.3 skill registry", () => {
 		await mkdir(skillDir);
 		await writeFile(join(skillDir, "skill.json"), JSON.stringify({ schemaVersion: 1, id: "missing", version: "1.0.0", entrypoint: "nope.md", requiredTools: [] }));
 		await expect(loadSkillRegistry({ root })).rejects.toThrow(/cannot resolve entrypoint nope\.md/);
+	});
+
+	it("accepts a manifest saved with a UTF-8 BOM", async () => {
+		const skillDir = join(root, "bom");
+		await mkdir(skillDir);
+		const manifest = JSON.stringify({ schemaVersion: 1, id: "bom-skill", version: "1.0.0", entrypoint: "instructions.md", requiredTools: [] });
+		await writeFile(join(skillDir, "skill.json"), String.fromCharCode(0xfeff) + manifest);
+		await writeFile(join(skillDir, "instructions.md"), "Do the work.");
+		const registry = await loadSkillRegistry({ root });
+		expect(skillOf(registry, "bom-skill").instructions).toBe("Do the work.");
+	});
+
+	it("loads a skill installed as a symlinked directory", async () => {
+		// Windows junctions and POSIX directory symlinks report `isSymbolicLink()`,
+		// not `isDirectory()`; dropping them would quietly shrink the registry.
+		const external = join(directory, "external-skill");
+		await mkdir(external);
+		await writeFile(
+			join(external, "skill.json"),
+			JSON.stringify({ schemaVersion: 1, id: "linked-skill", version: "1.0.0", entrypoint: "instructions.md", requiredTools: [] }),
+		);
+		await writeFile(join(external, "instructions.md"), "External instructions.");
+		await symlink(external, join(root, "linked"), "junction");
+		const registry = await loadSkillRegistry({ root });
+		expect(skillOf(registry, "linked-skill").instructions).toBe("External instructions.");
+	});
+
+	it("refuses an entrypoint that resolves outside its skill directory", async () => {
+		// The manifest path is relative and contains no `..`, but `nested` is a
+		// link to another directory: the resolved file must still be inside the
+		// skill's own (resolved) directory.
+		const skillDir = await writeSkill(root, "escaping", { id: "escaping", version: "1.0.0", entrypoint: "nested/instructions.md" });
+		const other = join(directory, "other");
+		await mkdir(other);
+		await writeFile(join(other, "instructions.md"), "secret");
+		await symlink(other, join(skillDir, "nested"), "junction");
+		const codes = await rejectionCodes(root);
+		expect(codes).toContainEqual({ code: "skill_entrypoint_escape", path: "$.skills.escaping.entrypoint" });
 	});
 
 	it("refuses malformed JSON instead of skipping the skill", async () => {
