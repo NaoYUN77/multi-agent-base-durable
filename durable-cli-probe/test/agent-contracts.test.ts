@@ -24,6 +24,7 @@ import { TASK_SPEC_SCHEMA_VERSION, validateTaskBatch, validateTaskSpec } from ".
 import { assertFieldOwner, modelForbiddenPaths, modelWritablePaths, ownerOf } from "../src/agent/state/authorization.ts";
 import { completeSubmission, isRunEnded, parseStructuredAnswer } from "../src/agent/state/finish.ts";
 import { AGENT_DOCUMENT_KINDS } from "../src/agent/contracts/documents.ts";
+import { hasViolation } from "../src/agent/contracts/errors.ts";
 
 /** A spec that passes, so each test can break exactly one thing. */
 const validTaskSpec = (overrides: Readonly<Record<string, unknown>> = {}): unknown => ({
@@ -537,6 +538,8 @@ describe("TASK-005.1 contracts — plan version (AC-03)", () => {
 		schemaVersion: 1,
 		planId: "plan-1",
 		version: 2,
+		requestId: "req-1",
+		requestVersion: 1,
 		goals: ["Check the figures."],
 		taskIds: ["task-verify-source"],
 		relatedQuestionIds: [],
@@ -547,6 +550,17 @@ describe("TASK-005.1 contracts — plan version (AC-03)", () => {
 
 	it("accepts a versioned plan", () => {
 		expect(validatePlan(plan()).ok).toBe(true);
+	});
+
+	it("refuses a plan with no requirement identity", () => {
+		// A plan is a plan *for a requirement*. Without the identity there is nothing
+		// to check a dispatch against, so a plan written for requirement v1 would
+		// still execute after the user restated it as v2.
+		expect(validatePlan(plan({ requestId: undefined })).ok).toBe(false);
+		expect(validatePlan(plan({ requestVersion: undefined })).ok).toBe(false);
+		expect(validatePlan(plan({ requestVersion: 0 })).ok).toBe(false);
+		const missing = validatePlan(plan({ requestId: undefined }));
+		expect(missing.ok === false && hasViolation(missing, "type_string", "$.requestId")).toBe(true);
 	});
 
 	it("refuses a plan that supersedes itself or a later version", () => {

@@ -39,6 +39,16 @@ export class Violations {
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 
+/**
+ * True for a string with the contract's stable-id shape. Exposed for callers
+ * that must refuse a free-form id *before* it becomes a document key — an id
+ * that fails this check cannot be written into a contract document, so letting
+ * it through turns a refusal into an unreadable document.
+ */
+export function isStableId(value: unknown): value is string {
+	return typeof value === "string" && ID_PATTERN.test(value);
+}
+
 /** True for a plain object (not an array, not null, not a class instance). */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -146,7 +156,7 @@ export function readSchemaVersion(
 export function readStableId(holder: Record<string, unknown>, field: string, path: string, collect: Violations): string | undefined {
 	const value = readString(holder, field, path, collect);
 	if (value === undefined) return undefined;
-	if (!ID_PATTERN.test(value)) {
+	if (!isStableId(value)) {
 		collect.add("id_invalid", path, "must match ^[a-z0-9][a-z0-9._-]{0,127}$");
 		return undefined;
 	}
@@ -185,7 +195,7 @@ export function readIdArray(holder: Record<string, unknown>, field: string, path
 	}
 	const ids: string[] = [];
 	value.forEach((entry, index) => {
-		if (typeof entry !== "string" || !ID_PATTERN.test(entry)) {
+		if (!isStableId(entry)) {
 			collect.add("id_invalid", `${path}[${index}]`, "must match ^[a-z0-9][a-z0-9._-]{0,127}$");
 			return;
 		}

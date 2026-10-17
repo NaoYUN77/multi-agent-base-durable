@@ -601,6 +601,8 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 			schemaVersion: 1,
 			planId,
 			version: 1,
+			requestId,
+			requestVersion: 2,
 			goals: ["Check the figures."],
 			taskIds: [taskId],
 			relatedQuestionIds: ["q-1"],
@@ -681,6 +683,8 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 
 					const planDoc = await tx.doc(AgentPlanDoc, root.id, planId, { planId });
 					planDoc.version = plan.value.version;
+					planDoc.requestId = plan.value.requestId;
+					planDoc.requestVersion = plan.value.requestVersion;
 					planDoc.goals = [...plan.value.goals];
 					planDoc.taskIds = [...plan.value.taskIds];
 					planDoc.relatedQuestionIds = [...plan.value.relatedQuestionIds];
