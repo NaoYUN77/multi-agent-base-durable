@@ -225,6 +225,22 @@ export type AnswerAttempt = {
 	readonly at: number;
 };
 
+/**
+ * One admitted dispatch operation, persisted so the attempt budget survives a
+ * reopen and a retried commit cannot spend twice.
+ *
+ * The operation key is the identity, not the timestamp: a replay of the same
+ * call carries the same key and is already counted, while a genuinely new call
+ * has a new key and is a new attempt.
+ */
+export type DispatchAttempt = {
+	/** The user request the attempt belongs to (not the requirement version). */
+	readonly requestId: string;
+	/** The real tool-call identity (`dispatch:<taskId>:<callId>`). */
+	readonly opKey: string;
+	readonly at: number;
+};
+
 export type MainServiceState = {
 	readonly schemaVersion: number;
 	/**
@@ -255,6 +271,12 @@ export type MainServiceState = {
 	 * than from the pointer, which lags a placed input.
 	 */
 	readonly admissions: InputAdmission[];
+	/**
+	 * Admitted dispatch operations, counted against the configured per-request
+	 * attempt budget. Optional because documents written before the field existed
+	 * carry no value; readers treat `undefined` as an empty list.
+	 */
+	readonly dispatchAttempts?: DispatchAttempt[];
 };
 
 /**
@@ -269,5 +291,14 @@ export const MainServiceDoc = defineDoc<MainServiceState>({
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
-	initial: () => ({ schemaVersion: MAIN_SERVICE_SCHEMA_VERSION, requestVersion: 1, plans: [], queue: [], receipts: [], answerAttempts: [], admissions: [] }),
+	initial: () => ({
+		schemaVersion: MAIN_SERVICE_SCHEMA_VERSION,
+		requestVersion: 1,
+		plans: [],
+		queue: [],
+		receipts: [],
+		answerAttempts: [],
+		admissions: [],
+		dispatchAttempts: [],
+	}),
 });

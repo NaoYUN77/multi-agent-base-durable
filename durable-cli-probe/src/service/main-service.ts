@@ -63,6 +63,20 @@ export type MainServiceOptions = {
 	readonly dispatch: MainToolHost["dispatch"];
 	/** Dependencies not yet accepted, when the executor can report them. */
 	readonly unacceptedDependencies?: MainToolHost["unacceptedDependencies"];
+	/**
+	 * Authorization policy for dispatch admission, if the deployment has one. It
+	 * runs inside the admission transaction, before the executor sees the batch.
+	 * A denial (or a thrown policy) refuses the dispatch; absence means no
+	 * external policy is configured, not that every batch is authorized.
+	 */
+	readonly authorizeDispatch?: MainToolHost["authorizeDispatch"];
+	/**
+	 * Per-request budget of admitted dispatch operations. Checked and reserved in
+	 * the admission transaction and persisted in the service document, so it
+	 * survives a reopen and a refused dispatch costs nothing. Must be a
+	 * non-negative integer when present.
+	 */
+	readonly dispatchQuota?: MainToolHost["dispatchQuota"];
 	/** Clock, so a test can make timestamps deterministic. Defaults to `Date.now`. */
 	readonly now?: () => number;
 	/**
@@ -163,6 +177,11 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	if (found === undefined) throw new Error(`main service: conversation ${String(conversationId)} not found`);
 	// Bound after the check, so the closures below carry a non-optional handle.
 	const handle: Conversation = found;
+	// A quota is a budget, not a hint: a negative or fractional value would make
+	// "remaining attempts" meaningless, so it is refused before any work starts.
+	if (options.dispatchQuota !== undefined && (!Number.isInteger(options.dispatchQuota.maxAttempts) || options.dispatchQuota.maxAttempts < 0)) {
+		throw new Error("main service: dispatchQuota.maxAttempts must be a non-negative integer");
+	}
 
 	/**
 	 * Committed reads go through `handle.commit` rather than `harness.snapshot`.
@@ -496,12 +515,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 * crash between this and `recordOperation` leaves a start with no result, which
 	 * a replay reports as interrupted instead of re-executing.
 	 */
-	async function beginOperation(opKey: string): Promise<void> {
-		await handle.commit(async (tx) => {
+	async function beginOperation(opKey: string, tx?: Tx): Promise<void> {
+		const write = async (tx: Tx) => {
 			const doc = await tx.doc(MainServiceDoc, conversationId);
 			if (doc.receipts.some((receipt) => receipt.opKey === opKey)) return;
 			doc.receipts = [...doc.receipts, { opKey, at: now() }];
-		}, context);
+		};
+		if (tx === undefined) await handle.commit(write, context);
+		else await write(tx);
 	}
 
 	/**
@@ -643,7 +664,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		now,
 		buildHandoff,
 		readOperation,
-		beginOperation: (input) => beginOperation(input.opKey),
+		beginOperation: (input, tx) => beginOperation(input.opKey, tx),
 		recordOperation,
 		// `save_plan` writes its own index entry inside its transaction, so the index
 		// and the plan can never disagree — and because the index is *persisted*, the
@@ -676,6 +697,8 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			return await restoreServedRequirement(request.messages);
 		},
 		...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
+		...(options.authorizeDispatch === undefined ? {} : { authorizeDispatch: options.authorizeDispatch }),
+		...(options.dispatchQuota === undefined ? {} : { dispatchQuota: options.dispatchQuota }),
 	});
 	options.registry.install(extension);
 	await handle.configure({ extensions: [extension], instructions: mainInstructions(options.instructionsExtra) }, context);

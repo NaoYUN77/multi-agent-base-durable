@@ -44,7 +44,7 @@ import { openQuestionIds, validateClarificationState, type ClarificationState } 
 import { nextPlanVersion, validatePlan, type Plan } from "../contracts/plan.ts";
 import { validateTaskBatch, type TaskSpec } from "../contracts/task-spec.ts";
 import { admissionBlockReasons } from "../state/lifecycle.ts";
-import { MainServiceDoc } from "./service-doc.ts";
+import { MainServiceDoc, type DispatchAttempt } from "./service-doc.ts";
 import { deriveQuestionId } from "./request-id.ts";
 import { mainRestorationSection } from "./restoration.ts";
 
@@ -53,6 +53,28 @@ export type DispatchResult = {
 	readonly taskId: string;
 	readonly status: "accepted" | "blocked" | "failed" | "queued";
 	readonly detail?: string;
+};
+
+/** Everything an injected dispatch-authorization policy is allowed to see. */
+export type DispatchAuthorizationRequest = {
+	/** The requirement the admitted batch belongs to. */
+	readonly requestId: string;
+	readonly requestVersion: number;
+	/** The plan being executed, as stored. */
+	readonly planId: string;
+	readonly planVersion: number;
+	/** The validated batch. The policy may deny the whole batch or inspect tasks. */
+	readonly tasks: readonly TaskSpec[];
+};
+
+/**
+ * The policy's answer. Denial is fail-closed: a thrown policy is a denial too,
+ * so an unavailable authorization source can never be read as permission.
+ */
+export type DispatchAuthorization = {
+	readonly allowed: boolean;
+	/** Why the batch was denied, carried into the refusal text. */
+	readonly reason?: string;
 };
 
 /** What the program, not the model, supplies to every tool call. */
@@ -87,6 +109,24 @@ export type MainToolHost = {
 	 * means "nothing to check".
 	 */
 	readonly unacceptedDependencies?: (tasks: readonly TaskSpec[]) => readonly string[];
+	/**
+	 * Whether this host authorizes the batch. Called during admission, before the
+	 * executor sees anything. Absent means no external policy is configured; the
+	 * program's structural checks still apply. A policy that throws is treated as
+	 * a denial, never as permission.
+	 */
+	readonly authorizeDispatch?: (input: DispatchAuthorizationRequest) => DispatchAuthorization | Promise<DispatchAuthorization>;
+	/**
+	 * The number of admitted dispatch operations allowed per user request.
+	 *
+	 * One admitted `dispatch_tasks` call consumes one attempt. The check and the
+	 * reservation happen in the admission transaction, so a refused dispatch
+	 * consumes nothing and a replay cannot spend twice. Persisted in the service
+	 * document, so the budget survives a reopen. Absent means no budget is
+	 * configured (the historical behavior); when present it must be a
+	 * non-negative integer, validated at `openMainService`.
+	 */
+	readonly dispatchQuota?: { readonly maxAttempts: number };
 	/**
 	 * Build the text a clarification hands back to the next round. The program
 	 * assembles it from persisted facts, never from the model: the handoff payload
@@ -130,8 +170,13 @@ export type MainToolHost = {
 	 * Record that a management operation has *started* but not finished, before it
 	 * runs its side effect. A crash in that window is then reported as interrupted
 	 * rather than silently re-executed.
+	 *
+	 * `tx` is passed when the caller is inside its own transaction, so the start
+	 * marker commits with the admission decision and the quota reservation. That
+	 * removes the window in which a crash after admission re-admits the call (and
+	 * spends a second attempt) because no receipt exists yet.
 	 */
-	readonly beginOperation?: (input: { readonly opKey: string }) => Promise<void>;
+	readonly beginOperation?: (input: { readonly opKey: string }, tx?: Tx) => Promise<void>;
 	/** Read back a recorded operation, or `undefined` when it never ran. */
 	readonly readOperation?: (
 		opKey: string,
@@ -228,6 +273,27 @@ export function blockingQuestionIdsFor(state: ClarificationState, taskIds: reado
 		.filter((question) => open.has(question.questionId))
 		.filter((question) => question.blockingScope.length === 0 || question.blockingScope.some((scope) => wanted.has(scope)))
 		.map((question) => question.questionId);
+}
+
+/** Why the program, not the model, asks a question after a blocked dispatch. */
+const BLOCKED_QUESTION_REASON = "A dispatched task reported blocked; only the user can decide how to unblock it.";
+
+/**
+ * The one user-facing question for every blocked result of a dispatch.
+ *
+ * Deterministic from the executor's result, so a retry of the same logical
+ * dispatch asks the same words and can reuse an open question instead of
+ * forking a second one. Details are included because they are the only material
+ * the user needs to decide; the task ids become the question's blocking scope.
+ */
+function blockedQuestionText(results: readonly DispatchResult[]): string {
+	const parts = results.map((result) => (result.detail === undefined ? result.taskId : `${result.taskId} (${result.detail})`));
+	return `The dispatched task(s) reported blocked: ${parts.join("; ")}. How should they continue?`;
+}
+
+/** The dispatch attempts already spent on one requirement. */
+function dispatchAttemptsOf(doc: { readonly dispatchAttempts?: readonly DispatchAttempt[] }): readonly DispatchAttempt[] {
+	return doc.dispatchAttempts ?? [];
 }
 
 /**
@@ -488,8 +554,9 @@ export function createMainExtension(host: MainToolHost): Extension {
 		name: "dispatch_tasks",
 		description:
 			"Execute a saved plan. Refused when the plan version is stale, the plan was written for a different requirement, " +
-			"a question blocking these tasks is still open, a dependency is not accepted, a task is not in the plan, or the " +
-			"attempt quota is exhausted. Dispatch runs the tasks; it does not create them.",
+			"a question blocking these tasks is still open, a dependency is not accepted, a task is not in the plan, the host " +
+			"does not authorize the batch, or the attempt quota is exhausted. If a task reports blocked, the program asks the " +
+			"user one question covering the blocked tasks and ends this run. Dispatch runs the tasks; it does not create them.",
 		parameters: Type.Object({
 			planId: Type.String({ description: "The saved plan to execute." }),
 			version: Type.Number({ description: "The exact plan version you read. A stale version is refused." }),
@@ -517,8 +584,14 @@ export function createMainExtension(host: MainToolHost): Extension {
 				// The stored error flag travels with the result, as `save_plan`'s replay
 				// does: a dispatch refused at admission, or one whose batch failed or
 				// blocked, recorded `isError: true`, and replaying it as an ordinary tool
-				// result would turn that refusal into a success.
-				return { output: [{ type: "text", text: replayed.result }], isError: replayed.isError === true };
+				// result would turn that refusal into a success. The control travels too:
+				// a dispatch that ended the run with a blocked-task question must end it
+				// again when replayed, or the rerun would continue past the question.
+				return {
+					output: [{ type: "text", text: replayed.result }],
+					isError: replayed.isError === true,
+					...(replayed.control === undefined ? {} : { control: replayed.control }),
+				};
 			}
 
 			const active = await host.activeRequest();
@@ -560,16 +633,21 @@ export function createMainExtension(host: MainToolHost): Extension {
 				const dependsOn = batch.value.some((task) => task.dependencies.length > 0);
 				const checkerMissing = dependsOn && host.unacceptedDependencies === undefined;
 				const unaccepted = checkerMissing ? [] : (host.unacceptedDependencies?.(batch.value) ?? []);
+				// Quota is read from the service document inside this transaction. The
+				// reservation itself is written only after every other gate passed, so a
+				// refused dispatch spends nothing. Counting by `opKey` makes a retried
+				// commit or a replay idempotent rather than a second charge.
+				const serviceDoc = host.dispatchQuota === undefined ? undefined : await tx.doc(MainServiceDoc, api.conversationId);
+				const usedAttempts = serviceDoc === undefined ? 0 : dispatchAttemptsOf(serviceDoc).filter((attempt) => attempt.requestId === activeRequestId).length;
+				const remainingAttempts =
+					host.dispatchQuota === undefined ? Number.POSITIVE_INFINITY : Math.max(0, host.dispatchQuota.maxAttempts - usedAttempts);
 				const reasons: string[] = [
 					...admissionBlockReasons({
 						expectedPlanVersion: args.version,
 						storedPlanVersion: storedVersion,
 						openQuestionIds: blocking,
 						unacceptedDependencies: unaccepted,
-						// The quota ledger is a TASK-005.3+ concern. This Issue's executor
-						// is injected and owns its own budget, so the contract's quota
-						// reason is left unasserted rather than faked as unlimited.
-						quotaRemaining: { attempts: Number.POSITIVE_INFINITY },
+						quotaRemaining: { attempts: remainingAttempts },
 					}),
 				];
 				// The plan must have been written for the requirement being served now.
@@ -581,6 +659,29 @@ export function createMainExtension(host: MainToolHost): Extension {
 				}
 				if (unplanned.length > 0) reasons.push("tasks_not_in_plan");
 				if (checkerMissing) reasons.push("dependency_check_unavailable");
+				// Authorization is consulted only when the batch is otherwise admissible:
+				// an external policy is not asked about work that cannot run anyway. A
+				// policy that throws is a denial, never permission.
+				if (reasons.length === 0 && host.authorizeDispatch !== undefined) {
+					let authorization: DispatchAuthorization;
+					try {
+						authorization = await host.authorizeDispatch({
+							requestId: activeRequestId,
+							requestVersion: activeRequestVersion,
+							planId: args.planId,
+							planVersion: storedVersion ?? args.version,
+							tasks: batch.value,
+						});
+					} catch (error) {
+						authorization = {
+							allowed: false,
+							reason: `authorization check failed: ${error instanceof Error ? error.message : String(error)}`,
+						};
+					}
+					if (!authorization.allowed) {
+						reasons.push(authorization.reason === undefined ? "not_authorized" : `not_authorized: ${authorization.reason}`);
+					}
+				}
 				// A refusal is a completed decision: a replay of this call must report the
 				// same refusal rather than re-running admission against state that may
 				// have moved. It is recorded in the admission transaction, so the
@@ -588,18 +689,22 @@ export function createMainExtension(host: MainToolHost): Extension {
 				if (reasons.length > 0) {
 					const text = `dispatch refused: ${reasons.join(", ")}. Nothing was executed.`;
 					await host.recordOperation?.({ opKey, result: text, isError: true }, tx);
-					return { reasons, version: storedVersion, refusal: text };
+					return { reasons, version: storedVersion, refusal: text, requestId: activeRequestId, requestVersion: activeRequestVersion };
 				}
-				return { reasons, version: storedVersion, refusal: undefined };
+				// Reserve the attempt in this transaction, before the executor runs. The
+				// check above and this write are one commit: two dispatches cannot both
+				// observe the last attempt. A crash after this commit leaves the started
+				// marker below, so a replay reports an unknown outcome instead of
+				// re-admitting and spending a second attempt.
+				if (serviceDoc !== undefined && !dispatchAttemptsOf(serviceDoc).some((attempt) => attempt.opKey === opKey)) {
+					serviceDoc.dispatchAttempts = [...dispatchAttemptsOf(serviceDoc), { requestId: activeRequestId, opKey, at: clock() }];
+				}
+				await host.beginOperation?.({ opKey }, tx);
+				return { reasons, version: storedVersion, refusal: undefined, requestId: activeRequestId, requestVersion: activeRequestVersion };
 			}, callContext);
 			if (admitted.refusal !== undefined) {
 				return { output: [{ type: "text", text: admitted.refusal }], isError: true };
 			}
-			// The call is marked as started *before* the executor runs. A crash between
-			// here and the receipt below therefore leaves a recorded start with no
-			// result, which a replay reports as interrupted instead of dispatching a
-			// second time — `replay: "safe"` alone would happily run it again.
-			await host.beginOperation?.({ opKey });
 			// Only past admission does the injected executor see the batch. It is handed
 			// the operation identity so an executor that wants to be idempotent has a
 			// stable key to dedupe on, rather than only the plan and the tasks.
@@ -612,13 +717,68 @@ export function createMainExtension(host: MainToolHost): Extension {
 			});
 			const lines = results.map((result) => `${result.taskId}: ${result.status}${result.detail === undefined ? "" : ` (${result.detail})`}`);
 			const refused = results.some((result) => result.status === "failed" || result.status === "blocked");
-			const text = [`dispatched plan ${args.planId} v${String(admitted.version)}:`, ...lines].join("\n");
+			const dispatchText = [`dispatched plan ${args.planId} v${String(admitted.version)}:`, ...lines].join("\n");
+			const blocked = results.filter((result) => result.status === "blocked");
+			// A blocked sub-task is not something the model can resolve from what it
+			// has: the program records one question for the whole blocked set and ends
+			// the run. This is the "子blocked统一Main提问" boundary — it does not depend
+			// on the model remembering to call `request_clarification` next round.
+			if (blocked.length > 0) {
+				const question = blockedQuestionText(blocked);
+				const scope = blocked.map((result) => result.taskId);
+				const written = await api.commit(async (tx) => {
+					const state = await tx.doc(AgentClarificationDoc, api.conversationId, admitted.requestId, { requestId: admitted.requestId });
+					const resolved = resolvedIds(state);
+					const sameText = state.questions.find((entry) => entry.question === question && !resolved.has(entry.questionId));
+					const questionId =
+						sameText === undefined ? deriveQuestionId(admitted.requestId, state.questions.length + 1, question) : sameText.questionId;
+					if (sameText === undefined) {
+						state.questions = [
+							...state.questions,
+							{ questionId, question, reason: BLOCKED_QUESTION_REASON, blockingScope: [...scope], askedAt: clock() },
+						];
+						const checked = validateClarificationState(state);
+						if (!checked.ok) {
+							throw new Error(
+								`clarification state invalid: ${checked.violations.map((violation) => `${violation.path}:${violation.code}`).join(", ")}`,
+							);
+						}
+					} else if (sameText.blockingScope.length > 0 && scope.some((taskId) => !sameText.blockingScope.includes(taskId))) {
+						// The program observed these tasks blocked, so they are genuinely
+						// waiting on this answer. Add them to the question's scope instead of
+						// reusing a narrower one that would leave them dispatchable again. An
+						// empty scope already blocks the whole request and is left alone.
+						state.questions = state.questions.map((entry) =>
+							entry.questionId === questionId
+								? { ...entry, blockingScope: [...new Set([...entry.blockingScope, ...scope])] }
+								: entry,
+						);
+						const checked = validateClarificationState(state);
+						if (!checked.ok) {
+							throw new Error(
+								`clarification state invalid: ${checked.violations.map((violation) => `${violation.path}:${violation.code}`).join(", ")}`,
+							);
+						}
+					}
+					const text = `${dispatchText}\nblocked task(s) need the user: asked question ${questionId}. This run ends now.`;
+					const handoff =
+						host.buildHandoff === undefined
+							? text
+							: await host.buildHandoff({ requestId: admitted.requestId, questionId, question, reason: BLOCKED_QUESTION_REASON }, tx);
+					// The question and the result that ends the run commit together, so a
+					// replay returns the same control and a crash cannot leave one without
+					// the other.
+					await host.recordOperation?.({ opKey, result: text, isError: true, control: { handoff } }, tx);
+					return { questionId, text, handoff };
+				}, callContext);
+				return { output: [{ type: "text", text: written.text }], isError: true, control: { handoff: written.handoff } };
+			}
 			// The receipt is recorded after the executor returns, so a replay of this
 			// call reports what actually happened instead of dispatching a second time.
 			// It carries `isError`, so a failed dispatch replays as a failure rather
 			// than as an ordinary tool result.
-			await host.recordOperation?.({ opKey, result: text, isError: refused });
-			return { output: [{ type: "text", text }], isError: refused };
+			await host.recordOperation?.({ opKey, result: dispatchText, isError: refused });
+			return { output: [{ type: "text", text: dispatchText }], isError: refused };
 		},
 	});
 

@@ -102,6 +102,14 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 		options: {
 			readonly dispatch?: (input: { readonly tasks: readonly TaskSpec[] }) => Promise<readonly DispatchResult[]>;
 			readonly unacceptedDependencies?: (tasks: readonly TaskSpec[]) => readonly string[];
+			readonly authorizeDispatch?: (input: {
+				readonly requestId: string;
+				readonly requestVersion: number;
+				readonly planId: string;
+				readonly planVersion: number;
+				readonly tasks: readonly TaskSpec[];
+			}) => { readonly allowed: boolean; readonly reason?: string } | Promise<{ readonly allowed: boolean; readonly reason?: string }>;
+			readonly dispatchQuota?: { readonly maxAttempts: number };
 			readonly seededQuestions?: readonly string[];
 		} = {},
 	): Promise<{
@@ -147,6 +155,8 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 				return (options.dispatch === undefined ? tasks.map((task) => ({ taskId: task.id, status: "queued" as const })) : await options.dispatch({ tasks }));
 			},
 			...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
+			...(options.authorizeDispatch === undefined ? {} : { authorizeDispatch: options.authorizeDispatch }),
+			...(options.dispatchQuota === undefined ? {} : { dispatchQuota: options.dispatchQuota }),
 			now: () => 1_700_000_000_000,
 		});
 		return { runtime, service, dispatched, requests };
@@ -232,6 +242,222 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			await drive(runtime, service);
 			expect(dispatched).toHaveLength(1);
 			expect(dispatched[0]?.map((task) => task.id)).toEqual(["t1"]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses a batch the authorization policy denies, before the executor sees it (AC-03)", async () => {
+		let seen: { readonly requestId: string; readonly planId: string; readonly planVersion: number; readonly taskIds: readonly string[] } | undefined;
+		const { runtime, service, dispatched } = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+			],
+			{
+				authorizeDispatch: async (input) => {
+					seen = {
+						requestId: input.requestId,
+						planId: input.planId,
+						planVersion: input.planVersion,
+						taskIds: input.tasks.map((task) => task.id),
+					};
+					return { allowed: false, reason: "policy forbids this task" };
+				},
+			},
+		);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+			expect(seen).toEqual({ requestId: "req-plan", planId: "plan-a", planVersion: 1, taskIds: ["t1"] });
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = doc?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt?.isError).toBe(true);
+			expect(receipt?.result).toContain("not_authorized");
+			expect(receipt?.result).toContain("policy forbids this task");
+			expect(doc?.dispatchAttempts ?? []).toHaveLength(0);
+			expect((await service.readRequest()).openQuestionIds).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("lets an authorized batch reach the executor (AC-03)", async () => {
+		const { runtime, service, dispatched } = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+			],
+			{ authorizeDispatch: async () => ({ allowed: true }) },
+		);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("treats a throwing authorization policy as a denial, never as permission (AC-03)", async () => {
+		const { runtime, service, dispatched } = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+			],
+			{
+				authorizeDispatch: async () => {
+					throw new Error("policy service is offline");
+				},
+			},
+		);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(0);
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = doc?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt?.isError).toBe(true);
+			expect(receipt?.result).toContain("not_authorized");
+			expect(receipt?.result).toContain("policy service is offline");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses an invalid dispatch quota before serving (AC-03)", async () => {
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxResponses: ["ok"] });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			await expect(
+				openMainService({
+					harness: runtime.harness,
+					registry: runtime.registry,
+					context,
+					conversationId: root.id,
+					dispatch: async () => [],
+					dispatchQuota: { maxAttempts: -1 },
+				}),
+			).rejects.toThrow("dispatchQuota.maxAttempts must be a non-negative integer");
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("reserves one dispatch attempt, charges nothing for a refusal, and refuses the next dispatch (AC-03)", async () => {
+		const { runtime, service, dispatched } = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+				// Refused on the stale version: this must not spend the request's attempt.
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 99, tasks: [taskSpec("t1")] } }],
+				// Admitted: this is the one attempt the budget allows.
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+				// Refused: the same request has no attempt left.
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+			],
+			{ dispatchQuota: { maxAttempts: 1 } },
+		);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(doc?.dispatchAttempts ?? []).toHaveLength(1);
+			expect(doc?.dispatchAttempts?.[0]?.requestId).toBe("req-plan");
+			expect(doc?.dispatchAttempts?.[0]?.opKey.startsWith("dispatch:")).toBe(true);
+			const quotaRefusals = (doc?.receipts ?? []).filter((entry) => entry.result?.includes("quota_exhausted"));
+			expect(quotaRefusals).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("persists an admitted dispatch attempt across a reopen (AC-03)", async () => {
+		const first = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1"] } }],
+				[{ name: "dispatch_tasks", arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } }],
+			],
+			{ dispatchQuota: { maxAttempts: 1 } },
+		);
+		try {
+			await drive(first.runtime, first.service);
+		} finally {
+			await first.runtime.close();
+		}
+
+		const second = await openProbe({ databasePath, provider: "faux", fauxResponses: ["ok"] });
+		try {
+			const root = await openRoot(second);
+			second.harness.resume();
+			const doc = await second.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(doc?.dispatchAttempts ?? []).toHaveLength(1);
+			expect(doc?.dispatchAttempts?.[0]?.requestId).toBe("req-plan");
+		} finally {
+			await second.close();
+		}
+	});
+
+	it("turns blocked sub-tasks into one program-created Main question and ends the run (AC-03)", async () => {
+		const { runtime, service, dispatched, requests } = await runScript(
+			[
+				[{ name: "save_plan", arguments: { planId: "plan-a", goals: ["g"], taskIds: ["t1", "t2", "t3"] } }],
+				[
+					{
+						name: "dispatch_tasks",
+						arguments: { planId: "plan-a", version: 1, tasks: [taskSpec("t1"), taskSpec("t2"), taskSpec("t3")] },
+					},
+				],
+			],
+			{
+				dispatch: async () => [
+					{ taskId: "t1", status: "blocked", detail: "the source file is missing" },
+					{ taskId: "t2", status: "blocked", detail: "the account is not authorized" },
+					{ taskId: "t3", status: "accepted" },
+				],
+			},
+		);
+		try {
+			await drive(runtime, service);
+			expect(dispatched).toHaveLength(1);
+			// Two provider requests: the save turn and the dispatch turn. If the
+			// blocked dispatch had not ended the run, the model would have been asked
+			// again and this would be three.
+			expect(requests).toHaveLength(2);
+			const view = await service.readRequest();
+			expect(view.openQuestionIds).toHaveLength(1);
+			const question = view.questions.find((entry) => entry.questionId === view.openQuestionIds[0]);
+			expect(question).toBeDefined();
+			if (question === undefined) return;
+			// One question covers every blocked task; the model never called
+			// request_clarification in this script.
+			expect(question.question).toContain("t1");
+			expect(question.question).toContain("the source file is missing");
+			expect(question.question).toContain("t2");
+			expect(question.question).toContain("the account is not authorized");
+			expect(question.blockingScope).toEqual(["t1", "t2"]);
+			// The dispatch ended the run with a handoff, so the model did not get a
+			// next turn in which it could ignore the blocked tasks.
+			expect((await service.status()).busy).toBe(false);
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const receipt = doc?.receipts.find((entry) => entry.opKey.startsWith("dispatch:"));
+			expect(receipt?.isError).toBe(true);
+			expect(receipt?.control?.handoff).toContain("the source file is missing");
+			expect(receipt?.control?.handoff).toContain("the account is not authorized");
+			// The program-created question is a real question: the application can
+			// answer it, and doing so unblocks the task.
+			const answer = await service.submitUserInput({ text: "use the file in the archive", answerTo: question.questionId, sufficient: true });
+			expect(answer.kind).toBe("answer");
+			if (answer.kind !== "answer") return;
+			await answer.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const after = await service.readRequest();
+			const recorded = after.answers.find((entry) => entry.questionId === question.questionId);
+			expect(recorded?.text).toBe("use the file in the archive");
+			expect(recorded?.sufficient).toBe(true);
+			// The answer resolved the question it answered. The handoff reset the
+			// model's context, so the scripted model retried the dispatch and asked a
+			// *new* question when the task was still blocked; that new question is not
+			// a failure to resolve the first one.
+			expect(after.openQuestionIds).not.toContain(question.questionId);
 		} finally {
 			await runtime.close();
 		}
