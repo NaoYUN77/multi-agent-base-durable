@@ -1,0 +1,8 @@
+{
+	"schemaVersion": 1,
+	"id": "material-summary",
+	"version": "1.0.0",
+	"entrypoint": "instructions.md",
+	"requiredTools": [],
+	"description": "Summarize only the materials supplied by the task, with no external tools."
+}
