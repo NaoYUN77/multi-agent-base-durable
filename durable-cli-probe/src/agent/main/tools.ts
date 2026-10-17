@@ -616,8 +616,25 @@ export function createMainExtension(host: MainToolHost): Extension {
 				// could already have moved, which is not the same as "the requirement
 				// being served when admission ran".
 				const current = await host.activeRequest(tx);
-				const activeRequestId = current?.requestId ?? active.requestId;
-				const activeRequestVersion = current?.requestVersion ?? active.requestVersion;
+				// No fallback to the value read before this commit. That value is a
+				// different read of a different moment: the requirement can become
+				// unresolvable between them (a new run whose input was rejected, a
+				// restatement that moved the pointer), and admitting against the stale
+				// reading is exactly the old-goal dispatch the in-transaction read is
+				// meant to prevent. An unresolvable requirement is a refusal.
+				if (current === undefined) {
+					const text = "dispatch refused: the requirement being served could not be resolved. Nothing was executed.";
+					await host.recordOperation?.({ opKey, result: text, isError: true }, tx);
+					return {
+						reasons: ["requirement_unresolved"],
+						version: undefined,
+						refusal: text,
+						requestId: active.requestId,
+						requestVersion: active.requestVersion,
+					};
+				}
+				const activeRequestId = current.requestId;
+				const activeRequestVersion = current.requestVersion;
 				const planDoc = await tx.doc(AgentPlanDoc, api.conversationId, args.planId, { planId: args.planId });
 				const storedVersion = planDoc.version === 0 ? undefined : planDoc.version;
 				const clarification = await tx.doc(AgentClarificationDoc, api.conversationId, activeRequestId, { requestId: activeRequestId });

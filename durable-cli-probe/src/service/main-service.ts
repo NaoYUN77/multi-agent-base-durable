@@ -41,6 +41,7 @@ import { LiveDoc } from "@earendil-works/pi-durable";
 import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../agent/contracts/documents.ts";
 import { composeUserAnswer, openQuestionIds, type ClarificationState, type UserAnswer } from "../agent/contracts/clarification.ts";
 import { validatePlan, type Plan } from "../agent/contracts/plan.ts";
+import { isStableId } from "../agent/contracts/validate.ts";
 import { MainServiceDoc, type InputAdmission, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
 import { answerInputId, derivedRequestId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
@@ -889,6 +890,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		async submitUserInput(input) {
 			const text = input.text;
 			if (text.trim() === "") return { kind: "refused", reason: "empty input" };
+			// A caller-supplied request id becomes a document key and is embedded in
+			// every id derived from it (question ids carry it), so it must have the
+			// contract's stable-id shape. An id that does not is refused here, before
+			// anything is written: the alternative is a request document no contract
+			// reader can load, or a failed write several steps later.
+			if (input.requestId !== undefined && !isStableId(input.requestId)) {
+				return { kind: "refused", reason: "requestId must match ^[a-z0-9][a-z0-9._-]{0,127}$" };
+			}
 
 			// Activation first. An input the boundary placed may have established the
 			// requirement that is active now while its document and the pointer were
@@ -932,9 +941,17 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// it is what makes a follow-up a new submission rather than a replay of
 				// the first answer, and it must therefore increase even though the
 				// stored answer count does not.
-				const revision = await handle.commit(async (tx) => {
+				const written = await handle.commit(async (tx) => {
 					const service = await tx.doc(MainServiceDoc, conversationId);
 					const state = await tx.doc(AgentClarificationDoc, conversationId, current.requestId, { requestId: current.requestId });
+					// The open-state check is repeated *inside* the write transaction.
+					// The read above it is a committed read, but not the same commit:
+					// two answers racing, or a resolution written by another path, could
+					// land in between — and an answer appended to a question that is no
+					// longer open would rewrite an exchange that is already settled.
+					if (!openQuestionIds(state).includes(input.answerTo!)) {
+						return { refusal: `question ${input.answerTo} is not open` };
+					}
 					const previous = state.answers.find((entry) => entry.questionId === input.answerTo);
 					if (previous !== undefined) state.answers = state.answers.filter((entry) => entry.questionId !== input.answerTo);
 					const answer = composed.value;
@@ -966,10 +983,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// The revision is the ordinal of this logical answer among the
 					// question's attempts, so a replay of an earlier answer returns the
 					// revision it had — and a new one gets a new key.
-					return service.answerAttempts.filter((attempt) => attempt.questionId === input.answerTo).findIndex(
-						(attempt) => attempt.text === text && attempt.sufficient === sufficient,
-					) + 1;
+					return {
+						revision: service.answerAttempts.filter((attempt) => attempt.questionId === input.answerTo).findIndex(
+							(attempt) => attempt.text === text && attempt.sufficient === sufficient,
+						) + 1,
+					};
 				}, context);
+				if (written.refusal !== undefined) return { kind: "refused", reason: written.refusal };
+				const revision = written.revision;
 				// The submission key carries the request AND the revision, so a
 				// follow-up to the same question is its own input rather than a replay
 				// of the first answer — and two requests that ask the same words cannot
@@ -1008,7 +1029,6 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// (see `derivedRequestId`). A caller that means two requirements told in
 				// the same words names both.
 				const requestId = input.requestId ?? current?.requestId ?? derivedRequestId(text);
-				const requestVersion = current?.requestVersion ?? 1;
 				const queuedAt = now();
 				// The version this input *becomes*, allocated here rather than at the
 				// consume boundary. The Harness places a queued input and starts its run
@@ -1017,15 +1037,28 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 				// resolved its requirement. Allocating it now is what lets the run bind
 				// its plans, and admit its dispatch, against the version the requirement
 				// is actually at.
+				//
 				// The submission key is the logical identity of the input, not a clock:
 				// keying on `queuedAt` would make the same input a different submission on
 				// a retry, which is the replay the dedup key exists to catch. The version
-				// in the key stays the version the input was queued *against* — the
-				// requirement's version when the caller submitted — because that is the
-				// identity the caller's own decision was made against.
-				const key = queuedInputId(requestId, requestVersion, text);
-				const allocatedVersion = await handle.commit(async (tx) => {
+				// in the key is the version the input was queued *against* — and that is
+				// the version of the request it names, read from that request's own
+				// document, not the active pointer's. A caller may name a different
+				// requirement while another one is being served; keying its input on the
+				// active requirement's version would make the key claim a version the
+				// named request never had, so a retry (which reads the named request's
+				// unchanged version) could never re-derive it.
+				const admitted = await handle.commit(async (tx) => {
 					const doc = await tx.doc(MainServiceDoc, conversationId);
+					// The *request document* is the authority for the version, not the
+					// pointer: the pointer is only moved when an input is consumed, so it
+					// lags, and the request document is what a plan is compared against.
+					// `requestedAt === 0` is the contract's "nothing recorded yet", so a
+					// request that has never been written starts at 1 like any other.
+					const request = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
+					const stored = request.requestedAt === 0 ? undefined : request.requestVersion;
+					const queuedAgainst = stored ?? 1;
+					const key = queuedInputId(requestId, queuedAgainst, text);
 					// One logical input has one identity. A retry — the same requirement,
 					// the same words — derives the same key and is the same input, so the
 					// version it becomes was already decided when it was first admitted.
@@ -1035,20 +1068,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// split across two versions, and the requirement would end up at the
 					// version no run and no plan ever saw.
 					const placed = doc.admissions.find((entry) => entry.key === key);
-					if (placed !== undefined) return placed.requestVersion;
+					if (placed !== undefined) {
+						return { key, requestVersion: queuedAgainst, allocatedVersion: placed.requestVersion };
+					}
 					// The allocation is per requirement: a queued input becomes the version
 					// after the one the requirement is at, and a second queued input for the
 					// same requirement takes the version after that. Every input is decided
 					// from persisted state, so the same admission allocates the same version
 					// on a retry.
-					//
-					// The *request document* is the authority for the version, not the
-					// pointer: the pointer is only moved when an input is consumed, so it
-					// lags, and the request document is what a plan is compared against.
-					// `requestedAt === 0` is the contract's "nothing recorded yet", so a
-					// request that has never been written starts at 1 like any other.
-					const request = await tx.doc(AgentRequestDoc, conversationId, requestId, { requestId });
-					const stored = request.requestedAt === 0 ? undefined : request.requestVersion;
 					const alreadyAllocated = doc.queue
 						.filter((entry) => entry.requestId === requestId)
 						.map((entry) => readableVersion(entry.allocatedVersion))
@@ -1075,14 +1102,14 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 						text,
 						...(input.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: input.expectedRequestVersion }),
 					});
-					return version;
+					return { key, requestVersion: queuedAgainst, allocatedVersion: version };
 				}, context);
-				const submission = await handle.submit({ type: "input", content: text, requestId: key }, context);
+				const submission = await handle.submit({ type: "input", content: text, requestId: admitted.key }, context);
 				const record: QueuedInput = {
 					submissionId: String(submission.id),
 					requestId,
-					requestVersion,
-					allocatedVersion,
+					requestVersion: admitted.requestVersion,
+					allocatedVersion: admitted.allocatedVersion,
 					...(input.expectedRequestVersion === undefined ? {} : { expectedRequestVersion: input.expectedRequestVersion }),
 					text,
 					queuedAt,
@@ -1102,7 +1129,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 					// under this key, so a run made of this input resolves the requirement
 					// from its own input rather than from the lagging pointer — and resolves
 					// the version it was allocated, not the one it was queued against.
-					await linkSubmission(tx, key, record.submissionId);
+					await linkSubmission(tx, admitted.key, record.submissionId);
 				}, context);
 				return { kind: "queued", submission, reason: "a round is running; the input is queued for the next boundary" };
 			}

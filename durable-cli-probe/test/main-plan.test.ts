@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import type { JsonObject } from "@earendil-works/pi-durable";
 import { context, openProbe, openRoot, type ProbeRuntime } from "../src/runtime.ts";
-import { AgentClarificationDoc, AgentPlanDoc } from "../src/agent/contracts/documents.ts";
+import { AgentClarificationDoc, AgentPlanDoc, AgentRequestDoc } from "../src/agent/contracts/documents.ts";
 import { validateTaskSpec, type TaskSpec } from "../src/agent/contracts/task-spec.ts";
 import { openMainService } from "../src/service/main-service.ts";
 import { MainServiceDoc } from "../src/agent/main/service-doc.ts";
@@ -1749,6 +1749,185 @@ describe("TASK-005.2 plan — save, version, dispatch admission (AC-02, AC-03)",
 			// The answer's own run took exactly one provider request: the re-ask ended
 			// it instead of letting the model speak again.
 			expect(requests.filter((text) => text.includes("not sure"))).toHaveLength(1);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses a caller-supplied request id that is not a stable id, before writing anything", async () => {
+		// The id becomes a document key and is embedded in every id derived from it
+		// (question ids carry the request id), so an invalid one would either fail a
+		// later write or persist a document no contract reader can load. It is
+		// refused up front instead.
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: () => fauxAssistantMessage([fauxText("unused")]) });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+			});
+			const refused = await service.submitUserInput({ text: "plan the work", requestId: "Req/1" });
+			expect(refused.kind).toBe("refused");
+			expect(refused.kind === "refused" ? refused.reason : "").toContain("requestId must match");
+			// Nothing was written: no requirement, no admission, no queue record.
+			expect((await service.readRequest()).requestId).toBeUndefined();
+			expect(await service.readQueue()).toEqual([]);
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			expect(doc?.activeRequestId).toBeUndefined();
+			expect(doc?.admissions ?? []).toEqual([]);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("keys a queued input against the request it names, not the active one", async () => {
+		// Two requirements can be in play at once: one being served, one named by
+		// the queued input. The submission key is the input's identity, so its
+		// version must be the *named* request's own. Keying it on the active
+		// request's version makes the key claim a version req-b never had — and a
+		// retry, which reads req-b's unchanged version, could never re-derive it.
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let run = 0;
+		const router: FauxResponseFactory = async () => {
+			run += 1;
+			if (run === 2) await parked;
+			return fauxAssistantMessage([fauxText("done")]);
+		};
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: router });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+			// req-a reaches version 1, then version 2, and a run of it parks.
+			const first = await service.submitUserInput({ text: "A work", requestId: "req-a" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			const second = await service.submitUserInput({ text: "A more", requestId: "req-a" });
+			if (second.kind !== "request") throw new Error("expected a request");
+			expect(second.requestVersion).toBe(2);
+
+			// Queue an input for a *different*, never-written request while req-a v2
+			// is being served, then retry the same input.
+			const queued = await service.submitUserInput({ text: "B work", requestId: "req-b" });
+			expect(queued.kind).toBe("queued");
+			const retried = await service.submitUserInput({ text: "B work", requestId: "req-b" });
+			expect(retried.kind).toBe("queued");
+
+			const records = (await service.readQueue()).filter((entry) => entry.requestId === "req-b");
+			expect(records).toHaveLength(1);
+			expect(records[0]!.requestVersion).toBe(1);
+			expect(records[0]!.allocatedVersion).toBe(1);
+			const doc = await runtime.harness.snapshot(MainServiceDoc, 1 as never, context);
+			const admissions = (doc?.admissions ?? []).filter((entry) => entry.requestId === "req-b");
+			expect(admissions).toHaveLength(1);
+			expect(admissions[0]!.key.startsWith("queued:req-b:v1:")).toBe(true);
+			// req-b's own requirement was never written: the input is queued against
+			// its initial version, not consumed.
+			const request = await runtime.harness.snapshot(AgentRequestDoc, 1 as never, "req-b", context);
+			expect(request?.requestedAt ?? 0).toBe(0);
+		} finally {
+			release?.();
+			await runtime.close();
+		}
+	});
+
+	it("refuses a dispatch when the requirement cannot be resolved inside the admission commit", async () => {
+		// The requirement was resolvable when the tool began but not in the
+		// transaction that admits the batch — a rejected restatement became live in
+		// between. Admitting against the earlier read would execute the old goal
+		// under the new requirement, so the batch is refused instead.
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: () => fauxAssistantMessage([fauxText("unused")]) });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const dispatched: TaskSpec[][] = [];
+			let calls = 0;
+			const extension = createMainExtension({
+				activeRequest: async () => {
+					calls += 1;
+					return calls === 1 ? { requestId: "req-plan", requestVersion: 1 } : undefined;
+				},
+				dispatch: async ({ tasks }) => {
+					dispatched.push([...tasks]);
+					return tasks.map((task) => ({ taskId: task.id, status: "queued" as const }));
+				},
+				readOperation: async () => undefined,
+				recordOperation: async () => {},
+				now: () => 1_700_000_000_000,
+			});
+			const dispatch = extension.tools?.find((tool) => tool.name === "dispatch_tasks");
+			expect(dispatch).toBeDefined();
+			const result = await dispatch!.execute(
+				{ planId: "plan-a", version: 1, tasks: [taskSpec("t1")] } as never,
+				{
+					taskId: "task-1" as never,
+					callId: "call-1",
+					conversationId: root.id,
+					commit: async (change: (tx: never) => unknown) => await runtime.harness.commit(change as never, context),
+				} as never,
+				context,
+			);
+			expect(result.isError).toBe(true);
+			expect(JSON.stringify(result.output)).toContain("could not be resolved");
+			expect(dispatched).toHaveLength(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("refuses the second of two concurrent answers once the question is resolved", async () => {
+		// The open-state check before the write is a committed read, but not the
+		// same commit: two answers racing can both pass it. The commit repeats the
+		// check, so the loser is refused instead of replacing a settled exchange.
+		const runtime = await openProbe({ databasePath, provider: "faux", fauxRouter: () => fauxAssistantMessage([fauxText("done")]) });
+		try {
+			const root = await openRoot(runtime);
+			runtime.harness.resume();
+			const service = await openMainService({
+				harness: runtime.harness,
+				registry: runtime.registry,
+				context,
+				conversationId: root.id,
+				dispatch: async () => [],
+				now: () => 1_700_000_000_000,
+			});
+			const first = await service.submitUserInput({ text: "plan the work", requestId: "req-plan" });
+			if (first.kind !== "request") throw new Error("expected a request");
+			await first.submission.wait(context);
+			await runtime.harness.waitForIdle(context);
+			await runtime.harness.commit(async (tx) => {
+				const state = await tx.doc(AgentClarificationDoc, 1 as never, "req-plan", { requestId: "req-plan" });
+				state.questions = [...state.questions, { questionId: "q-1", question: "which file?", reason: "ambiguous", blockingScope: [], askedAt: 1 }];
+			}, context);
+
+			const outcomes = await Promise.all([
+				service.submitUserInput({ text: "use report.txt", answerTo: "q-1", sufficient: true }),
+				service.submitUserInput({ text: "use archive.txt", answerTo: "q-1", sufficient: true }),
+			]);
+			const answered = outcomes.filter((outcome) => outcome.kind === "answer");
+			const refused = outcomes.filter((outcome) => outcome.kind === "refused");
+			expect(answered).toHaveLength(1);
+			expect(refused).toHaveLength(1);
+			expect(refused[0]!.kind === "refused" ? refused[0]!.reason : "").toContain("not open");
+			const stored = await runtime.harness.snapshot(AgentClarificationDoc, 1 as never, "req-plan", context);
+			expect(stored?.answers).toHaveLength(1);
+			expect(stored?.resolutions.filter((resolution) => resolution.questionId === "q-1")).toHaveLength(1);
+			await runtime.harness.waitForIdle(context);
 		} finally {
 			await runtime.close();
 		}
