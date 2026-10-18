@@ -1,0 +1,8 @@
+{
+	"schemaVersion": 1,
+	"id": "text-stats",
+	"version": "1.0.0",
+	"entrypoint": "instructions.md",
+	"requiredTools": ["text_stats", "text_check"],
+	"description": "Count and verify text statistics with the local, side-effect-free text tools."
+}
