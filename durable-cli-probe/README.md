@@ -896,6 +896,11 @@ or a configuration that was refused. Codes 2 and 3 are decided before the
 database is touched. A session that cannot open (code 1) may still have created
 the database file.
 
+The terminal is restored on every way out: a confirmed quit, a failed start, and
+a session whose close throws. A storage failure at close is not reported on
+screen (the screen is what is being torn down); the next open meets the same
+storage state and reports it there.
+
 ### Configuration
 
 ```json
@@ -1000,6 +1005,6 @@ by one and are checked by hand in Windows Terminal:
 | --- | --- |
 | `test/tui-config.test.ts` | argument parsing, the exit codes, and that a refused configuration never echoes a credential and never creates the database |
 | `test/tui-state.test.ts` | the real session over the faux provider: derived statuses, `/answer` reaching Main with its sufficiency, `/cancel` proven by the receipt, close-mid-run then reopen finishing |
-| `test/tui-terminal.test.ts` | the real app over a recorded terminal: the frame, `ctrl+c` then `n` / `y`, `/cancel all`, the quit overlay's keys, `--no-animation` |
+| `test/tui-terminal.test.ts` | the real app over a recorded terminal: the frame, `ctrl+c` then `n` / `y`, `/cancel all`, the quit overlay's keys, `--no-animation`, leaving when the session's close throws, and one follow-up pass for a burst of notifications |
 | `test/tui-view.test.ts` | the frame's rules: every status word and tone, colour changes no column, column-accurate fitting with CJK text, no invented numbers |
 
