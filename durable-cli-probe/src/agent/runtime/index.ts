@@ -20,7 +20,10 @@
 //     or no item call resolves;
 //   * `BatchRuntime.dispatch` / `.batches` — the `MainToolHost` hooks;
 //   * `BatchRuntime.reconcile` — once, on open;
-//   * `BatchRuntime.stopAll` — for a request-wide cancel.
+//   * `BatchRuntime.stopAll` — for a request-wide cancel;
+//   * `readRuntimeTasks` / `findBatchOfTask` (TASK-005.5) — the terminal entry's
+//     read-only view of the runtime's documents. They return facts, never
+//     tokens, and they never write: the service derives presentation from them.
 //
 // The identity and refusal types are re-exported because they cross that boundary:
 // a caller resolves a `RefusalCode`, reads a `BatchReconciliation`, or holds a
@@ -28,6 +31,10 @@
 
 export { createBatchRuntime, runtimeHarnessSettings } from "./runtime.ts";
 export type { BatchRuntime, BatchRuntimeOptions } from "./runtime.ts";
+
+// The read surface (TASK-005.5): facts, never tokens or writers. See `tasks.ts`.
+export { findBatchOfTask, readBatchState, readRuntimeTasks, readSchedulerState, startRuntimeWatches } from "./tasks.ts";
+export type { RuntimeReadOptions, RuntimeTask } from "./tasks.ts";
 
 export { BatchNotResumable } from "./contracts.ts";
 export type {

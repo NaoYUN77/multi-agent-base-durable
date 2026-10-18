@@ -1,0 +1,15 @@
+{
+	"provider": "faux",
+	"runConfig": {
+		"schemaVersion": 1,
+		"maxConcurrentSubAgents": 2,
+		"maxSubAgentsPerRequest": 4,
+		"maxToolInvocationsPerRound": 6,
+		"maxFailedToolCallsPerRound": 3,
+		"maxAttemptsPerOperation": 3,
+		"maxTechnicalRestarts": 1,
+		"roundTimeoutMs": 120000,
+		"providerRetry": { "maxRetries": 2, "backoffMs": 500 },
+		"harnessRetry": { "maxRetries": 0, "backoffMs": 0 }
+	}
+}

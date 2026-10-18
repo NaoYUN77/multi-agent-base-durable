@@ -47,6 +47,8 @@ import { MainServiceDoc, type InputAdmission, type OperationReceipt, type PlanIn
 import { answerInputId, derivedRequestId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
 import type { BatchReconciliation, BatchRuntime } from "../agent/runtime/index.ts";
+import { findBatchOfTask, readBatchState, type RuntimeReadOptions } from "../agent/runtime/index.ts";
+import type { TaskCancelResult } from "./types.ts";
 import { restorationSectionText, withRestorationSection } from "../agent/main/restoration.ts";
 import { mainInstructions } from "../agent/prompts/main.ts";
 
@@ -192,6 +194,21 @@ export type MainService = {
 	 * the one step that destroys the evidence the other two rely on.
 	 */
 	requestCancel(reason?: string): Promise<{ readonly requested: boolean; readonly reason: string }>;
+	/**
+	 * Stop the batch of one task, and only that batch (TASK-005.5).
+	 *
+	 * Unlike `requestCancel`, this does not abort Main: the user cancelling one
+	 * task still wants Main to report what happened. The task is resolved to its
+	 * batch by reading `BatchIndexDoc` and each `AgentBatchDoc` — both
+	 * non-creating snapshots — and the stop is the runtime's own `cancelBatch`,
+	 * which commits the intent before aborting anything. The documents are read
+	 * again afterwards so the answer describes the receipt state, not the call.
+	 *
+	 * Refuses rather than guesses: an unknown task, an ambiguous id, a task whose
+	 * receipt is already terminal, or a service without a runtime answers
+	 * `already-terminal` / `unknown-task` and changes nothing.
+	 */
+	cancelTask(taskId: string, reason?: string): Promise<TaskCancelResult>;
 	/**
 	 * What the runtime reconciled when this service opened: the batches that still had
 	 * outstanding work, and the stops an interrupted process left unfinished and this
@@ -1365,6 +1382,34 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			if (options.runtime !== undefined) await options.runtime.stopAll(reason ?? "cancelled_by_user", context);
 			await handle.abort(context);
 			return { requested: true, reason: reason ?? "cancelled_by_user" };
+		},
+
+		async cancelTask(taskId, reason) {
+			const runtime = options.runtime;
+			if (runtime === undefined) return { taskId, outcome: "unknown-task", detail: "no batch runtime is configured, so no task can be running" };
+			const reader: RuntimeReadOptions = { harness, mainConversationId: conversationId, context };
+			const found = await findBatchOfTask(reader, taskId);
+			if (found === undefined) return { taskId, outcome: "unknown-task", detail: `no admitted batch holds task ${taskId}` };
+			if ("batchIds" in found) {
+				return { taskId, outcome: "unknown-task", detail: `task id ${taskId} is in more than one batch (${found.batchIds.join(", ")}); refusing to guess` };
+			}
+			const before = await readBatchState(reader, found.batchId);
+			const item = before?.items.find((entry) => entry.taskId === taskId);
+			if (item === undefined) return { taskId, outcome: "unknown-task", detail: `batch ${found.batchId} no longer lists ${taskId}` };
+			if (item.receipt !== undefined) {
+				return { taskId, batchId: found.batchId, outcome: "already-terminal", detail: `the receipt is ${item.receipt.status}` };
+			}
+			if (before?.cancel !== undefined) {
+				return { taskId, batchId: found.batchId, outcome: "stopping", detail: `batch ${found.batchId} already has a ${before.cancel.kind} stop recorded` };
+			}
+			const result = await runtime.cancelBatch(found.batchId as never, reason ?? "cancelled_by_user", context);
+			const mine = result.items.find((entry) => entry.taskId === taskId);
+			const receipted = (await readBatchState(reader, found.batchId))?.items.find((entry) => entry.taskId === taskId)?.receipt;
+			const outcome: TaskCancelResult["outcome"] =
+				receipted?.status === "cancelled" ? "cancelled" : mine?.state === "settled" ? "already-terminal" : "stopping";
+			const detail =
+				mine === undefined ? `batch ${found.batchId} reported no row for ${taskId}` : (mine.detail ?? `the item is ${mine.state}`);
+			return { taskId, batchId: found.batchId, outcome, detail };
 		},
 
 		async close() {

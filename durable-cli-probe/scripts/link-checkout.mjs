@@ -31,6 +31,7 @@ const packages = [
 	{ dir: "packages/chord", name: "@earendil-works/chord" },
 	{ dir: "packages/ai", name: "@earendil-works/pi-ai" },
 	{ dir: "packages/durable", name: "@earendil-works/pi-durable" },
+	{ dir: "packages/tui", name: "@earendil-works/pi-tui" },
 ];
 
 async function exists(path) {

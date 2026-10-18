@@ -867,3 +867,139 @@ npm download cache keyed on the pinned Pi commit plus the app lockfile hash, and
 | `npm warn EBADENGINE ... @earendil-works/gondolin@0.12.0 requires node >=23.6.0` | the upstream workspace contains a package that wants a newer Node than the pinned 22.22.2 | informational only; the four packages in the chain build and typecheck on 22.22.2 |
 | `dist/index.d.ts is missing` during verification | the build step did not run or failed silently | re-run `npm run pi:prepare -- --clean` and read the build output |
 
+---
+
+## 19. TASK-005.5 — the terminal entry
+
+`npm run agent:tui` opens the agent session in the terminal: one frame above
+one editor. The frame is the newest read pass over the durable documents, the
+conversation tail, and a status line; the editor sends a line to Main or runs a
+command. Closing the window never cancels work; it pauses at the last durable
+point and the next open replays it.
+
+### Command
+
+```bash
+npm run agent:tui -- --db data/agent-tui.sqlite --config agent-tui.example.json
+```
+
+| argument | meaning |
+| --- | --- |
+| `--db <path>` (required) | SQLite file. It must be a file, not `:memory:`: the point of the entry is that a closed session can be reopened |
+| `--config <path>` (required) | JSON configuration, see below |
+| `--no-animation` | no spinner. The elapsed clock and every status word still show; use this in recordings and on terminals where a redraw every second is noise |
+
+Exit codes: `0` the screen closed normally; `1` the session could not open
+(locked file, missing provider key, a failed run); `2` stdin or stdout is not a
+TTY (a pipe gets a refusal, not a frame of escape sequences); `3` a bad argument
+or a configuration that was refused. Codes 2 and 3 are decided before the
+database is touched. A session that cannot open (code 1) may still have created
+the database file.
+
+### Configuration
+
+```json
+{
+	"provider": "faux",
+	"runConfig": { "schemaVersion": 1, "maxConcurrentSubAgents": 2, "maxSubAgentsPerRequest": 4, "...": "as in agent-tui.example.json" }
+}
+```
+
+`runConfig` is required and is validated as a whole; a value the runtime would
+not honour (for example `harnessRetry.maxRetries` other than `0`) is refused at
+startup. A real provider is configured like the CLI's (`provider`, `modelId`,
+`baseUrl` for `custom`), with one rule for the key:
+
+* the file never holds a key. It names the environment variable that does,
+  `"apiKeyEnv": "DEEPSEEK_API_KEY"`, and startup refuses if that variable is not
+  set;
+* a field name that looks like a credential (`apiKey`, `token`, `secret`,
+  `password`, and the like) is refused by name. The message never repeats the
+  value.
+
+An unknown field is refused too, so a typo cannot silently configure nothing.
+
+### What the frame shows
+
+Above the editor, top to bottom:
+
+* **header.** `main busy` or `main idle` with Main's live tasks, the request id
+  and version, an open question when there is one, queued inputs, and how many
+  batches have settled;
+* **conversation.** the newest lines of Main's conversation, `you ›` and
+  `main ›`;
+* **tasks.** one row per task of every admitted batch: task id, status word,
+  round, tool invocations used over the limit, failed tool calls, elapsed time;
+* **panel.** the answer to the last command (`/help`, `/tasks`, `/inspect`, ...);
+* **notice.** the outcome of the last input (sent, queued, answered, refused),
+  and a stop that was asked for until its receipt lands;
+* **status line.** how many tasks are active, how many questions are open, and
+  the keys.
+
+The rows are derived, never estimated. A status word is the ledger's business
+status when the task has a ledger, otherwise the item's receipt, otherwise the
+runtime's own state (a live slot is `running`, a queue place is `queued`, an
+admitted item with neither is `planned`). A row that never started shows no
+elapsed time, and nothing shows a percentage, because no document counts steps.
+A finished task usually reads `awaiting review`: that is the durable lifecycle's
+fixed point, and nothing in this entry accepts on its behalf.
+
+The spinner is the only thing that changes when nothing has happened. Colour
+only mirrors the status word, so the frame reads the same with colour stripped.
+
+### Commands
+
+`/help` lists them. The ones that change something:
+
+| command | effect |
+| --- | --- |
+| `enter` | send the line as input. Queued if Main is busy; refused while a question is open |
+| `/answer <text>` | answer the open question, marked sufficient |
+| `/answer --insufficient <text>` | reply that is not yet an answer |
+| `/cancel <id>` | stop one task's batch. The rest of Main keeps running; the task id may be a unique prefix |
+| `/cancel all` | stop every batch and abort Main |
+| `/withdraw <id>` | withdraw a queued input by its submission id from the header |
+| `/inspect <id>` | one task: rounds, limits, evidence, failure, the contract's acceptance criteria |
+| `/tasks`, `/transcript` | the same facts as a panel |
+| `/quit` or `ctrl+c` | asks first; `y` or `enter` quits, anything else stays |
+
+Ctrl+C never cancels tasks. The confirmation says so, and the only way work is
+stopped is `/cancel`.
+
+`/cancel <id>` is refused rather than guessed: an id in two batches, an id that
+is already finished, and an unknown id each answer with what was found and
+change nothing.
+
+### Manual checklist (AC-06)
+
+The suites below drive the screen over a fake terminal; these cannot be proven
+by one and are checked by hand in Windows Terminal:
+
+1. `npm run agent:tui -- --db data/manual.sqlite --config agent-tui.example.json`
+   starts, draws the frame with the editor on the last line, and the cursor
+   stays in the editor.
+2. Type a line and press enter: the request appears in the conversation and the
+   header turns `main busy`, then `main idle`.
+3. `ctrl+c` shows the confirmation without moving the frame; `n` keeps the
+   session, the cursor and the typed text intact.
+4. Send a long input and `ctrl+c`, then `y`: the screen restores, the shell
+   prompt returns on a clean line, and keystrokes typed after exit are not
+   echoed twice.
+5. Reopen with the same `--db`: the header shows `reopened: reconciled ...`
+   when a batch was in flight, and the conversation continues.
+6. Resize the window narrower and wider: every line stays inside the width and
+   nothing wraps into the editor.
+7. `npm run agent:tui -- --db data/manual.sqlite --config agent-tui.example.json --no-animation`
+   draws no spinner, and the elapsed column still counts.
+8. Pipe the command (`npm run agent:tui ... | cat`) and check the exit code is
+   `2` with the refusal on stderr.
+
+### Tests
+
+| suite | proves |
+| --- | --- |
+| `test/tui-config.test.ts` | argument parsing, the exit codes, and that a refused configuration never echoes a credential and never creates the database |
+| `test/tui-state.test.ts` | the real session over the faux provider: derived statuses, `/answer` reaching Main with its sufficiency, `/cancel` proven by the receipt, close-mid-run then reopen finishing |
+| `test/tui-terminal.test.ts` | the real app over a recorded terminal: the frame, `ctrl+c` then `n` / `y`, `/cancel all`, the quit overlay's keys, `--no-animation` |
+| `test/tui-view.test.ts` | the frame's rules: every status word and tone, colour changes no column, column-accurate fitting with CJK text, no invented numbers |
+
