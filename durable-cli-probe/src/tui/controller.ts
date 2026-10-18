@@ -140,10 +140,10 @@ export class Controller {
 			const stopping = rest.stopping;
 			const settled = stopping === undefined || this.stopSettled(snapshot, stopping.ids);
 			this.state = { ...rest, snapshot, ...(stopping === undefined || settled ? { stopping: undefined } : {}) };
+			this.host.requestRender();
 		} catch (error) {
 			this.state = { ...this.state, readError: error instanceof Error ? error.message : String(error) };
 		}
-		this.host.requestRender();
 	}
 
 	/**

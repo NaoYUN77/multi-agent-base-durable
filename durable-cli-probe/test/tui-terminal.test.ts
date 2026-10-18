@@ -279,6 +279,27 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(mounted.calls.snapshots).toBeGreaterThan(0);
 	});
 
+	it("survives a redraw that throws", async () => {
+		// The app starts `submit()` without awaiting it. A redraw that throws would
+		// otherwise reject that promise unhandled, which ends the process in Node.
+		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0 };
+		const controller = new Controller({
+			session: fakeSession(() => snapshot([]), calls),
+			animate: false,
+			transcriptLimit: 50,
+			host: {
+				requestRender: () => {
+					throw new Error("the screen is gone");
+				},
+				askQuit: () => {},
+				dismissQuit: () => {},
+				leave: () => {},
+			},
+		});
+		await expect(controller.refresh()).resolves.toBeUndefined();
+		expect(calls.snapshots).toBe(1);
+	});
+
 	it("draws the quit confirmation with its promise and its keys, and answers it by key", () => {
 		const lines = new QuitPrompt(createTheme(plainPainter()), () => {}, () => {})
 			.render(60)
