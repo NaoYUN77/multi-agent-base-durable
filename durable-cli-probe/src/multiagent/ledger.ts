@@ -28,9 +28,12 @@ import {
 	BUSINESS_TRANSITIONS,
 	IllegalTransitionError,
 	assertBusinessTransition,
+	assertRoundTransition,
 	isTerminalBusinessStatus,
+	type RoundStatus,
 	type TaskBusinessStatus,
 } from "../agent/state/lifecycle.ts";
+import type { RoundExecution } from "../agent/contracts/round-execution.ts";
 import { defineDocFamily } from "@earendil-works/pi-durable";
 
 /**
@@ -67,6 +70,13 @@ export type RoundRecord = {
 	readonly evidence: EvidenceReference[];
 	readonly startedAt: number;
 	readonly settledAt?: number;
+	/**
+	 * Present on every round the TASK-005.4 runtime started; absent on a legacy
+	 * TASK-003 round. Optional for exactly that reason: making it required would
+	 * refuse to read a document an older writer produced, and this document is the
+	 * one both subsystems share.
+	 */
+	execution?: RoundExecution;
 };
 
 /** Reference to one persisted tool result or answer, extracted by the program. */
@@ -196,9 +206,12 @@ export type TaskLedgerState = {
  */
 export const TaskLedgerDoc = defineDocFamily<TaskLedgerState, { readonly taskId: string; readonly model: ModelRef }>({
 	kind: "app.multiagent.task-ledger",
-	version: 2,
+	version: 3,
 	// v1 documents predate operation bindings, state events and the version
-	// counter; a v1 read is filled in rather than rejected.
+	// counter; a v1 read is filled in rather than rejected. v2 -> v3 adds only the
+	// optional `RoundRecord.execution`, so a v2 document is already a valid v3 one
+	// and nothing is written: a round the TASK-005.4 runtime never started has no
+	// execution record, and inventing one would claim it did.
 	migrate: (value, fromVersion) => {
 		if (fromVersion >= 2) return value as unknown as TaskLedgerState;
 		return {
@@ -383,6 +396,80 @@ export function releaseRound(doc: ClaimDraft, opKey: string): boolean {
 	doc.activeRound = undefined;
 	doc.activeToolTaskId = undefined;
 	return true;
+}
+
+/**
+ * Write the execution record of one round, in the same commit that claimed it.
+ *
+ * `claimRound` above is deliberately unaware of `RoundExecution`: TASK-003's
+ * delegation calls it and must keep working unchanged, and the shape belongs to
+ * the runtime. This helper is the single place a runtime round is stamped, so
+ * "which round is this, under what limits, with what attempts" is answered once
+ * and cannot be half-written by a caller that forgot a field.
+ *
+ * @throws ExecutionRightError when the round does not exist or is held by another
+ * operation — stamping it would attribute this operation's work to someone
+ * else's round.
+ */
+export function stampExecution(
+	doc: ClaimDraft & { rounds: RoundRecord[] },
+	input: { readonly opKey: string; readonly round: number; readonly execution: RoundExecution },
+): void {
+	if (doc.activeOpKey !== input.opKey) {
+		throw new ExecutionRightError(doc.taskId, `round ${input.round} is not held by ${input.opKey}`);
+	}
+	const existing = doc.rounds.find((round) => round.round === input.round);
+	if (existing === undefined || existing.opKey !== input.opKey) {
+		throw new ExecutionRightError(doc.taskId, `round ${input.round} was not claimed by ${input.opKey}`);
+	}
+	// A round is stamped once. Re-stamping would let a second attempt rewrite the
+	// limits and the deadline the first one started under, which is exactly the
+	// history a resume must not be able to change.
+	if (existing.execution !== undefined) return;
+	doc.rounds = doc.rounds.map((round) => (round.round === input.round ? { ...round, execution: input.execution } : round));
+}
+
+/**
+ * Move one round's status, asserting the shared transition table.
+ *
+ * The table is the one in `src/agent/state/lifecycle.ts`; this helper only
+ * locates the round in the document and applies the move, so there is no second
+ * state machine to keep in sync.
+ *
+ * @throws IllegalTransitionError on an illegal edge, `ExecutionRightError` when
+ * the round has no execution record or another operation holds the right.
+ */
+export function recordRoundStatus(
+	doc: ClaimDraft & { rounds: RoundRecord[] },
+	input: { readonly opKey: string; readonly round: number; readonly status: RoundStatus },
+): void {
+	const existing = doc.rounds.find((round) => round.round === input.round);
+	if (existing?.execution === undefined) {
+		throw new ExecutionRightError(doc.taskId, `round ${input.round} has no execution record`);
+	}
+	if (doc.activeOpKey !== undefined && doc.activeOpKey !== input.opKey) {
+		throw new ExecutionRightError(doc.taskId, `round ${input.round} is held by ${doc.activeOpKey}, not ${input.opKey}`);
+	}
+	assertRoundTransition(existing.execution.status, input.status);
+	doc.rounds = doc.rounds.map((round) =>
+		round.round === input.round && round.execution !== undefined
+			? { ...round, execution: { ...round.execution, status: input.status } }
+			: round,
+	);
+}
+
+/**
+ * Read the execution record of one round, refusing a legacy round.
+ *
+ * The runtime must not treat a TASK-003 round as one of its own: that round has
+ * no limits, no deadline and no attempt list, so applying the runtime's
+ * settlement to it would invent all three.
+ */
+export function executionOf(doc: { readonly rounds: readonly RoundRecord[]; readonly taskId: string }, round: number): RoundExecution {
+	const record = doc.rounds.find((entry) => entry.round === round);
+	if (record === undefined) throw new ExecutionRightError(doc.taskId, `round ${round} does not exist`);
+	if (record.execution === undefined) throw new ExecutionRightError(doc.taskId, `round ${round} predates the batch runtime and has no execution record`);
+	return record.execution;
 }
 
 /** Drop a right whose holder task is gone (a stale right from an aborted call). */

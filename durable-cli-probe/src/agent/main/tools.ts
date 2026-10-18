@@ -36,6 +36,7 @@ import {
 	defineTool,
 	type ConversationId,
 	type Extension,
+	type ToolExecutionApi,
 	type ToolExecutionResult,
 	type Tx,
 } from "@earendil-works/pi-durable";
@@ -48,11 +49,70 @@ import { MainServiceDoc, type DispatchAttempt } from "./service-doc.ts";
 import { deriveQuestionId } from "./request-id.ts";
 import { mainRestorationSection } from "./restoration.ts";
 
-/** What one dispatched task reported. */
+/**
+ * What one dispatched task reported.
+ *
+ * The three new statuses are the *receipt's* own vocabulary, not the executor's:
+ * a runtime that settles a round reports `completed` (the round ran to a
+ * submitted answer), `failed` (it did not, and the detail says which kind of
+ * failure) or `cancelled` (a stop ended it). They are here rather than folded
+ * into `accepted` because the requirement is that Main receives the real
+ * receipt — "the task was admitted" and "the task's round completed" are
+ * different facts, and a status that conflated them would let a failed round
+ * read as a dispatched one.
+ */
 export type DispatchResult = {
 	readonly taskId: string;
-	readonly status: "accepted" | "blocked" | "failed" | "queued";
+	readonly status: "accepted" | "completed" | "failed" | "cancelled" | "blocked" | "queued";
 	readonly detail?: string;
+};
+
+/**
+ * What the runtime needs from the dispatch tool to make a batch durable in the
+ * *same* commit that admits it.
+ *
+ * The split is deliberate: the tool owns admission (it has the plan, the
+ * requirement, the question scope and the quota), and the runtime owns what a
+ * batch *is* (its id derivation, its member list, its saved contracts). Neither
+ * can write the other's documents without becoming the other's owner, so the
+ * tool calls out once, inside its own transaction, and the runtime writes there.
+ */
+export type BatchHost = {
+	/**
+	 * Record the admitted batch and its saved contracts, inside the caller's
+	 * transaction.
+	 *
+	 * Idempotent and first-write-wins: a batch that already exists is left exactly
+	 * as it is, because re-staging would erase the receipts of members that have
+	 * already settled. Called only after every other admission gate passed, so a
+	 * refused dispatch stages nothing.
+	 */
+	readonly stage: (tx: Tx, input: BatchStageRequest) => Promise<void>;
+	/**
+	 * Whether an admitted-but-unfinished dispatch may be re-entered.
+	 *
+	 * The tool asks this when it finds a started marker with no result: if the
+	 * batch is on record, re-entering is safe (every id is derived, every write is
+	 * idempotent) and is the only way the work a crash interrupted ever finishes.
+	 * If it is not, the outcome is genuinely unknown and the tool reports that
+	 * instead of re-running.
+	 */
+	readonly resumable: (operationKey: string) => Promise<boolean>;
+};
+
+/** The admitted batch, as the dispatch tool hands it to `BatchHost.stage`. */
+export type BatchStageRequest = {
+	readonly conversationId: ConversationId;
+	/** The stable identity of the dispatching tool call; the batch id derives from it. */
+	readonly operationKey: string;
+	readonly planId: string;
+	readonly planVersion: number;
+	/** The requirement, as read inside the admission transaction. */
+	readonly requestId: string;
+	readonly requestVersion: number;
+	/** The validated batch, in the order the model declared it. */
+	readonly tasks: readonly TaskSpec[];
+	readonly now: number;
 };
 
 /** Everything an injected dispatch-authorization policy is allowed to see. */
@@ -86,12 +146,19 @@ export type MainToolHost = {
 	 */
 	readonly activeRequest: (tx?: Tx) => Promise<{ readonly requestId: string; readonly requestVersion: number } | undefined>;
 	/**
-	 * Execute an admitted batch. Injected: this Issue uses a faux executor and
-	 * never creates a real sub-agent. Called *after* admission, so a refused
-	 * dispatch cannot reach it.
+	 * Execute an admitted batch. Called *after* admission, so a refused dispatch
+	 * cannot reach it.
+	 *
+	 * `api` is the dispatching tool call itself, and it is what makes a real
+	 * executor possible: an item started through `api.executeTool` is a nested
+	 * `pi.tool` task with a stable key, so work a crash interrupted is reattached
+	 * rather than lost, and the caller's own lifecycle (whether the parent settles,
+	 * is aborted, or the Harness closes) applies to it.
 	 */
 	readonly dispatch: (input: {
 		readonly conversationId: ConversationId;
+		/** The invoking tool call. An executor that starts durable work needs it. */
+		readonly api: ToolExecutionApi;
 		readonly planId: string;
 		readonly planVersion: number;
 		readonly tasks: readonly TaskSpec[];
@@ -107,8 +174,18 @@ export type MainToolHost = {
 	 * Dependencies of the given tasks that are not yet `accepted`. Injected
 	 * because "accepted" is a fact about a task ledger the executor owns. Absent
 	 * means "nothing to check".
+	 *
+	 * `tx` is passed when the caller is inside its own transaction — the admission
+	 * transaction — so the answer is the state the admission decision is made
+	 * against, rather than a state read a moment earlier. The result may be
+	 * awaited: a checker that reads ledgers has to.
 	 */
-	readonly unacceptedDependencies?: (tasks: readonly TaskSpec[]) => readonly string[];
+	readonly unacceptedDependencies?: (tasks: readonly TaskSpec[], tx?: Tx) => readonly string[] | Promise<readonly string[]>;
+	/**
+	 * The runtime's admission-side half, when one is wired in. Absent means this
+	 * deployment dispatches without a batch runtime (the historical behavior).
+	 */
+	readonly batches?: BatchHost;
 	/**
 	 * Whether this host authorizes the batch. Called during admission, before the
 	 * executor sees anything. Absent means no external policy is configured; the
@@ -567,14 +644,25 @@ export function createMainExtension(host: MainToolHost): Extension {
 		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
 			const opKey = operationKey("dispatch", api.taskId, api.callId);
 			const replayed = await replayOf(opKey);
-			if (replayed !== undefined) {
-				// A recorded call with no result was begun but never finished: it died in
-				// the window between the executor's effects and the receipt. Re-dispatching
-				// would run the batch a second time, so it is reported instead — and
-				// reported as an *error with unknown outcome*, not as a completion. Not
-				// re-running is not the same as having succeeded: the batch may have
-				// partially taken effect, and nothing here can tell whether it did. A
-				// finished call replays its result verbatim.
+			// A recorded call with no result was begun but never finished: it died in
+			// the window between the executor's effects and the receipt. Whether that
+			// is recoverable depends on whether the batch is on record — which is why
+			// the runtime is asked rather than assumed:
+			//
+			//   * **Resumable.** The admission commit that wrote the started marker
+			//     also wrote the batch and its member list, so re-entering this call
+			//     re-enters exactly the same batch: the batch id derives from this same
+			//     operation key, the attempt and quota reservations are already charged
+			//     under it, each item is a nested call whose key is derived from
+			//     `(task, round)` and whose receipt short-circuits it if it already ran.
+			//     Falling through is therefore the only way the interrupted work
+			//     finishes, and it cannot double-run anything.
+			//   * **Not resumable.** No batch exists, so nothing about the first
+			//     attempt is known: it may have partially taken effect. Reported as an
+			//     *error with unknown outcome* rather than as a completion. Not
+			//     re-running is not the same as having succeeded.
+			const resumable = replayed !== undefined && replayed.result === undefined && host.batches !== undefined && (await host.batches.resumable(opKey));
+			if (replayed !== undefined && !resumable) {
 				if (replayed.result === undefined) {
 					const text =
 						`dispatch ${args.planId} did NOT complete: it was interrupted after starting and may have partially run. ` +
@@ -647,9 +735,15 @@ export function createMainExtension(host: MainToolHost): Extension {
 				// dependencies" is not a fact that was established — it is the absence of
 				// the check — so the batch is refused rather than waved through. A batch
 				// with no dependencies needs no checker and is unaffected.
+				// The checker is handed the transaction, so it reads the dependency
+				// ledgers inside this same commit: a dependency that is accepted at the
+				// moment of the check cannot have been accepted by a commit that started
+				// after it, and vice versa. It may answer asynchronously — the ledgers
+				// are documents, and a document read is a request — so the result is
+				// awaited before `admissionBlockReasons` sees it.
 				const dependsOn = batch.value.some((task) => task.dependencies.length > 0);
 				const checkerMissing = dependsOn && host.unacceptedDependencies === undefined;
-				const unaccepted = checkerMissing ? [] : (host.unacceptedDependencies?.(batch.value) ?? []);
+				const unaccepted = checkerMissing ? [] : ((await host.unacceptedDependencies?.(batch.value, tx)) ?? []);
 				// Quota is read from the service document inside this transaction. The
 				// reservation itself is written only after every other gate passed, so a
 				// refused dispatch spends nothing. Counting by `opKey` makes a retried
@@ -716,6 +810,22 @@ export function createMainExtension(host: MainToolHost): Extension {
 				if (serviceDoc !== undefined && !dispatchAttemptsOf(serviceDoc).some((attempt) => attempt.opKey === opKey)) {
 					serviceDoc.dispatchAttempts = [...dispatchAttemptsOf(serviceDoc), { requestId: activeRequestId, opKey, at: clock() }];
 				}
+				// The batch and its member list are written in this same commit as the
+				// started marker below, so a crash after it leaves the runtime a batch it
+				// can resume rather than an operation with no record of what it was doing.
+				// The write is first-write-wins on the operation key: a replay of this
+				// commit re-stages the identical member list and changes nothing, which is
+				// what makes the replay branch above able to fall through safely.
+				await host.batches?.stage(tx, {
+					conversationId: api.conversationId,
+					operationKey: opKey,
+					planId: args.planId,
+					planVersion: storedVersion ?? args.version,
+					requestId: activeRequestId,
+					requestVersion: activeRequestVersion,
+					tasks: batch.value,
+					now: clock(),
+				});
 				await host.beginOperation?.({ opKey }, tx);
 				return { reasons, version: storedVersion, refusal: undefined, requestId: activeRequestId, requestVersion: activeRequestVersion };
 			}, callContext);
@@ -727,6 +837,12 @@ export function createMainExtension(host: MainToolHost): Extension {
 			// stable key to dedupe on, rather than only the plan and the tasks.
 			const results = await host.dispatch({
 				conversationId: api.conversationId,
+				// The executor is handed the tool-execution API, not just the conversation:
+				// the tasks it runs are nested tool calls made *from* this call, and the
+				// call's identity is what gives them their per-call keys and their
+				// cancellation. A dispatcher that only received a conversation id could
+				// not make a nested call that this call's abort reaches.
+				api,
 				planId: args.planId,
 				planVersion: admitted.version ?? args.version,
 				tasks: batch.value,

@@ -590,6 +590,9 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 		const requestId = "req-1";
 		const planId = "plan-1";
 		const taskId = "task-a";
+		// The result document is keyed by the round's result id, not by the task, so a
+		// rework cannot overwrite the previous round's receipt.
+		const resultId = "res.task-a.r1";
 
 		const clarification = validateClarificationState({
 			schemaVersion: 1,
@@ -635,7 +638,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 		});
 		const result = validateTaskResult({
 			schemaVersion: 1,
-			resultId: "result-1",
+			resultId,
 			runtime: { taskId, round: 1, status: "completed", attempts: 1, technicalRestarts: 0, toolInvocations: 2, sideEffect: "recorded", settledAt: 1_700_000_000_000 },
 			// Non-empty evidence and work, so the comparison after the reopen has
 			// something to lose: an empty list round-trips through anything.
@@ -655,7 +658,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 			const clarificationRead = await harness.snapshot(AgentClarificationDoc, conversationId as never, requestId, context);
 			const planRead = await harness.snapshot(AgentPlanDoc, conversationId as never, planId, context);
 			const configRead = await harness.snapshot(AgentTaskConfigDoc, conversationId as never, taskId, context);
-			const resultRead = await harness.snapshot(AgentTaskResultDoc, conversationId as never, taskId, context);
+			const resultRead = await harness.snapshot(AgentTaskResultDoc, conversationId as never, resultId, context);
 			if (request === undefined || clarificationRead === undefined || planRead === undefined || configRead === undefined || resultRead === undefined) {
 				throw new Error("every document must exist");
 			}
@@ -693,7 +696,7 @@ describe("TASK-005.1 documents — write, close, reopen (AC-03)", { timeout: 30_
 					const configDoc = await tx.doc(AgentTaskConfigDoc, root.id, taskId, { taskId });
 					configDoc.snapshot = snapshot.value;
 
-					const resultDoc = await tx.doc(AgentTaskResultDoc, root.id, taskId, { taskId });
+					const resultDoc = await tx.doc(AgentTaskResultDoc, root.id, resultId, { resultId, taskId });
 					resultDoc.result = result.value;
 				},
 				context,

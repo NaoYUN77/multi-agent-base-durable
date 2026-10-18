@@ -42,6 +42,19 @@ export type BuilderDependencies = {
 	readonly taskSpecVersion: number;
 	/** Plan version the task was dispatched from. */
 	readonly planVersion: number;
+	/**
+	 * Extensions the *runtime* installs, on top of the granted tools' own.
+	 *
+	 * Not part of the grant and not negotiated per task: the batch runtime's quota
+	 * gate wraps the tools the grant already authorized and adds no tool of its
+	 * own, so it belongs to the process running the child rather than to the task's
+	 * permissions. It is deliberately absent from `TaskConfigSnapshot` and from
+	 * `configHash` — a snapshot is compared between attempts of *one* task, and
+	 * listing a program-installed extension there would make every stored snapshot
+	 * from an older version look incompatible. The behaviour contract's version is
+	 * already recorded as `contractRevision`.
+	 */
+	readonly runtimeExtensions?: readonly Extension[];
 };
 
 /** The assembled configuration of one child conversation. */
@@ -250,7 +263,11 @@ export function buildSubAgentConfig(spec: TaskSpec, dependencies: BuilderDepende
 		budget,
 		configHash,
 	};
-	const extensions = [...new Set(capabilities.tools.map((tool) => tool.extension))];
+	// The grant's extensions first, then the ones this process installs. `Set`
+	// keeps each once: an extension that is both a granted tool's host and the
+	// runtime's gate would otherwise be installed twice, and `configure` installs
+	// what it is given rather than deduplicating.
+	const extensions = [...new Set([...capabilities.tools.map((tool) => tool.extension), ...(dependencies.runtimeExtensions ?? [])])];
 	const registrations = capabilities.tools.map((tool) => tool.registration);
 	return {
 		taskId: spec.id,
