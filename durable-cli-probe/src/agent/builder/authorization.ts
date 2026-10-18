@@ -17,6 +17,7 @@
 import type { Extension, ToolRegistration } from "@earendil-works/pi-durable";
 import type { ContractValidation } from "../contracts/errors.ts";
 import type { TaskSpec } from "../contracts/task-spec.ts";
+import { readToolEffects, type ToolEffects } from "../contracts/tool-effects.ts";
 import { Violations } from "../contracts/validate.ts";
 import type { SkillDefinition, SkillRegistry } from "./skill-registry.ts";
 
@@ -34,6 +35,16 @@ export type AuthorizedTool = {
 	 * never inherited.
 	 */
 	readonly extension: Extension;
+	/**
+	 * What the tool reads and writes, declared by the catalog.
+	 *
+	 * Required, not optional: the batch runtime decides which items may run
+	 * concurrently from the union of their granted tools' effects, and an absent
+	 * declaration would silently mean "touches nothing" — the most permissive
+	 * reading of the least information. A tool whose targets cannot be named
+	 * declares `UNKNOWN_WRITE` instead, which is admitted exclusively.
+	 */
+	readonly effects: ToolEffects;
 };
 
 /**
@@ -98,6 +109,14 @@ export function authorizeTask(spec: TaskSpec, policy: TaskAuthorizationPolicy): 
 		// authorize a tool the child never receives.
 		if (!(tool.extension.tools ?? []).some((registered) => registered.name === tool.name)) {
 			collect.add("tool_extension_mismatch", "$.tools", `extension ${tool.extension.name} does not provide tool ${tool.name}`);
+			continue;
+		}
+		// Effects are what the batch runtime uses to decide concurrency. A catalog
+		// entry without a well-formed declaration is an application error, not a
+		// tool with no effects: the latter would run alongside any other item.
+		const effects = readToolEffects(tool.effects);
+		if (!effects.ok) {
+			collect.add("tool_effects_missing", "$.tools", `tool ${tool.name}: ${effects.detail}`);
 			continue;
 		}
 		catalog.set(tool.name, tool);

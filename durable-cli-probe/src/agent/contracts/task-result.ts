@@ -18,7 +18,7 @@
 // rejected before the document is assembled, so a forged result cannot be
 // persisted, let alone read back as evidence.
 
-import { Violations, readCount, readEnum, readNoUnknownKeys, readObject, readOptionalEnum, readOptionalStableId, readPositiveInteger, readSchemaVersion, readStableId, readString, readStringList } from "./validate.ts";
+import { Violations, readBoolean, readCount, readEnum, readNoUnknownKeys, readObject, readOptionalEnum, readOptionalStableId, readPositiveInteger, readSchemaVersion, readStableId, readString, readStringList } from "./validate.ts";
 import type { ContractValidation } from "./errors.ts";
 
 export const TASK_RESULT_SCHEMA_VERSION = 1;
@@ -49,6 +49,15 @@ export type RuntimeOutcome = {
 	/** Technical restarts spent. Counted separately from quality attempts. */
 	readonly technicalRestarts: number;
 	readonly toolInvocations: number;
+	/**
+	 * Whether Main must decide how this operation continues. Set on a round that
+	 * exhausted its technical budget: the round is over and nothing further will
+	 * happen to it on its own, but the *task* is not abandoned — Main may start a
+	 * technical restart or a targeted rework. A quality failure does not set it
+	 * (the work was done and reviewed), and a cancelled round does not set it (the
+	 * decision was already made).
+	 */
+	readonly requiresMainDecision?: boolean;
 	/** Whether a side effect may exist that nobody recorded. Never claimed as "none" without proof. */
 	readonly sideEffect: "unknown" | "none" | "recorded";
 	readonly settledAt: number;
@@ -165,6 +174,7 @@ function readRuntime(value: unknown, path: string, collect: Violations): Runtime
 		"attempts",
 		"technicalRestarts",
 		"toolInvocations",
+		"requiresMainDecision",
 		"sideEffect",
 		"settledAt",
 	]);
@@ -175,6 +185,7 @@ function readRuntime(value: unknown, path: string, collect: Violations): Runtime
 	const attempts = readCount(holder, "attempts", `${path}.attempts`, collect);
 	const technicalRestarts = readCount(holder, "technicalRestarts", `${path}.technicalRestarts`, collect);
 	const toolInvocations = readCount(holder, "toolInvocations", `${path}.toolInvocations`, collect);
+	const requiresMainDecision = holder.requiresMainDecision === undefined ? undefined : readBoolean(holder, "requiresMainDecision", `${path}.requiresMainDecision`, collect);
 	const sideEffect = readEnum(holder, "sideEffect", `${path}.sideEffect`, collect, ["unknown", "none", "recorded"] as const);
 	const settledAt = readCount(holder, "settledAt", `${path}.settledAt`, collect);
 	if (status !== "completed" && failureKind === undefined) {
@@ -203,6 +214,7 @@ function readRuntime(value: unknown, path: string, collect: Violations): Runtime
 		sideEffect,
 		settledAt,
 		...(failureKind === undefined ? {} : { failureKind: failureKind as RuntimeOutcome["failureKind"] }),
+		...(requiresMainDecision === undefined ? {} : { requiresMainDecision }),
 	};
 }
 

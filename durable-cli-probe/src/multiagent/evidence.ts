@@ -232,6 +232,11 @@ export async function extractRoundEvidence(scanner: EntryScanner, bounds: RoundB
 			{
 				entryId: bounds.answerEntryId,
 				kind: answerEntry.kind,
+				// The answer is durable work like any other entry, so it carries the
+				// task that produced it. Without this the answer's own reference could
+				// not pass an attribution check — the same check every other reference
+				// has to pass — and a round's answer would be unverifiable evidence.
+				...(answerEntry.byTaskId === undefined ? {} : { byTaskId: String(answerEntry.byTaskId) }),
 				excerpt: excerptOf(answerText, EVIDENCE_EXCERPT_LIMIT).excerpt,
 				truncated: excerptOf(answerText, EVIDENCE_EXCERPT_LIMIT).truncated,
 			},

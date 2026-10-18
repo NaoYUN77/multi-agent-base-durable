@@ -32,6 +32,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import type {
 	Conversation,
 	ConversationId,
+	Extension,
 	Harness,
 	Registry,
 	Submission,
@@ -45,6 +46,7 @@ import { isStableId } from "../agent/contracts/validate.ts";
 import { MainServiceDoc, type InputAdmission, type OperationReceipt, type PlanIndexEntry, type QueuedInput } from "../agent/main/service-doc.ts";
 import { answerInputId, derivedRequestId, queuedInputId, requestInputId } from "../agent/main/request-id.ts";
 import { createMainExtension, type MainToolHost } from "../agent/main/tools.ts";
+import type { BatchReconciliation, BatchRuntime } from "../agent/runtime/index.ts";
 import { restorationSectionText, withRestorationSection } from "../agent/main/restoration.ts";
 import { mainInstructions } from "../agent/prompts/main.ts";
 
@@ -60,8 +62,26 @@ export type MainServiceOptions = {
 	readonly context: Context;
 	/** The Main conversation, from `harness.root`. */
 	readonly conversationId: ConversationId;
-	/** Executor for admitted dispatch batches. Required: the service never invents one. */
-	readonly dispatch: MainToolHost["dispatch"];
+	/**
+	 * Executor for admitted dispatch batches. Required unless `runtime` is given,
+	 * which supplies its own: the service never invents one.
+	 */
+	readonly dispatch?: MainToolHost["dispatch"];
+	/**
+	 * The durable batch runtime of Issue #19 (TASK-005.4), when this deployment runs
+	 * one. It supplies the executor, the admission hooks (`stage` inside the dispatch
+	 * commit, and the resume check), the dependency checker and — because its item
+	 * tool is reachable only through `executeTool` — the extension that must be
+	 * *selected* on the Main conversation alongside the management tools.
+	 *
+	 * Supplying it also turns on the two recovery paths the runtime owns: the stops
+	 * an interrupted process left unfinished are rejoined once, at open, and reported
+	 * as `openReconciliation`; and `requestCancel` fans a request-wide cancel out to
+	 * every admitted batch *between* persisting its own intent and aborting the
+	 * conversation, so a process that dies mid-cancel leaves stops on record rather
+	 * than children whose batches look runnable.
+	 */
+	readonly runtime?: BatchRuntime;
 	/** Dependencies not yet accepted, when the executor can report them. */
 	readonly unacceptedDependencies?: MainToolHost["unacceptedDependencies"];
 	/**
@@ -86,6 +106,17 @@ export type MainServiceOptions = {
 	 * from the conversation rather than asserting a string was built.
 	 */
 	readonly instructionsExtra?: string;
+	/**
+	 * Additional extensions this deployment selects on the Main conversation
+	 * beside the management extension (and the batch runtime's, when one is
+	 * supplied). Each is installed into `registry` here, because `configure`
+	 * replaces the selected list rather than adding to it: an extension named but
+	 * not installed resolves to nothing, and one installed but not named is
+	 * unreachable from this conversation. This is a composition hook, not a
+	 * permission: every tool these extensions add is Main-visible, so a caller
+	 * that supplies one is saying the deployment's Main agent really has it.
+	 */
+	readonly extensionsExtra?: readonly Extension[];
 };
 
 /** What one `submitUserInput` call did. */
@@ -148,11 +179,28 @@ export type MainService = {
 	/** The conversation's live status, read from `harness.inspect()`. Writes nothing. */
 	status(): Promise<{ readonly busy: boolean; readonly openQuestionIds: readonly string[]; readonly requestId: string | undefined }>;
 	/**
-	 * Persist a cancellation intent, then abort the conversation's ordinary
-	 * ownership scope. Returns once the abort is signalled; it does not wait for a
-	 * model round to finish, which is the point of a control call.
+	 * Persist a cancellation intent, stop every batch the runtime holds, then abort
+	 * the conversation's ordinary ownership scope. Returns once the abort is
+	 * signalled; it does not wait for a model round to finish, which is the point of a
+	 * control call.
+	 *
+	 * The order is the guarantee. The intent is written first so a process that dies
+	 * mid-cancel leaves a readable record; the batch stops come second, because a
+	 * batch that has not recorded *its* stop would be resumed by its own dispatch
+	 * replay after the reopen — the abort kills the running children, and only the
+	 * recorded intent stops them being started again; the abort is last, because it is
+	 * the one step that destroys the evidence the other two rely on.
 	 */
 	requestCancel(reason?: string): Promise<{ readonly requested: boolean; readonly reason: string }>;
+	/**
+	 * What the runtime reconciled when this service opened: the batches that still had
+	 * outstanding work, and the stops an interrupted process left unfinished and this
+	 * open completed. Empty when no runtime is configured.
+	 *
+	 * Captured once, at open, and never recomputed — it is a record of what recovery
+	 * found, which a later read cannot reproduce.
+	 */
+	readonly openReconciliation: readonly BatchReconciliation[];
 	close(): Promise<void>;
 };
 
@@ -183,6 +231,20 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	if (options.dispatchQuota !== undefined && (!Number.isInteger(options.dispatchQuota.maxAttempts) || options.dispatchQuota.maxAttempts < 0)) {
 		throw new Error("main service: dispatchQuota.maxAttempts must be a non-negative integer");
 	}
+	// One dispatch has one writer, and one dependency check has one authority. A
+	// deployment that handed in both an executor and a runtime would have two, and
+	// which of them ran would depend on an argument order rather than on a decision.
+	if (options.runtime !== undefined && options.dispatch !== undefined) {
+		throw new Error("main service: `runtime` supplies its own executor, so `dispatch` must not also be given");
+	}
+	if (options.runtime !== undefined && options.unacceptedDependencies !== undefined) {
+		throw new Error("main service: `runtime` supplies its own dependency checker, so `unacceptedDependencies` must not also be given");
+	}
+	const dispatch = options.runtime?.dispatch ?? options.dispatch;
+	if (dispatch === undefined) {
+		throw new Error("main service: either `runtime` or `dispatch` is required; the service never invents an executor");
+	}
+	const unacceptedDependencies = options.unacceptedDependencies ?? options.runtime?.unacceptedDependencies;
 
 	/**
 	 * Committed reads go through `handle.commit` rather than `harness.snapshot`.
@@ -661,7 +723,7 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 	 */
 	const extension = createMainExtension({
 		activeRequest,
-		dispatch: options.dispatch,
+		dispatch,
 		now,
 		buildHandoff,
 		readOperation,
@@ -697,12 +759,31 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			await reconcileQueue();
 			return await restoreServedRequirement(request.messages);
 		},
-		...(options.unacceptedDependencies === undefined ? {} : { unacceptedDependencies: options.unacceptedDependencies }),
+		...(unacceptedDependencies === undefined ? {} : { unacceptedDependencies }),
+		...(options.runtime === undefined ? {} : { batches: options.runtime.batches }),
 		...(options.authorizeDispatch === undefined ? {} : { authorizeDispatch: options.authorizeDispatch }),
 		...(options.dispatchQuota === undefined ? {} : { dispatchQuota: options.dispatchQuota }),
 	});
 	options.registry.install(extension);
-	await handle.configure({ extensions: [extension], instructions: mainInstructions(options.instructionsExtra) }, context);
+	// The runtime's item tool is reachable only through `executeTool`, and
+	// `executeTool` resolves a tool among the conversation's *enabled* ones — so the
+	// runtime's extension has to be selected here as well as installed, or every item
+	// call resolves to nothing. Installing it a second time is deliberately harmless:
+	// `install` is idempotent by name, so a registry the runtime already installed
+	// into is left exactly as it was, and a different one is brought up to the same
+	// state rather than being silently missing a tool.
+	const extra = options.extensionsExtra ?? [];
+	for (const candidate of extra) options.registry.install(candidate);
+	const extensions = [...(options.runtime === undefined ? [extension] : [extension, options.runtime.extension]), ...extra];
+	if (options.runtime !== undefined) options.registry.install(options.runtime.extension);
+	await handle.configure({ extensions, instructions: mainInstructions(options.instructionsExtra) }, context);
+
+	// Recovery, once, before the service is handed back. A stop an interrupted
+	// process did not finish is rejoined here rather than left owed, and a batch that
+	// still has items without receipts is reported. The runtime is idempotent and so
+	// is this call, so reopening the same session twice reconciles twice and changes
+	// nothing the second time.
+	const openReconciliation: readonly BatchReconciliation[] = options.runtime === undefined ? [] : await options.runtime.reconcile(context);
 
 	/**
 	 * Whether this conversation has live non-background work.
@@ -1270,12 +1351,18 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		},
 
 		async requestCancel(reason) {
-			// Documents first, then the abort: the intent is persisted before any
-			// signal, so a process that dies mid-cancel leaves a readable intent.
+			// Documents first, then the batch stops, then the abort. The intent is
+			// persisted before any signal, so a process that dies mid-cancel leaves a
+			// readable intent; the batch stops come before the abort because a batch that
+			// has not recorded *its* stop would be resumed by its own dispatch replay
+			// after the reopen — the abort kills the running children, and only the
+			// recorded intent stops them being started again; and the abort is last
+			// because it is the step that destroys the evidence the other two rely on.
 			await handle.commit(async (tx) => {
 				const doc = await tx.doc(MainServiceDoc, conversationId);
 				doc.cancelRequested = { at: now(), ...(reason === undefined ? {} : { reason }) };
 			}, context);
+			if (options.runtime !== undefined) await options.runtime.stopAll(reason ?? "cancelled_by_user", context);
 			await handle.abort(context);
 			return { requested: true, reason: reason ?? "cancelled_by_user" };
 		},
@@ -1283,6 +1370,8 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		async close() {
 			await harness.close(context);
 		},
+
+		openReconciliation,
 	};
 
 	return service;

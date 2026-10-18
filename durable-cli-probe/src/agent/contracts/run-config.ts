@@ -27,7 +27,13 @@ export type RunConfig = {
 	readonly maxSubAgentsPerRequest: number;
 	readonly maxToolInvocationsPerRound: number;
 	readonly maxFailedToolCallsPerRound: number;
-	/** Attempts per operation: quality rework and provider retries share this budget. */
+	/**
+	 * Attempts per operation: the initial round plus every quality rework. A
+	 * provider retry is *not* an attempt — it is bounded by
+	 * `providerRetry.maxRetries` and recorded in the same round
+	 * (`src/agent/state/quota.ts` states the same rule). Reusing one counter for
+	 * both would let a flaky provider burn the task's revision allowance.
+	 */
 	readonly maxAttemptsPerOperation: number;
 	/** Technical restarts allowed before the task is abandoned. */
 	readonly maxTechnicalRestarts: number;
