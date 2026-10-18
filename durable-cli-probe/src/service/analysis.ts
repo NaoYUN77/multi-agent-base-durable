@@ -69,10 +69,6 @@ function rowWord(status: TaskBusinessStatus): TaskRowStatus {
 	return status === "accepted" ? "accepted" : status === "failed" ? "failed" : "cancelled";
 }
 
-function isTerminalRow(status: TaskRowStatus): boolean {
-	return status === "accepted" || status === "failed" || status === "cancelled";
-}
-
 /**
  * The status word of one task, from its runtime facts and its ledger.
  *
@@ -160,25 +156,6 @@ export function deriveTaskRow(input: {
 		...(task?.queuePosition === undefined ? {} : { queuePosition: task.queuePosition }),
 		retrying: execution?.status === "retry_wait",
 	};
-}
-
-/** Build the status bar's summary sentence for one snapshot. Pure. */
-export function summarize(rows: readonly TaskRow[]): { readonly active: number; readonly words: Readonly<Record<TaskRowStatus, number>> } {
-	const words: Record<TaskRowStatus, number> = {
-		planned: 0,
-		queued: 0,
-		running: 0,
-		retry_wait: 0,
-		stopping: 0,
-		"awaiting-review": 0,
-		"awaiting-input": 0,
-		accepted: 0,
-		failed: 0,
-		cancelled: 0,
-	};
-	for (const row of rows) words[row.status] += 1;
-	const active = rows.filter((row) => !isTerminalRow(row.status)).length;
-	return { active, words };
 }
 
 function mainTaskName(record: { readonly key?: unknown; readonly kind?: unknown }): string {
