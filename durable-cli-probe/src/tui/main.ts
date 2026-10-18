@@ -75,6 +75,20 @@ export async function runScreen(session: AgentSession, animate: boolean): Promis
 	const tui = new TuiMainScreen(terminal, false);
 	let app: InstanceType<typeof ControllerApp> | undefined;
 	let exiting: ((code: number) => void) | undefined;
+	// One way out, whatever the reason: a confirmed quit, a failed pass, or a
+	// rejected start. The terminal must be restored on every path, or a thrown
+	// error leaves the user in raw mode with the cursor hidden.
+	let restored = false;
+	const restore = (): Promise<void> => {
+		if (restored) return Promise.resolve();
+		restored = true;
+		app?.dispose();
+		tui.stop();
+		return terminal.drainInput(500, 50).then(
+			() => undefined,
+			() => undefined,
+		);
+	};
 	const controller = new Controller({
 		session,
 		animate,
@@ -84,13 +98,7 @@ export async function runScreen(session: AgentSession, animate: boolean): Promis
 			askQuit: () => app?.showQuit(),
 			dismissQuit: () => app?.hideQuit(),
 			leave: () => {
-				// Restore the terminal first, then drain, then end: a failure in either
-				// step must not keep the user inside a stopped screen.
-				tui.stop();
-				void terminal.drainInput(500, 50).then(
-					() => exiting?.(EXIT.ok),
-					() => exiting?.(EXIT.ok),
-				);
+				void restore().then(() => exiting?.(EXIT.ok));
 			},
 		},
 	});
@@ -100,8 +108,14 @@ export async function runScreen(session: AgentSession, animate: boolean): Promis
 	app = new ControllerApp({ controller, tui, theme });
 	tui.addChild(app);
 	tui.setFocus(app.editor());
-	tui.start();
-	await controller.start();
+	try {
+		tui.start();
+		await controller.start();
+	} catch (error) {
+		await session.close().catch(() => {});
+		await restore();
+		throw error;
+	}
 	return await done;
 }
 

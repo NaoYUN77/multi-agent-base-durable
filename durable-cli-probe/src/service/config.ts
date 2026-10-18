@@ -158,6 +158,10 @@ export function parseAgentConfig(raw: unknown, where = "config"): ConfigResult<A
 	const baseUrl = readString("baseUrl");
 	const apiKeyEnv = readString("apiKeyEnv");
 	const databasePath = readString("databasePath");
+	// A config naming a database and the entry naming another is two answers to
+	// one question. The command line wins, and the entry passes it explicitly, so
+	// the field is accepted only to say what it will not do.
+	if (databasePath !== undefined && !isAbsolute(databasePath)) errors.push(`${where}: databasePath must be an absolute path when set`);
 	const readCount = (key: string): number | undefined => {
 		const value = source[key];
 		if (value === undefined) return undefined;
@@ -237,9 +241,5 @@ export async function readAgentConfig(path: string): Promise<ConfigResult<AgentC
 		return { ok: false, errors: [`config: ${path} is not valid JSON${position === undefined ? "" : ` (error at character ${position})`}`] };
 	}
 	const parsed = parseAgentConfig(raw, "config");
-	if (parsed.ok && parsed.value.databasePath !== undefined) {
-		const configPath = parsed.value.databasePath;
-		if (!isAbsolute(configPath)) return { ok: false, errors: ["config: databasePath must be an absolute path when set"] };
-	}
 	return parsed;
 }

@@ -64,6 +64,8 @@ export class Controller {
 	private state: ViewState = {};
 	private transcript: readonly TranscriptLine[] = [];
 	private watch: SessionWatch | undefined;
+	private refreshing = false;
+	private readonly waiting: (() => void)[] = [];
 	private quitting = false;
 	private started = false;
 
@@ -99,8 +101,37 @@ export class Controller {
 		this.host.requestRender();
 	}
 
-	/** One read pass, requested now (a command may need it before acting). */
+	/**
+	 * One read pass, requested now (a command may need it before acting).
+	 *
+	 * Coalesced and single-flight: a change that arrives while a pass runs joins
+	 * one follow-up pass instead of starting a second read, and every caller
+	 * resolves only after a pass that began after its call finished. Without this,
+	 * a busy child commits many frames a second and each notification would start
+	 * its own read of every document.
+	 */
 	async refresh(): Promise<void> {
+		if (this.quitting) return;
+		const settled = new Promise<void>((resolve) => {
+			this.waiting.push(resolve);
+		});
+		if (this.refreshing) return settled;
+		this.refreshing = true;
+		try {
+			while (this.waiting.length > 0 && !this.quitting) {
+				const batch = this.waiting.splice(0);
+				await this.readOnce();
+				for (const resolve of batch) resolve();
+			}
+		} finally {
+			this.refreshing = false;
+			for (const resolve of this.waiting.splice(0)) resolve();
+		}
+		return settled;
+	}
+
+	/** One pass: read, keep the stop until it settles, request a redraw. */
+	private async readOnce(): Promise<void> {
 		if (this.quitting) return;
 		try {
 			const snapshot = await this.session.snapshot(this.now());
@@ -191,10 +222,19 @@ export class Controller {
 		this.quitting = true;
 		this.host.dismissQuit();
 		// The watches stop first so no pass starts against a closing session; the
-		// session's own close stops its feed for the same reason.
-		await this.watch?.stop();
-		await this.session.close();
-		this.host.leave();
+		// session's own close stops its feed for the same reason. A close that
+		// throws must still end in `leave()`: the terminal is restored by it, and
+		// leaving the user in raw mode because storage refused is the worse failure.
+		// Nothing is left to report the error to once the screen is gone; the next
+		// open meets the same storage state and reports it there.
+		try {
+			await this.watch?.stop();
+			await this.session.close();
+		} catch {
+			// See above.
+		} finally {
+			this.host.leave();
+		}
 	}
 
 	cancelQuit(): void {

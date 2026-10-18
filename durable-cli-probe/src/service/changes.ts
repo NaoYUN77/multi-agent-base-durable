@@ -112,6 +112,7 @@ export function startChangeFeed(options: {
 			watched.delete(key);
 			stopping.push(watch.stop());
 		}
+		let acquiredAny = false;
 		for (const [key, spec] of wanted) {
 			if (watched.has(key) || stopped) continue;
 			const watch = await spec.acquire();
@@ -120,8 +121,13 @@ export function startChangeFeed(options: {
 			watch.start(async () => {
 				mark();
 			});
+			acquiredAny = true;
 		}
 		await Promise.all(stopping);
+		// A watch never fires for what changed before it started, and the pass that
+		// asked for it read the document before that. One more pass closes the gap:
+		// by then the watch is listening, so anything later arrives on its own.
+		if (acquiredAny) mark();
 	}
 
 	return {

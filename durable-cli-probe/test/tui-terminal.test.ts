@@ -85,7 +85,7 @@ function snapshot(rows: readonly TaskRow[]): TuiSnapshot {
 	};
 }
 
-type Calls = { closed: number; cancelledAll: string[]; cancelled: string[] };
+type Calls = { closed: number; cancelledAll: string[]; cancelled: string[]; failClose?: boolean; snapshots: number; snapshotDelayMs: number };
 
 /** A session double: every call the controller can make is recorded. */
 function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
@@ -99,7 +99,11 @@ function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
 		} as unknown as AgentSession["main"],
 		conversationId: 1 as AgentSession["conversationId"],
 		context: unused as never,
-		snapshot: async () => latest(),
+		snapshot: async () => {
+			calls.snapshots += 1;
+			if (calls.snapshotDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, calls.snapshotDelayMs));
+			return latest();
+		},
 		watch: async () => ({ mark: () => {}, flush: async () => {}, stop: async () => {} }),
 		transcript: async () => [
 			{ entryId: "1", kind: "user", text: "run things" },
@@ -116,6 +120,7 @@ function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
 		},
 		close: async () => {
 			calls.closed += 1;
+			if (calls.failClose === true) throw new Error("storage refused the close");
 		},
 	};
 }
@@ -137,7 +142,7 @@ function frame(app: ControllerApp, needle = ""): string {
 async function mount(latest: () => TuiSnapshot, animate = false) {
 	const terminal = new FakeTerminal();
 	const tui = new TuiMainScreen(terminal);
-	const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [] };
+	const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0 };
 	const session = fakeSession(latest, calls);
 	let leave: (() => void) | undefined;
 	const left = new Promise<void>((resolve) => {
@@ -247,7 +252,35 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(mounted.controller.view().state.stopping).toBeUndefined();
 	});
 
-	it("draws the quit confirmation with its promise and its keys, and answers it by key", () => {		const lines = new QuitPrompt(createTheme(plainPainter()), () => {}, () => {})
+	it("leaves even when closing the session throws", async () => {
+		// The terminal is restored by leave(); a storage failure at close must not
+		// keep the user in raw mode. Nothing is cancelled on the way out either.
+		mounted = await mount(() => snapshot([row("t-alpha", "running")]), false);
+		mounted.calls.failClose = true;
+		await mounted.controller.confirmQuit();
+		await mounted.left;
+		expect(mounted.calls.closed).toBe(1);
+		expect(mounted.terminal.started).toBe(false);
+		expect(mounted.calls.cancelledAll).toEqual([]);
+	});
+
+	it("coalesces a burst of notifications into one follow-up pass", async () => {
+		// A busy child commits many frames a second. The feed asks for a pass per
+		// notification; a slow pass must absorb the burst rather than start one read
+		// per frame.
+		mounted = await mount(() => snapshot([row("t-alpha", "running")]), false);
+		mounted.calls.snapshotDelayMs = 40;
+		mounted.calls.snapshots = 0;
+		const controller = mounted.controller as unknown as { refresh(): Promise<void> };
+		const running = Promise.all([controller.refresh(), controller.refresh(), controller.refresh(), controller.refresh()]);
+		await running;
+		// One pass is running, one follows it; the four callers share them.
+		expect(mounted.calls.snapshots).toBeLessThanOrEqual(2);
+		expect(mounted.calls.snapshots).toBeGreaterThan(0);
+	});
+
+	it("draws the quit confirmation with its promise and its keys, and answers it by key", () => {
+		const lines = new QuitPrompt(createTheme(plainPainter()), () => {}, () => {})
 			.render(60)
 			.map((line) => stripTerminalSequences(line));
 		expect(lines.join("\n")).toContain("Quit?");
