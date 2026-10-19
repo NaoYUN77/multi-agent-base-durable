@@ -65,6 +65,16 @@ const reached = {
 	"created-not-input": (state) => state.child && !state.submitted,
 	"result-not-returned": (state) => state.answered && !state.result,
 	"retry-wait": (state) => state.retryWait,
+	// TASK-005.7 (AC-04). The review decision is its own commit, and a rework is a
+	// round the decision starts, so the three windows a crash can land in are:
+	//
+	//   review-accepted  the accept is committed, before the tool call returned;
+	//   rework-decided   the rejection is committed, and the next round has not been
+	//                    claimed yet — the window between deciding and executing;
+	//   rework-settled   the revision round settled, before the tool call returned.
+	"review-accepted": (state) => state.reviewAccepted,
+	"rework-decided": (state) => state.reviewRejected && !state.roundAdvanced,
+	"rework-settled": (state) => state.reworkSettled,
 };
 
 const matches = reached[boundary];
@@ -126,13 +136,23 @@ function snapshot() {
 		// Each flag is this poll's truth (latched or freshly read), never merely the
 		// previous poll's answer: a flag that lags by one poll would report a round
 		// as unsubmitted after its submission had already committed.
+		const review = value?.reviews?.at(-1);
+		const rounds = value?.rounds ?? [];
 		const state = {
 			claim: value !== undefined && value.activeOpKey !== undefined,
 			child: childSeen || childExists(connection),
 			submitted: submittedSeen || status !== undefined,
 			answered: answeredSeen || status === "done",
 			result: resultSeen || result,
-			retryWait: value?.rounds?.find((entry) => entry.round === round)?.execution?.status === "retry_wait",
+			retryWait: rounds.find((entry) => entry.round === round)?.execution?.status === "retry_wait",
+			// The decision is a delta on the ledger, so its own review list is the
+			// cheapest true signal; the status and the round list say what followed it.
+			reviewAccepted: value?.status === "accepted" && review?.decision === "accept",
+			reviewRejected: review?.decision === "reject",
+			roundAdvanced: rounds.some((entry) => entry.round > round),
+			reworkSettled:
+				review?.decision === "reject" &&
+				rounds.some((entry) => entry.round > round && entry.execution?.status === "completed"),
 		};
 		connection.exec("COMMIT");
 		if (state.child) childSeen = true;

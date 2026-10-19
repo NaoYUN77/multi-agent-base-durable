@@ -74,6 +74,7 @@ import { childQuotaExtension } from "./child.ts";
 import { AgentBatchDoc, BatchIndexDoc, type BatchItemState } from "./documents.ts";
 import { AGENT_TASK_ROUND_TOOL, createAgentTaskRoundTool, type ItemDependencies, type ItemToolOutput } from "./item.ts";
 import { runConfigFingerprint } from "./resources.ts";
+import { reviewTask } from "./review.ts";
 import { lastRoundOf } from "./round.ts";
 
 /** Everything the runtime needs from the process that built it. All of it explicit. */
@@ -132,6 +133,15 @@ export type BatchRuntime = {
 	readonly stopAll: (reason: string, context: Context) => Promise<readonly BatchCancelResult[]>;
 	/** Finish what a crash left mid-stop and report what is outstanding. Idempotent. */
 	readonly reconcile: (context: Context) => Promise<readonly BatchReconciliation[]>;
+	/**
+	 * Review one finished round: accept it or rework it (TASK-005.7).
+	 *
+	 * Wired into the Main extension as its `review` hook. The decision is written
+	 * by `review.ts` in one commit with its receipt; a rework then runs through this
+	 * same runtime's `runTaskBatch`, so it reuses the task's child conversation, its
+	 * ledger and its quota operation.
+	 */
+	readonly review: NonNullable<MainToolHost["review"]>;
 };
 
 /**
@@ -228,6 +238,20 @@ export function createBatchRuntime(options: BatchRuntimeOptions): BatchRuntime {
 		},
 		unacceptedDependencies: (tasks, tx) => unacceptedDependencies(state, tasks, tx),
 		runTaskBatch: async (planRef, taskIds, executionContext) => (await executeBatch(state, planRef, taskIds, executionContext)).results,
+		// The review entry shares this runtime's harness, conversation, model and clock,
+		// and it is handed `runTaskBatch` itself — not a copy of the executor — so a
+		// rework is the same nested-call path an initial dispatch takes.
+		review: async (request) =>
+			await reviewTask(
+				{
+					harness: state.harness,
+					mainConversationId: state.mainConversationId,
+					model: state.model,
+					now: state.now,
+					execute: async (planRef, taskIds, executionContext) => await executeBatch(state, planRef, taskIds, executionContext),
+				},
+				request,
+			),
 		cancelBatch: async (batchId, reason, context) => await stopBatch(cancelDependencies, { batchId, kind: "operator", reason }, context),
 		stopAll: async (reason, context) => await stopAllBatches(state, reason, context),
 		reconcile: async (context) => await reconcileBatches(cancelDependencies, context),

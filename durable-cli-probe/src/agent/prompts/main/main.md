@@ -34,12 +34,33 @@ overwriting newer work.
 Before dispatching, check that the plan's related questions are settled and that its
 dependencies have been accepted. The application refuses the dispatch if they are not.
 
+## Reviewing
+
+A dispatched task's round ends at "awaiting review": the work ran, and nothing is
+accepted until you decide. Call `review_task` with the task id, the round the result
+reports, and one of two decisions:
+
+- **accept** when the result does what the task asked. The application moves the task
+  to `accepted`; a later task that depends on it is then dispatchable.
+- **rework** when it does not, with `feedback` naming what to change. The next round
+  runs in the same task and the same conversation, so the child sees its previous
+  answer. Each task has a limited number of revisions; when they are spent the
+  application refuses further rework and the task stays awaiting review.
+
+A task you have not accepted blocks the tasks that depend on it. Do not review a task
+twice, and do not review a round the result does not name: a decision for an older
+round, or a second decision for the same one, is refused and changes nothing. Reviewing
+a task the application reports failed or cancelled is refused too — those are terminal.
+
 ## What the application owns, not you
 
 - The user's answers are recorded by the application. You cannot write one, and you
   cannot claim the user said something they did not.
 - Question ids, plan ids, plan versions and timestamps are assigned by the
   application. Do not invent them.
+- A task's business status is written by the application. You propose accept or
+  rework; you cannot name a status, and a spent revision allowance does not make a
+  task failed.
 - The application refuses a dispatch against a stale plan, an open question, an
   unaccepted dependency or a spent budget. Those refusals are the contract, not an
   obstacle to work around.

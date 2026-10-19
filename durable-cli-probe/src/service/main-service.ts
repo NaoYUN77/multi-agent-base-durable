@@ -262,6 +262,9 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		throw new Error("main service: either `runtime` or `dispatch` is required; the service never invents an executor");
 	}
 	const unacceptedDependencies = options.unacceptedDependencies ?? options.runtime?.unacceptedDependencies;
+	// Captured once, so the host below is built from a value rather than from a
+	// `!` assertion on an option that was checked in another expression.
+	const runtime = options.runtime;
 
 	/**
 	 * Committed reads go through `handle.commit` rather than `harness.snapshot`.
@@ -643,6 +646,23 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 		else await write(tx);
 	}
 
+	/**
+	 * The management calls whose recorded result is an error.
+	 *
+	 * The review entry asks for this before it decides whether a round already has
+	 * a decision. A rejection whose round never started decided nothing, and the
+	 * only record of that is the receipt: the operation binding alone would make the
+	 * round permanently unreviewable after one transient refusal. A receipt with no
+	 * `result` yet belongs to a call still in flight and is deliberately absent, so
+	 * a live decision can never be unlocked by this.
+	 */
+	async function failedOperationKeys(): Promise<ReadonlySet<string>> {
+		return await handle.commit(async (tx) => {
+			const doc = await tx.doc(MainServiceDoc, conversationId);
+			return new Set(doc.receipts.filter((receipt) => receipt.isError === true && receipt.result !== undefined).map((receipt) => receipt.opKey));
+		}, context);
+	}
+
 	async function readOperation(
 		opKey: string,
 	): Promise<{ readonly result?: string; readonly isError?: boolean; readonly control?: { readonly handoff?: string } } | undefined> {
@@ -776,6 +796,18 @@ export async function openMainService(options: MainServiceOptions): Promise<Main
 			await reconcileQueue();
 			return await restoreServedRequirement(request.messages);
 		},
+		// The review entry is the runtime's, bound to the service's own receipt
+		// writers. A deployment without a runtime has no reviewer, and the tool says
+		// so instead of pretending to decide.
+		...(runtime === undefined
+			? {}
+			: {
+					review: async (request) =>
+						await runtime.review({
+							...request,
+							failedOperations: async () => await failedOperationKeys(),
+						}),
+				}),
 		...(unacceptedDependencies === undefined ? {} : { unacceptedDependencies }),
 		...(options.runtime === undefined ? {} : { batches: options.runtime.batches }),
 		...(options.authorizeDispatch === undefined ? {} : { authorizeDispatch: options.authorizeDispatch }),
