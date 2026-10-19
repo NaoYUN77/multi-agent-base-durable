@@ -13,7 +13,7 @@
 
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, Extension } from "@earendil-works/pi-durable";
-import type { FauxResponseFactory } from "@earendil-works/pi-ai";
+import type { FauxModelDefinition, FauxResponseFactory } from "@earendil-works/pi-ai";
 import type { ClarificationQuestion, UserAnswer } from "../agent/contracts/clarification.ts";
 import type { RunConfig } from "../agent/contracts/run-config.ts";
 import type { RoundExecution } from "../agent/contracts/round-execution.ts";
@@ -177,6 +177,16 @@ export type TuiSnapshot = {
 	readonly openReconciliation: readonly BatchReconciliation[];
 	/** Runs and backoffs of Main's own live tasks, for the header. */
 	readonly mainTasks: readonly { readonly name: string; readonly state: "running" | "ready" | "waiting" | "completing" | "blocked" }[];
+	/**
+	 * The model the durable agent holds and the ones the installed provider
+	 * offers. The current one is a document (`pi.agent`); the catalog is the
+	 * installed provider's own list, which is process state.
+	 */
+	readonly model: {
+		/** Absent when the agent has no model: every request then fails as `no_model`. */
+		readonly current?: { readonly provider: string; readonly modelId: string };
+		readonly available: readonly ModelOption[];
+	};
 };
 
 /** One transcript line of Main's conversation. */
@@ -194,6 +204,26 @@ export type TaskCancelResult = {
 	readonly batchId?: string;
 	/** `unknown-task` means no admitted batch holds the id; nothing was changed. */
 	readonly outcome: "cancelled" | "stopping" | "settled" | "already-terminal" | "unknown-task";
+	readonly detail: string;
+};
+
+/** One model the installed provider offers. Read from that provider's own catalog. */
+export type ModelOption = {
+	readonly provider: string;
+	readonly modelId: string;
+	/** The provider's own display name for it. */
+	readonly name: string;
+	/** The catalog's context window, in tokens. */
+	readonly contextWindow: number;
+};
+
+/** What a model switch did. */
+export type ModelSetResult = {
+	readonly provider: string;
+	readonly modelId: string;
+	/** `unavailable` means the installed provider does not offer it; nothing was written. */
+	readonly outcome: "set" | "unavailable";
+	/** The provider's name for the model when it was set; why it was refused otherwise. */
 	readonly detail: string;
 };
 
@@ -237,6 +267,20 @@ export type AgentSession = {
 	readonly cancelTask: (taskId: string, reason?: string) => Promise<TaskCancelResult>;
 	/** Stop every running batch and abort Main, as `requestCancel` defines it. */
 	readonly cancelAll: (reason?: string) => Promise<{ readonly requested: boolean; readonly reason: string }>;
+	/**
+	 * Set the model the durable agent is configured with.
+	 *
+	 * Durable: Main's next request uses it, and so does the next open. A round
+	 * already in flight keeps the model it started with, because the model is part
+	 * of that run's checkpoint, and a delegated task keeps the model the session
+	 * opened with: a task's conversation is configured when the task is created and
+	 * the model is part of its configuration snapshot, which a later run compares
+	 * against and refuses on a difference rather than run with. Refuses an id the
+	 * installed provider does not offer — the runtime answers such a request by
+	 * failing it as `no_model`, so accepting one would break the session instead of
+	 * changing it.
+	 */
+	readonly setModel: (provider: string, modelId: string) => Promise<ModelSetResult>;
 	/** The context every call runs under. */
 	readonly context: Context;
 	close(): Promise<void>;
@@ -256,6 +300,8 @@ export type AgentSessionOptions = AgentConfig & {
 	readonly databasePath: string;
 	/** Test seam: serve the faux provider from this router instead of a fixed script. */
 	readonly fauxRouter?: FauxResponseFactory;
+	/** Test seam: the faux provider's catalog. A second model gives a switch a destination. */
+	readonly fauxModels?: readonly FauxModelDefinition[];
 	readonly now?: () => number;
 	readonly wait?: (ms: number) => Promise<void>;
 	readonly admissionPollMs?: number;

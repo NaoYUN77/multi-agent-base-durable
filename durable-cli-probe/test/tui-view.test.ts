@@ -49,6 +49,13 @@ function snapshot(rows: readonly TaskRow[], extra: Partial<TuiSnapshot> = {}): T
 		watchedBatches: ["batch-1"],
 		openReconciliation: [],
 		mainTasks: [],
+		model: {
+			current: { provider: "faux", modelId: "faux-1" },
+			available: [
+				{ provider: "faux", modelId: "faux-1", name: "Faux One", contextWindow: 128_000 },
+				{ provider: "faux", modelId: "faux-2", name: "Faux Two", contextWindow: 64_000 },
+			],
+		},
 		...extra,
 	};
 }

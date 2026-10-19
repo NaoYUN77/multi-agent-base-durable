@@ -167,10 +167,10 @@ function grantOf(spec: TaskSpec, policy: TaskAuthorizationPolicy): AuthorizedCap
 }
 
 /** Build the child config with the run's fixed identity/version fields. */
-function configOf(spec: TaskSpec, capabilities: AuthorizedCapabilities): SubAgentConfig {
+function configOf(spec: TaskSpec, capabilities: AuthorizedCapabilities, model: ModelRef = { provider: "faux", modelId: "faux-1" }): SubAgentConfig {
 	return buildSubAgentConfig(spec, {
 		capabilities,
-		model: { provider: "faux", modelId: "faux-1" } satisfies ModelRef,
+		model,
 		runConfig: RUN_CONFIG,
 		contractRevision: 1,
 		requestVersion: 1,
@@ -501,6 +501,21 @@ describe("TASK-005.3 sub-agent factory", () => {
 		const childAgent = await agentOf(factory, created.conversationId);
 		expect(childAgent.instructions).toBe(config.instructions);
 		expect(childAgent.instructions).not.toContain("CHANGED-INSTRUCTIONS-6E0B");
+
+		// ── A different model is the same kind of change ─────────────────────
+		// The model a task was configured with is in this record, so a task found
+		// already configured for another one is refused and keeps the model it was
+		// given. This is why `/model` writes Main's agent configuration and not a
+		// task's: the switch could not reach a task that already exists.
+		const remodelled = configOf(STATS_SPEC, grantOf(STATS_SPEC, policyFor(factory.skills)), { provider: "faux", modelId: "faux-2" });
+		expect(remodelled.snapshot.configHash).not.toBe(config.snapshot.configHash);
+		const remodelledRefusal = await createSubAgent(factory.api(anchor), context, remodelled, { taskId: STATS_TASK, opKey: OP_INITIAL });
+		expect(remodelledRefusal.ok).toBe(false);
+		if (remodelledRefusal.ok) throw new Error("unreachable");
+		expect(remodelledRefusal.failure.code).toBe("config_incompatible");
+		expect(remodelledRefusal.failure.detail).toContain("model");
+		expect(await readSnapshot(factory, STATS_TASK)).toEqual(config.snapshot);
+		expect((await agentOf(factory, created.conversationId)).model).toEqual({ provider: "faux", modelId: "faux-1" });
 	}, 30_000);
 
 	it("creates one conversation per task, reuses it for rework, and refuses without a right (AC-05)", async () => {

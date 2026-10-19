@@ -43,6 +43,15 @@ const RUN_CONFIG = runConfigOf({
 
 const BUDGET = { maxToolInvocations: 3, maxAttempts: 2, maxTechnicalRestarts: 1, timeoutMs: 8_000 };
 
+/**
+ * Two faux models, so a switch has somewhere to go: with a catalog of one, "set
+ * the model" and "did nothing" look the same from the outside.
+ */
+const FAUX_MODELS = [
+	{ id: "faux-1", name: "Faux One", contextWindow: 128_000 },
+	{ id: "faux-2", name: "Faux Two", contextWindow: 64_000 },
+];
+
 const specOf = (id: string, dependencies: readonly string[] = []) => taskSpecOf({ id, skillId: "material-summary", requestedTools: ["text_stats"], budget: BUDGET, dependencies });
 
 function sessionOptions(databasePath: string, router: FauxResponseFactory) {
@@ -103,8 +112,8 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 		await rm(directory, { recursive: true, force: true });
 	});
 
-	async function open(router: FauxResponseFactory): Promise<AgentSession> {
-		const session = await openAgentSession(sessionOptions(databasePath, router));
+	async function open(router: FauxResponseFactory, fauxModels?: typeof FAUX_MODELS): Promise<AgentSession> {
+		const session = await openAgentSession({ ...sessionOptions(databasePath, router), ...(fauxModels === undefined ? {} : { fauxModels }) });
 		opened.push(session);
 		return session;
 	}
@@ -166,6 +175,60 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 		]);
 	});
 
+	it("switches the model in use, and refuses one the provider does not offer", async () => {
+		// The provider records the model each request actually carried, so "the next
+		// request uses it" is read from the request and not from the document that
+		// asked for it.
+		const used: string[] = [];
+		const inner = mainRouter(() => [], textStatsChildRouter("MAT"));
+		const recording: FauxResponseFactory = (request, options, state, model) => {
+			used.push(model.id);
+			return inner(request, options, state, model);
+		};
+		const session = await open(recording, FAUX_MODELS);
+		const first = await passes(session);
+		expect(first.model.current).toEqual({ provider: "faux", modelId: "faux-1" });
+		expect(first.model.available.map((option) => [option.modelId, option.name])).toEqual([
+			["faux-1", "Faux One"],
+			["faux-2", "Faux Two"],
+		]);
+
+		// `/model` alone asks for the list; a named model is switched to, in either
+		// the bare form or the `provider/modelId` form the list itself prints.
+		expect(routeLine("/model", first)).toEqual({ kind: "models" });
+		expect(routeLine("/model faux-2", first)).toEqual({ kind: "set-model", provider: "faux", modelId: "faux-2" });
+		expect(routeLine("/model faux/faux-2", first)).toEqual({ kind: "set-model", provider: "faux", modelId: "faux-2" });
+		expect(routeLine("/model faux/nope", first)).toMatchObject({ kind: "noop" });
+
+		// An id the provider does not offer is refused before anything is written:
+		// the runtime fails every request carrying such a model as `no_model`, so
+		// accepting one would break the session rather than change it.
+		const refused = routeLine("/model gpt-9", first);
+		expect(refused.kind).toBe("noop");
+		expect(refused.kind === "noop" ? refused.notice : "").toContain("faux/faux-1");
+		expect(await session.setModel("faux", "gpt-9")).toMatchObject({ outcome: "unavailable" });
+		expect((await passes(session)).model.current).toEqual({ provider: "faux", modelId: "faux-1" });
+
+		const set = await session.setModel("faux", "faux-2");
+		expect(set).toMatchObject({ outcome: "set", detail: "Faux Two" });
+		expect((await passes(session)).model.current).toEqual({ provider: "faux", modelId: "faux-2" });
+
+		const sent = await session.main.submitUserInput({ text: "run with the second model", requestId: "req-model" });
+		expect(sent.kind).toBe("request");
+		if (sent.kind !== "request") return;
+		await sent.submission.wait(context);
+		// Every request this window carried went to the model it was switched to.
+		expect([...new Set(used)]).toEqual(["faux-2"]);
+
+		// The switch is a document, so a reopen reads it back — the config that opens
+		// the database supplies a model only when the root conversation is created,
+		// and `harness.root()` ignores the agent change once the root exists.
+		await session.close();
+		opened.splice(opened.indexOf(session), 1);
+		const reopened = await open(recording, FAUX_MODELS);
+		expect((await passes(reopened)).model.current).toEqual({ provider: "faux", modelId: "faux-2" });
+	});
+
 	it("sends an answer to the open question with the judgement the line stated", async () => {
 		// Main asks for a blocking detail before it plans anything.
 		const router = mainRouter(
@@ -197,7 +260,7 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 		const named = notice.match(/\/[a-z-]+/g) ?? [];
 		expect(named.length).toBeGreaterThan(0);
 		expect(notice).not.toMatch(/\/$|\/\s/);
-		for (const command of named) expect(["/help", "/tasks", "/transcript", "/quit", "/exit", "/inspect", "/cancel", "/answer", "/withdraw"]).toContain(command);
+		for (const command of named) expect(["/help", "/tasks", "/transcript", "/quit", "/exit", "/inspect", "/cancel", "/answer", "/withdraw", "/model"]).toContain(command);
 
 		// `--insufficient` answers without claiming sufficiency, and the question stays open.
 		const insufficient = routeLine("/answer --insufficient maybe the second one", asking);
@@ -210,6 +273,7 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 			inspectTask: session.inspectTask,
 			cancelTask: session.cancelTask,
 			cancelAll: session.cancelAll,
+			setModel: session.setModel,
 			close: session.close,
 		};
 		const host = { requestRender: () => {}, askQuit: () => {}, dismissQuit: () => {}, leave: () => {} };

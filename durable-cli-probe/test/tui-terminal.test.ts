@@ -68,6 +68,14 @@ function row(taskId: string, status: TaskRow["status"]): TaskRow {
 	return { taskId, batchId: "batch-1", title: `do ${taskId}`, status, statusSource: "ledger", round: 1, startedAt: Date.now() - 5_000, toolInvocations: { used: 1, limit: 3 }, failedToolCalls: { used: 0, limit: 2 }, retrying: false };
 }
 
+const MODELS: TuiSnapshot["model"] = {
+	current: { provider: "faux", modelId: "faux-1" },
+	available: [
+		{ provider: "faux", modelId: "faux-1", name: "Faux One", contextWindow: 128_000 },
+		{ provider: "faux", modelId: "faux-2", name: "Faux Two", contextWindow: 64_000 },
+	],
+};
+
 function snapshot(rows: readonly TaskRow[]): TuiSnapshot {
 	return {
 		takenAt: Date.now(),
@@ -82,10 +90,11 @@ function snapshot(rows: readonly TaskRow[]): TuiSnapshot {
 		watchedBatches: ["batch-1"],
 		openReconciliation: [],
 		mainTasks: [],
+		model: MODELS,
 	};
 }
 
-type Calls = { closed: number; cancelledAll: string[]; cancelled: string[]; failClose?: boolean; failCancelAll?: boolean; snapshots: number; snapshotDelayMs: number };
+type Calls = { closed: number; cancelledAll: string[]; cancelled: string[]; models: [string, string][]; failClose?: boolean; failCancelAll?: boolean; snapshots: number; snapshotDelayMs: number };
 
 /** A session double: every call the controller can make is recorded. */
 function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
@@ -93,6 +102,15 @@ function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
 		throw new Error("not used by the terminal suite");
 	};
 	return {
+		setModel: async (provider, modelId) => {
+			calls.models.push([provider, modelId]);
+			// The service's own rule, mirrored: an id the provider does not offer is
+			// refused, and nothing is written.
+			const option = latest().model.available.find((entry) => entry.provider === provider && entry.modelId === modelId);
+			return option === undefined
+				? { provider, modelId, outcome: "unavailable", detail: "the installed provider does not offer it" }
+				: { provider, modelId, outcome: "set", detail: option.name };
+		},
 		main: {
 			withdrawQueued: async () => ({ withdrawn: false, reason: "not used" }),
 			submitUserInput: async () => ({ kind: "refused", reason: "not used" }),
@@ -143,7 +161,7 @@ function frame(app: ControllerApp, needle = ""): string {
 async function mount(latest: () => TuiSnapshot, animate = false) {
 	const terminal = new FakeTerminal();
 	const tui = new TuiMainScreen(terminal);
-	const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0 };
+	const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], models: [], snapshots: 0, snapshotDelayMs: 0 };
 	const session = fakeSession(latest, calls);
 	let leave: (() => void) | undefined;
 	const left = new Promise<void>((resolve) => {
@@ -278,6 +296,32 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(mounted.controller.view().state.stopping).toBeUndefined();
 	});
 
+	it("lists the model in use and the ones offered, and switches to the one named", async () => {
+		mounted = await mount(() => snapshot([]));
+		await mounted.controller.submit("/model");
+		const panel = frame(mounted.app);
+		expect(panel).toContain("current: faux/faux-1");
+		expect(panel).toContain("faux/faux-2");
+		expect(panel).toContain("Faux Two");
+		// Listing writes nothing.
+		expect(mounted.calls.models).toEqual([]);
+
+		// A line naming no offered model is refused before the service is called: an
+		// id the provider does not offer would fail every later request.
+		await mounted.controller.submit("/model gpt-9");
+		expect(mounted.calls.models).toEqual([]);
+		expect(mounted.controller.view().state.notice).toContain("no model matches gpt-9");
+		expect(mounted.controller.view().state.notice).toContain("faux/faux-1");
+
+		await mounted.controller.submit("/model faux-2");
+		expect(mounted.calls.models).toEqual([["faux", "faux-2"]]);
+		expect(mounted.controller.view().state.notice).toContain("faux/faux-2");
+		// The notice names whose request changes. `/model` writes the Main agent's
+		// configuration; a delegated task is configured with the session's opening
+		// model, which is part of the task's own config snapshot.
+		expect(mounted.controller.view().state.notice).toContain("Main's next request");
+	});
+
 	it("leaves even when closing the session throws", async () => {
 		// The terminal is restored by leave(); a storage failure at close must not
 		// keep the user in raw mode. Nothing is cancelled on the way out either.
@@ -308,7 +352,7 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 	it("survives a redraw that throws", async () => {
 		// The app starts `submit()` without awaiting it. A redraw that throws would
 		// otherwise reject that promise unhandled, which ends the process in Node.
-		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0 };
+		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], models: [], snapshots: 0, snapshotDelayMs: 0 };
 		const controller = new Controller({
 			session: fakeSession(() => snapshot([]), calls),
 			animate: false,
@@ -330,7 +374,7 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		// The app starts `submit()` without awaiting it. A service call that throws
 		// would otherwise reject that promise unhandled, which ends the process with
 		// the terminal still in raw mode and nothing left to restore it.
-		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0, failCancelAll: true };
+		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], models: [], snapshots: 0, snapshotDelayMs: 0, failCancelAll: true };
 		const controller = new Controller({
 			session: fakeSession(() => snapshot([row("t-alpha", "running")]), calls),
 			animate: false,

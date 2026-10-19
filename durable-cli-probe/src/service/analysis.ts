@@ -17,6 +17,11 @@
 //   | task title, acceptance, constraints | `AgentTaskSpecDoc`                          |
 //   | outcome summary                     | `AgentTaskResultDoc`                        |
 //   | Main's live tasks                   | `harness.inspect()`                         |
+//   | the model in use                    | `pi.agent` (the durable agent config)       |
+//
+// One field is not a document: the models the installed provider offers come
+// from that provider's own catalog, which is process state. It is handed in by
+// the composition root rather than read here, so this file stays a reader.
 //
 // All document reads are non-creating `harness.snapshot` calls, so a read pass
 // can never change what it reads. `deriveTaskRow` is pure: the table, the detail
@@ -24,7 +29,7 @@
 // to "what is this task doing".
 
 import type { Context } from "@earendil-works/chord";
-import type { Harness } from "@earendil-works/pi-durable";
+import { AgentDoc, type Harness } from "@earendil-works/pi-durable";
 import { AgentQuotaDoc, type RequestQuotaState } from "../agent/runtime/documents.ts";
 import { readRuntimeTasks, type RuntimeTask } from "../agent/runtime/index.ts";
 import { resultIdOf } from "../agent/runtime/contracts.ts";
@@ -33,7 +38,7 @@ import { AgentTaskResultDoc, AgentTaskSpecDoc } from "../agent/contracts/documen
 import type { RunConfig } from "../agent/contracts/run-config.ts";
 import { TaskLedgerDoc, type TaskLedgerState } from "../multiagent/ledger.ts";
 import type { MainService } from "./main-service.ts";
-import type { TaskDetail, TaskRow, TaskRoundView, TaskRowStatus, TaskStatusSource, TuiSnapshot } from "./types.ts";
+import type { ModelOption, TaskDetail, TaskRow, TaskRoundView, TaskRowStatus, TaskStatusSource, TuiSnapshot } from "./types.ts";
 
 export type AnalysisReaderOptions = {
 	readonly harness: Harness;
@@ -42,6 +47,8 @@ export type AnalysisReaderOptions = {
 	readonly context: Context;
 	readonly runConfig: RunConfig;
 	readonly openReconciliation: TuiSnapshot["openReconciliation"];
+	/** The installed provider's model catalog; process state, not a document. */
+	readonly availableModels: readonly ModelOption[];
 };
 
 export type AnalysisReader = {
@@ -230,10 +237,12 @@ export function createAnalysisReader(options: AnalysisReaderOptions): AnalysisRe
 		const request = await main.readRequest();
 		const queue = await main.readQueue();
 		const status = await main.status();
-		const [tasks, quota, inspection] = await Promise.all([
+		const [tasks, quota, inspection, agent] = await Promise.all([
 			readRuntimeTasks(runtimeRead),
 			quotaFor(request.requestId).catch(() => undefined),
 			harness.inspect(context),
+			// The agent's own document, which is where a model switch is written.
+			harness.snapshot(AgentDoc, mainConversationId as never, context),
 		]);
 		const ledgers = new Map<string, Readonly<TaskLedgerState> | undefined>();
 		const rows: TaskRow[] = [];
@@ -279,6 +288,10 @@ export function createAnalysisReader(options: AnalysisReaderOptions): AnalysisRe
 			watchedBatches: [...batchIds],
 			openReconciliation: options.openReconciliation,
 			mainTasks,
+			model: {
+				...(agent?.model === undefined ? {} : { current: { provider: agent.model.provider, modelId: agent.model.modelId } }),
+				available: options.availableModels,
+			},
 		};
 	};
 

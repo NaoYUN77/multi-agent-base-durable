@@ -887,7 +887,7 @@ npm run agent:tui -- --db data/agent-tui.sqlite --config agent-tui.example.json
 | --- | --- |
 | `--db <path>` (required) | SQLite file. It must be a file, not `:memory:`: the point of the entry is that a closed session can be reopened |
 | `--config <path>` (required) | JSON configuration, see below |
-| `--no-animation` | no spinner. The elapsed clock and every status word still show; use this in recordings and on terminals where a redraw every second is noise |
+| `--no-animation` | no spinner. The elapsed clock and every status word still show; use this in recordings and on terminals where a moving spinner is noise |
 
 Exit codes: `0` the screen closed normally; `1` the session could not open
 (locked file, missing provider key, a failed run); `2` stdin or stdout is not a
@@ -966,6 +966,7 @@ only mirrors the status word, so the frame reads the same with colour stripped.
 | `/cancel all` | stop every batch and abort Main |
 | `/withdraw <id>` | withdraw a queued input by its submission id from the header |
 | `/inspect <id>` | one task: rounds, limits, evidence, failure, the contract's acceptance criteria |
+| `/model [<id>]` | the model in use and the ones the installed provider offers; `<id>` switches to one of them |
 | `/tasks`, `/transcript` | the same facts as a panel |
 | `/quit` or `ctrl+c` | asks first; `y` or `enter` quits, anything else stays |
 
@@ -975,6 +976,26 @@ stopped is `/cancel`.
 `/cancel <id>` is refused rather than guessed: an id in two batches, an id that
 is already finished, and an unknown id each answer with what was found and
 change nothing.
+
+`/model <id>` writes the durable agent configuration of the Main conversation, so
+the choice survives a reopen and Main's next request uses it; a round already in
+flight keeps the model it started with. It changes Main only: a delegated task's
+conversation is configured when the task is created, with the model the session
+opened with (the configuration file's `modelId`, or the provider's default), and that
+model is part of the task's configuration snapshot — a later run compares the
+snapshot and refuses a task whose configuration differs rather than running it
+with the difference. Both spellings are accepted: the bare model id, and the
+`provider/modelId` form the panel prints, so a line copied from the list works.
+A model the installed provider does not offer is refused before anything is
+written: the runtime answers a request carrying an unknown model by failing it as
+`no_model`, and a document that broke every later request would outlive the typo
+that wrote it.
+
+The `modelId` in the configuration file is used only when the database's root
+conversation is created — that is, on the first open of a fresh database. The
+Harness returns an existing root as it is and ignores the agent change, so on
+every later open the model in the document is the one in use, and `/model` shows
+which one that is.
 
 ### Manual checklist (AC-06)
 

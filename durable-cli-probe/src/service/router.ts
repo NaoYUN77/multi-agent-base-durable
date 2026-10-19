@@ -15,8 +15,13 @@
 //   * **A task is named, never guessed.** `/inspect`, `/cancel` and `/withdraw`
 //     take the id the table shows. `/cancel` also accepts a unique prefix; an
 //     ambiguous prefix is refused and the candidates listed.
+//   * **A model is named too, and only one the provider offers.** `/model <id>`
+//     is resolved against the catalog the newest pass read, so a misspelling is
+//     refused here and nothing is written — the runtime answers a request
+//     carrying an unknown model by failing it as `no_model`, which would break
+//     every later request rather than change the one in use.
 
-import type { TuiSnapshot } from "./types.ts";
+import type { ModelOption, TuiSnapshot } from "./types.ts";
 
 export type Route =
 	/** Send as input: an ordinary request, or an answer to `answerTo`. */
@@ -29,6 +34,9 @@ export type Route =
 	| { readonly kind: "cancel-all"; readonly reason: string }
 	| { readonly kind: "withdraw"; readonly submissionId: string }
 	| { readonly kind: "transcript" }
+	/** Show the model in use and the ones the installed provider offers. */
+	| { readonly kind: "models" }
+	| { readonly kind: "set-model"; readonly provider: string; readonly modelId: string }
 	| { readonly kind: "quit" }
 	| { readonly kind: "panel"; readonly title: string; readonly lines: readonly string[] };
 
@@ -41,6 +49,7 @@ export const HELP_LINES: readonly string[] = [
 	"/answer <text>     answer the open question (sufficient)",
 	"/answer --insufficient <text>   reply that is not yet an answer",
 	"/withdraw <id>     withdraw a queued input (its submission id from the header)",
+	"/model [<id>]      the model in use and the ones the provider offers; <id> switches it",
 	"/transcript        the latest conversation lines",
 	"/help              this list",
 	"/quit              leave (ctrl+c asks to confirm first)",
@@ -54,6 +63,21 @@ export function resolveTaskId(argument: string, snapshot: TuiSnapshot | undefine
 	if (matches.length === 1) return { ok: true, taskId: matches[0] as string };
 	if (matches.length === 0) return { ok: false, notice: `no task matches ${argument}${ids.length === 0 ? " (no tasks yet)" : ` (known: ${ids.join(", ")})`}` };
 	return { ok: false, notice: `${argument} is ambiguous: ${matches.join(", ")}` };
+}
+
+/**
+ * Resolve a model argument against the catalog the pass read.
+ *
+ * Both spellings are accepted: the bare `modelId`, and the `provider/modelId`
+ * form the panel prints, so a line copied from the list is a line that works.
+ * Exact only — one provider is installed, and a prefix would have to guess.
+ */
+export function resolveModel(argument: string, available: readonly ModelOption[]): ModelOption | undefined {
+	const slash = argument.indexOf("/");
+	if (slash < 0) return available.find((option) => option.modelId === argument);
+	const provider = argument.slice(0, slash);
+	const modelId = argument.slice(slash + 1);
+	return available.find((option) => option.provider === provider && option.modelId === modelId);
 }
 
 /**
@@ -110,6 +134,17 @@ export function routeLine(line: string, snapshot: TuiSnapshot | undefined): Rout
 		case "/withdraw": {
 			if (rest === "") return { kind: "noop", notice: "/withdraw needs a submission id (shown in the queued line)" };
 			return { kind: "withdraw", submissionId: rest };
+		}
+		case "/model": {
+			if (rest === "") return { kind: "models" };
+			if (snapshot === undefined) return { kind: "noop", notice: "/model needs a finished pass to know which models the provider offers" };
+			const match = resolveModel(rest, snapshot.model.available);
+			if (match !== undefined) return { kind: "set-model", provider: match.provider, modelId: match.modelId };
+			const offered = snapshot.model.available.map((option) => `${option.provider}/${option.modelId}`);
+			return {
+				kind: "noop",
+				notice: `no model matches ${rest}${offered.length === 0 ? " (the installed provider offers none)" : ` (offered: ${offered.join(", ")})`}`,
+			};
 		}
 		default:
 			return { kind: "noop", notice: `unknown command ${command}; /help lists the commands` };

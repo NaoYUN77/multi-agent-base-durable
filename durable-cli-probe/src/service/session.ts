@@ -34,7 +34,7 @@ import { context as backgroundContext, openProbe, openRoot } from "../runtime.ts
 import { openMainService } from "./main-service.ts";
 import { createAnalysisReader } from "./analysis.ts";
 import { startChangeFeed } from "./changes.ts";
-import type { AgentSession, AgentSessionOptions, TranscriptLine, TuiSnapshot } from "./types.ts";
+import type { AgentSession, AgentSessionOptions, ModelOption, TranscriptLine, TuiSnapshot } from "./types.ts";
 /** The bundled skills directory, addressed from the source tree rather than the process cwd. */
 const REPOSITORY_SKILLS = fileURLToPath(new URL("../../skills", import.meta.url));
 
@@ -91,6 +91,7 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 		// for custom endpoints, and nothing here copies, prints or stores it.
 		...(options.apiKeyEnv === undefined ? {} : { apiKey: process.env[options.apiKeyEnv] }),
 		...(options.fauxRouter === undefined ? {} : { fauxRouter: options.fauxRouter }),
+		...(options.fauxModels === undefined ? {} : { fauxModels: options.fauxModels }),
 		...(options.extraMainExtensions === undefined ? {} : { extensions: options.extraMainExtensions }),
 		// Installed, never selected on Main: a child is granted these per task.
 		registryExtensions: [ChildTools],
@@ -132,6 +133,15 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 		const conversation = await runtime.harness.conversation(root.id, context);
 		if (conversation === undefined) throw new Error("main service: the Main conversation vanished while the session opened");
 		const mainConversationId = root.id;
+		// The models this session can offer: the installed provider's own catalog.
+		// One provider is installed per session, so this is the whole list, and its
+		// ids are exactly what a request is resolved against at run time.
+		const availableModels: readonly ModelOption[] = runtime.models.getModels(runtime.modelRef.provider).map((model) => ({
+			provider: runtime.modelRef.provider,
+			modelId: model.id,
+			name: model.name,
+			contextWindow: model.contextWindow,
+		}));
 		const analysis = createAnalysisReader({
 			harness: runtime.harness,
 			main,
@@ -139,6 +149,7 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 			context,
 			runConfig: options.runConfig,
 			openReconciliation: main.openReconciliation,
+			availableModels,
 		});
 
 		// Watches are acquired from what a pass read: the runtime's own documents
@@ -194,6 +205,17 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 			cancelTask: async (taskId, reason) => await main.cancelTask(taskId, reason),
 			inspectTask: async (taskId, clock) => await analysis.inspectTask(taskId, clock),
 			cancelAll: async (reason) => await main.requestCancel(reason),
+			setModel: async (provider, modelId) => {
+				// The same resolution the runtime makes at request time. An id that
+				// misses here is one every later request would fail as `no_model`, so
+				// it is refused instead of written.
+				const model = runtime.models.getModel(provider, modelId);
+				if (model === undefined) {
+					return { provider, modelId, outcome: "unavailable", detail: `the installed provider does not offer ${provider}/${modelId}` };
+				}
+				await conversation.configure({ model: { provider, modelId } }, context);
+				return { provider, modelId, outcome: "set", detail: model.name };
+			},
 			close: async () => {
 				stopped = true;
 				listeners.clear();

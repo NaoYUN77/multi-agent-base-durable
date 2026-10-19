@@ -37,7 +37,10 @@ export type ControllerHost = {
 };
 
 /** The part of the session the controller uses. */
-export type ControllerSession = Pick<AgentSession, "main" | "snapshot" | "watch" | "transcript" | "inspectTask" | "cancelTask" | "cancelAll" | "close">;
+export type ControllerSession = Pick<
+	AgentSession,
+	"main" | "snapshot" | "watch" | "transcript" | "inspectTask" | "cancelTask" | "cancelAll" | "setModel" | "close"
+>;
 
 export type ControllerOptions = {
 	readonly session: ControllerSession;
@@ -222,6 +225,22 @@ export class Controller {
 			case "cancel-all":
 				await this.cancelAll(route.reason);
 				return;
+			case "models":
+				this.panel("models", modelLines(this.state.snapshot?.model));
+				return;
+			case "set-model": {
+				const result = await this.session.setModel(route.provider, route.modelId);
+				this.notice(
+					result.outcome === "set"
+						// Main's own next request, deliberately: a task's conversation is
+						// configured at creation with the model this session opened with, and
+						// that model is part of the task's configuration snapshot.
+						? `model set to ${result.provider}/${result.modelId} (${result.detail}); Main's next request uses it`
+						: `model not changed: ${result.detail}`,
+				);
+				await this.refresh();
+				return;
+			}
 			case "withdraw": {
 				const outcome = await this.session.main.withdrawQueued(route.submissionId);
 				this.notice(outcome.withdrawn ? `withdrew ${route.submissionId}` : `not withdrawn: ${outcome.reason}`);
@@ -338,6 +357,26 @@ export class Controller {
 		}
 		this.render();
 	}
+}
+
+/**
+ * The `/model` panel: what is in use, and what the installed provider offers.
+ *
+ * Every line is a line that works as an argument, in the `provider/modelId`
+ * spelling the router accepts, so it can be copied straight back in.
+ */
+function modelLines(model: TuiSnapshot["model"] | undefined): readonly string[] {
+	if (model === undefined) return ["no pass has finished yet"];
+	const current = model.current === undefined ? "none configured" : `${model.current.provider}/${model.current.modelId}`;
+	if (model.available.length === 0) return [`current: ${current}`, "the installed provider offers no models"];
+	return [
+		`current: ${current}`,
+		`offered by the installed provider (${model.available.length}):`,
+		...model.available.map((option) => {
+			const inUse = option.provider === model.current?.provider && option.modelId === model.current?.modelId;
+			return `${inUse ? "*" : " "} ${option.provider}/${option.modelId}  ${option.name}  ${Math.round(option.contextWindow / 1000)}k context`;
+		}),
+	];
 }
 
 function rowLine(row: TaskRow): string {
