@@ -68,12 +68,12 @@ export async function prepare(argv: readonly string[], io: EntryIo): Promise<{ r
  */
 export async function runScreen(session: AgentSession, animate: boolean): Promise<number> {
 	const { ProcessTerminal, TuiMainScreen, getTerminalColorMode } = await import("@earendil-works/pi-tui");
-	const { ControllerApp } = await import("./app.ts");
+	const { mountApp } = await import("./app.ts");
 	const { ansiPainter, createTheme } = await import("./theme.ts");
 	const theme = createTheme(ansiPainter(getTerminalColorMode()));
 	const terminal = new ProcessTerminal();
 	const tui = new TuiMainScreen(terminal, false);
-	let app: InstanceType<typeof ControllerApp> | undefined;
+	let app: ReturnType<typeof mountApp> | undefined;
 	let exiting: ((code: number) => void) | undefined;
 	// One way out, whatever the reason: a confirmed quit, a failed pass, or a
 	// rejected start. The terminal must be restored on every path, or a thrown
@@ -105,9 +105,7 @@ export async function runScreen(session: AgentSession, animate: boolean): Promis
 	const done = new Promise<number>((resolve) => {
 		exiting = resolve;
 	});
-	app = new ControllerApp({ controller, tui, theme });
-	tui.addChild(app);
-	tui.setFocus(app.editor());
+	app = mountApp(tui, controller, theme);
 	try {
 		tui.start();
 		await controller.start();

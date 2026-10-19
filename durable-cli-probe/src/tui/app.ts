@@ -135,6 +135,24 @@ export class ControllerApp implements Component {
 	}
 }
 
+/**
+ * Mount the frame and its editor on a TUI, in that order.
+ *
+ * The editor must be a *child*, not merely the focused component. pi-tui renders
+ * its children and routes input to whatever is focused, and the two are separate
+ * lists: an editor that is focused but unmounted takes every keystroke and draws
+ * none of them, so a submitted line appears only after `enter`. Both the real
+ * entry and the terminal suite go through here, because they had drifted once and
+ * the drift was exactly this omission.
+ */
+export function mountApp(tui: TUI, controller: Controller, theme: Theme): ControllerApp {
+	const app = new ControllerApp({ controller, tui, theme });
+	tui.addChild(app);
+	tui.addChild(app.editor());
+	tui.setFocus(app.editor());
+	return app;
+}
+
 /** The confirmation overlay: two choices, each bound to its keys. */
 export class QuitPrompt implements Component {
 	private readonly theme: Theme;

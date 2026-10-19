@@ -18,7 +18,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { stripTerminalSequences, TuiMainScreen, type Terminal } from "@earendil-works/pi-tui";
 import type { AgentSession, TaskRow, TuiSnapshot } from "../src/service/types.ts";
-import { ControllerApp, QuitPrompt } from "../src/tui/app.ts";
+import { type ControllerApp, mountApp, QuitPrompt } from "../src/tui/app.ts";
 import { Controller } from "../src/tui/controller.ts";
 import { createTheme, plainPainter } from "../src/tui/theme.ts";
 
@@ -164,9 +164,9 @@ async function mount(latest: () => TuiSnapshot, animate = false) {
 			},
 		},
 	});
-	app = new ControllerApp({ controller, tui, theme: createTheme(plainPainter()) });
-	tui.addChild(app);
-	tui.setFocus(app.editor());
+	// The same mount the real entry uses, so the editor this suite drives is the
+	// editor `runScreen` draws.
+	app = mountApp(tui, controller, createTheme(plainPainter()));
 	tui.start();
 	await controller.start();
 	// The first pass arrives through the change feed after the screen started;
@@ -197,6 +197,26 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(text).toContain("main › started");
 		expect(text).toContain("2 active");
 		expect(text).toContain("ctrl+c quits");
+	});
+
+	it("draws what is being typed, before it is sent", async () => {
+		// The editor has to be a child of the TUI, not merely the focused component:
+		// pi-tui renders its children and routes input to whatever is focused, and an
+		// editor that was only focused took every keystroke while drawing none of
+		// them, so a line became visible only after `enter` had already sent it.
+		mounted = await mount(() => snapshot([]), false);
+		const editor = mounted.app.editor();
+		expect(mounted.tui.getFocusedComponent()).toBe(editor);
+		mounted.terminal.written = "";
+		for (const key of ["z", "z", "q", "x"]) mounted.terminal.type(key);
+		await settle();
+		mounted.tui.renderNow(true);
+		await settle();
+		expect(editor.getText()).toBe("zzqx");
+		expect(stripTerminalSequences(mounted.terminal.written)).toContain("zzqx");
+		// Nothing was sent: the line is still in the editor, and no notice was posted.
+		expect(mounted.controller.view().state.notice).toBeUndefined();
+		expect(mounted.calls.snapshots).toBeGreaterThan(0);
 	});
 
 	it("ctrl+c asks first; n keeps the session open; y closes it once and leaves", async () => {
