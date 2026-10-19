@@ -20,6 +20,10 @@
 //     refused here and nothing is written — the runtime answers a request
 //     carrying an unknown model by failing it as `no_model`, which would break
 //     every later request rather than change the one in use.
+//   * **One command table, two readers.** `SLASH_COMMANDS` is what `/help`
+//     prints and what the editor completes while a line is typed, so a command
+//     that can be completed is a command this switch knows, and a command this
+//     switch knows is never missing from the list.
 
 import type { ModelOption, TuiSnapshot } from "./types.ts";
 
@@ -43,22 +47,72 @@ export type Route =
 	| { readonly kind: "quit" }
 	| { readonly kind: "panel"; readonly title: string; readonly lines: readonly string[] };
 
+/**
+ * One slash command, as the help panel lists it and the editor completes it.
+ *
+ * `usage` is the canonical spelling including the slash and any argument,
+ * because that is what a reader copies. `variants` are further spellings listed
+ * by `/help` under the same command; `aliases` are accepted names that are not
+ * worth a line of their own. Completion offers every `name` and `alias`, never
+ * a `usage` with an argument in it.
+ */
+export type SlashCommand = {
+	/** The canonical name, without the leading slash. */
+	readonly name: string;
+	/** The canonical full spelling, e.g. `/model [<id>]`. */
+	readonly usage: string;
+	readonly description: string;
+	/** Further full spellings, listed by `/help` under the same command. */
+	readonly variants?: readonly string[];
+	/** Other names `routeLine` accepts for this command. */
+	readonly aliases?: readonly string[];
+};
+
+/**
+ * Every command `routeLine` knows, in the order `/help` prints them.
+ *
+ * The switch below and this table are two views of one list: a command added
+ * here without a case falls through to "unknown command", and a case added
+ * without an entry is a command nobody can discover or complete.
+ */
+export const SLASH_COMMANDS: readonly SlashCommand[] = [
+	{ name: "tasks", usage: "/tasks", description: "list tasks with their status words" },
+	{ name: "inspect", usage: "/inspect <id>", description: "one task: rounds, limits, evidence count, failure" },
+	{ name: "cancel", usage: "/cancel <id>", description: "stop one task's batch (the rest of Main keeps running)", variants: ["/cancel all"] },
+	{ name: "answer", usage: "/answer <text>", description: "answer the open question (sufficient)", variants: ["/answer --insufficient <text>"] },
+	{ name: "withdraw", usage: "/withdraw <id>", description: "withdraw a queued input (its submission id from the header)" },
+	{ name: "model", usage: "/model [<id>]", description: "the model in use and the ones the provider offers; <id> switches it" },
+	{ name: "mcp", usage: "/mcp", description: "list configured MCP servers and their live connection state", variants: ["/mcp connect <name>", "/mcp disconnect <name>"] },
+	{ name: "transcript", usage: "/transcript", description: "the latest conversation lines" },
+	{ name: "help", usage: "/help", description: "this list" },
+	{ name: "quit", usage: "/quit", description: "leave (ctrl+c asks to confirm first)", aliases: ["exit"] },
+];
+
+/** The column the help descriptions start at; a longer usage gets one space instead. */
+const HELP_COLUMN = 19;
+
+/** The completion list's label for a command: its spelling up to the first argument. */
+export function commandLabel(command: SlashCommand): string {
+	const space = command.usage.search(/\s/);
+	return space < 0 ? command.usage : command.usage.slice(0, space);
+}
+
+function helpLine(usage: string, description: string): string {
+	return usage.length >= HELP_COLUMN ? `${usage} ${description}` : usage.padEnd(HELP_COLUMN) + description;
+}
+
+/**
+ * The `/help` panel: one line per spelling, description aligned.
+ *
+ * Derived from {@link SLASH_COMMANDS} rather than written twice, so the panel
+ * and the editor's completion cannot disagree about what exists.
+ */
 export const HELP_LINES: readonly string[] = [
-	"enter              send the line as input (queued if Main is busy; refused if a question is open)",
-	"/tasks             list tasks with their status words",
-	"/inspect <id>      one task: rounds, limits, evidence count, failure",
-	"/cancel <id>       stop one task's batch (the rest of Main keeps running)",
-	"/cancel all        stop every batch and cancel the request",
-	"/answer <text>     answer the open question (sufficient)",
-	"/answer --insufficient <text>   reply that is not yet an answer",
-	"/withdraw <id>     withdraw a queued input (its submission id from the header)",
-	"/model [<id>]      the model in use and the ones the provider offers; <id> switches it",
-	"/mcp               list configured MCP servers and their live connection state",
-	"/mcp connect <name> connect one configured MCP server",
-	"/mcp disconnect <name> disconnect it (a later tool call may reconnect)",
-	"/transcript        the latest conversation lines",
-	"/help              this list",
-	"/quit              leave (ctrl+c asks to confirm first)",
+	helpLine("enter", "send the line as input (queued if Main is busy; refused if a question is open)"),
+	...SLASH_COMMANDS.flatMap((command) => [
+		helpLine(command.usage, command.description),
+		...(command.variants ?? []).map((usage) => helpLine(usage, command.description)),
+	]),
 ];
 
 /** Resolve a task id argument: exact first, then a unique prefix. */

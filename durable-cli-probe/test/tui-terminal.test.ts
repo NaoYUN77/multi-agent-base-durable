@@ -309,6 +309,58 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(mounted.calls.snapshots).toBeGreaterThan(0);
 	});
 
+	it("opens the command list as soon as a slash is typed, and narrows it per letter", async () => {
+		// The completion is installed on the editor `runScreen` mounts, so this is
+		// the same path a user takes: type `/`, then `m`, and read the drawn list
+		// back from the terminal. Each read starts from an empty stream, so a line
+		// of the previous frame cannot answer for the current one.
+		mounted = await mount(() => snapshot([]), false);
+		const screen = mounted;
+		const redraw = async (): Promise<string> => {
+			screen.terminal.written = "";
+			screen.tui.renderNow(true);
+			await settle();
+			return stripTerminalSequences(screen.terminal.written);
+		};
+
+		mounted.terminal.type("/");
+		await settle();
+		let drawn = await redraw();
+		// The list is drawn under the editor, five visible at a time with a count.
+		expect(drawn).toContain("/tasks");
+		expect(drawn).toContain("(1/");
+
+		mounted.terminal.type("m");
+		await settle();
+		drawn = await redraw();
+		expect(drawn).toContain("/model");
+		expect(drawn).toContain("model in use");
+		expect(drawn).toContain("/mcp");
+		expect(drawn).not.toContain("/tasks");
+
+		mounted.terminal.type("o");
+		await settle();
+		drawn = await redraw();
+		expect(drawn).toContain("/model");
+		expect(drawn).not.toContain("/mcp");
+
+		// Tab takes the selected command and leaves a space for its argument; the
+		// same keystroke then lists the models the pass read, and takes one.
+		mounted.terminal.type("\t");
+		await settle();
+		expect(mounted.app.editor().getText()).toBe("/model ");
+		mounted.terminal.type("\t");
+		await settle();
+		drawn = await redraw();
+		expect(drawn).toContain("faux/faux-1");
+		expect(drawn).toContain("Faux Two");
+		mounted.terminal.type("\t");
+		await settle();
+		expect(mounted.app.editor().getText()).toBe("/model faux/faux-1");
+		// Nothing was sent by completing: the line is still in the editor.
+		expect(mounted.controller.view().state.notice).toBeUndefined();
+	});
+
 	it("ctrl+c asks first; n keeps the session open; y closes it once and leaves", async () => {
 		mounted = await mount(() => snapshot([row("t-alpha", "running")]), false);
 		const app = mounted.app;

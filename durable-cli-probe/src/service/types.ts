@@ -239,6 +239,12 @@ export type AgentConfig = {
 	readonly maxConcurrentSubAgents: number;
 	readonly maxSubAgentsPerRequest: number;
 	readonly runConfig: RunConfig;
+	/**
+	 * The faux provider's catalog, so `/model` has more than one name to offer.
+	 * Accepted only for `provider: "faux"`; every other provider has its own
+	 * fixed catalog. An id here is also a legal `modelId`.
+	 */
+	readonly models?: readonly FauxModelDefinition[];
 };
 
 /**

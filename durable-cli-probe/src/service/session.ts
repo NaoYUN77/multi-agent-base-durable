@@ -113,7 +113,13 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 		// for custom endpoints, and nothing here copies, prints or stores it.
 		...(options.apiKeyEnv === undefined ? {} : { apiKey: process.env[options.apiKeyEnv] }),
 		...(options.fauxRouter === undefined ? {} : { fauxRouter: options.fauxRouter }),
-		...(options.fauxModels === undefined ? {} : { fauxModels: options.fauxModels }),
+		// The test seam wins over the configuration file's catalog: a suite that
+		// names its own models must not depend on what a fixture declares.
+		...(options.fauxModels === undefined
+			? options.models === undefined
+				? {}
+				: { fauxModels: options.models }
+			: { fauxModels: options.fauxModels }),
 		extensions: mainExtensions,
 		// Installed, never selected on Main: a child is granted these per task.
 		registryExtensions: [ChildTools],

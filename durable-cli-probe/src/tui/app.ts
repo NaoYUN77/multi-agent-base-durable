@@ -14,6 +14,7 @@
 
 import { type Component, Editor, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { renderView } from "../service/view.ts";
+import { createAutocompleteProvider } from "./autocomplete.ts";
 import type { Controller } from "./controller.ts";
 import type { Theme } from "./theme.ts";
 
@@ -32,6 +33,12 @@ export type ControllerAppOptions = {
 	readonly controller: Controller;
 	readonly tui: TUI;
 	readonly theme: Theme;
+	/**
+	 * The configured MCP server names, for `/mcp connect|disconnect` completion.
+	 * Read live rather than captured: a server list is a connection fact, and the
+	 * manager's status is the only place that holds it.
+	 */
+	readonly mcpServers: () => readonly string[];
 };
 
 export class ControllerApp implements Component {
@@ -51,6 +58,14 @@ export class ControllerApp implements Component {
 		this.tui = options.tui;
 		this.theme = options.theme;
 		this.input = new Editor(this.tui, options.theme.editor, { paddingX: 1, autocompleteMaxVisible: 5 });
+		// Typing `/` opens the command list, and each further letter narrows it;
+		// past the command name the same list completes the argument it takes.
+		this.input.setAutocompleteProvider(
+			createAutocompleteProvider({
+				snapshot: () => this.controller.view().state.snapshot,
+				mcpServers: () => options.mcpServers(),
+			}),
+		);
 		this.input.onSubmit = (text: string) => {
 			this.input.setText("");
 			void this.controller.submit(text);
@@ -153,8 +168,8 @@ export class ControllerApp implements Component {
  * entry and the terminal suite go through here, because they had drifted once and
  * the drift was exactly this omission.
  */
-export function mountApp(tui: TUI, controller: Controller, theme: Theme): ControllerApp {
-	const app = new ControllerApp({ controller, tui, theme });
+export function mountApp(tui: TUI, controller: Controller, theme: Theme, mcpServers: () => readonly string[] = () => []): ControllerApp {
+	const app = new ControllerApp({ controller, tui, theme, mcpServers });
 	tui.addChild(app);
 	tui.addChild(app.editor());
 	tui.setFocus(app.editor());

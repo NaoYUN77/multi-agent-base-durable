@@ -18,6 +18,7 @@
 
 import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import type { FauxModelDefinition } from "@earendil-works/pi-ai";
 import { validateRunConfig, type RunConfig } from "../agent/contracts/run-config.ts";
 import type { AgentConfig } from "./types.ts";
 
@@ -113,7 +114,11 @@ const KNOWN_FIELDS: readonly string[] = [
 	"maxConcurrentSubAgents",
 	"maxSubAgentsPerRequest",
 	"runConfig",
+	"models",
 ];
+
+/** Keys of one `models` entry. A faux catalog is a name and a few limits, nothing else. */
+const KNOWN_MODEL_FIELDS: readonly string[] = ["id", "name", "reasoning", "input", "contextWindow", "maxTokens"];
 
 const PROVIDERS = new Set(["faux", "deepseek", "openai", "custom"]);
 
@@ -191,6 +196,60 @@ export function parseAgentConfig(raw: unknown, where = "config"): ConfigResult<A
 		errors.push(`${where}: baseUrl is only used by provider custom`);
 	}
 
+	// The faux provider's catalog. It is what `/model` lists and what a model
+	// switch resolves against, so an entry here is validated as strictly as the
+	// rest of the file: a misspelled limit would otherwise be silently defaulted.
+	const models: FauxModelDefinition[] = [];
+	if (source.models !== undefined) {
+		if (provider !== "faux") errors.push(`${where}: models is only used by provider faux; every other provider has its own catalog`);
+		else if (!Array.isArray(source.models) || source.models.length === 0) errors.push(`${where}: models must be a non-empty array`);
+		else {
+			const seen = new Set<string>();
+			source.models.forEach((entry: unknown, index: number) => {
+				const at = `${where}: models[${index}]`;
+				if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+					errors.push(`${at} must be an object`);
+					return;
+				}
+				const model = entry as Record<string, unknown>;
+				for (const key of Object.keys(model)) {
+					if (!KNOWN_MODEL_FIELDS.includes(key)) errors.push(`${at}: unknown field \`${key}\` (known: ${KNOWN_MODEL_FIELDS.join(", ")})`);
+				}
+				if (typeof model.id !== "string" || model.id.trim() === "") errors.push(`${at}: id must be a non-empty string`);
+				else if (seen.has(model.id)) errors.push(`${at}: id ${model.id} appears more than once`);
+				else seen.add(model.id);
+				if (model.name !== undefined && (typeof model.name !== "string" || model.name.trim() === "")) errors.push(`${at}: name must be a non-empty string`);
+				if (model.reasoning !== undefined && typeof model.reasoning !== "boolean") errors.push(`${at}: reasoning must be a boolean`);
+				if (model.input !== undefined) {
+					const input = model.input;
+					if (!Array.isArray(input) || input.some((kind) => kind !== "text" && kind !== "image")) errors.push(`${at}: input must be an array of "text" and/or "image"`);
+				}
+				for (const key of ["contextWindow", "maxTokens"] as const) {
+					const value = model[key];
+					if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value <= 0)) errors.push(`${at}: ${key} must be a positive integer`);
+				}
+				if (typeof model.id === "string" && model.id.trim() !== "") {
+					models.push({
+						id: model.id,
+						...(typeof model.name === "string" ? { name: model.name } : {}),
+						...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
+						...(Array.isArray(model.input) ? { input: model.input as ("text" | "image")[] } : {}),
+						...(typeof model.contextWindow === "number" ? { contextWindow: model.contextWindow } : {}),
+						...(typeof model.maxTokens === "number" ? { maxTokens: model.maxTokens } : {}),
+					});
+				}
+			});
+			// The model a fresh database's root conversation is configured with. The
+			// provider defaults to its own id, which this catalog may not contain, so
+			// an omitted `modelId` means the catalog's first entry — the same rule the
+			// provider applies to its own default.
+			if (modelId !== undefined && !seen.has(modelId)) {
+				errors.push(`${where}: modelId ${modelId} is not in models (${[...seen].join(", ")})`);
+			}
+		}
+	}
+	const effectiveModelId = modelId ?? models[0]?.id;
+
 	let runConfig: RunConfig | undefined;
 	if (source.runConfig === undefined) {
 		errors.push(`${where}: runConfig is required: every limit is explicit, and this file supplies none by default`);
@@ -211,13 +270,14 @@ export function parseAgentConfig(raw: unknown, where = "config"): ConfigResult<A
 		ok: true,
 		value: {
 			provider: provider as AgentConfig["provider"],
-			...(modelId === undefined ? {} : { modelId }),
+			...(effectiveModelId === undefined ? {} : { modelId: effectiveModelId }),
 			...(baseUrl === undefined ? {} : { baseUrl }),
 			...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
 			...(databasePath === undefined ? {} : { databasePath }),
 			maxConcurrentSubAgents: maxConcurrentSubAgents ?? runConfig.maxConcurrentSubAgents,
 			maxSubAgentsPerRequest: maxSubAgentsPerRequest ?? runConfig.maxSubAgentsPerRequest,
 			runConfig,
+			...(models.length === 0 ? {} : { models }),
 		},
 	};
 }

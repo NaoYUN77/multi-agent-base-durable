@@ -906,9 +906,22 @@ storage state and reports it there.
 ```json
 {
 	"provider": "faux",
+	"models": [
+		{ "id": "faux-1", "name": "Faux One", "contextWindow": 128000 },
+		{ "id": "faux-2", "name": "Faux Two", "contextWindow": 64000 }
+	],
 	"runConfig": { "schemaVersion": 1, "maxConcurrentSubAgents": 2, "maxSubAgentsPerRequest": 4, "...": "as in agent-tui.example.json" }
 }
 ```
+
+`models` is the faux provider's catalog, and it is what `/model` lists. It is
+accepted only for `provider: "faux"`; a real provider has its own fixed catalog,
+and the file cannot replace it. Every entry needs an `id`; `name`,
+`contextWindow` and `maxTokens` are optional and default in the provider. The
+first entry is the model a fresh database's root conversation is configured
+with, so `modelId` may be omitted — and if it is given, it has to name one of
+the entries. Without `models`, the provider installs its own single default
+model, which is why the shipped example declares three.
 
 `runConfig` is required and is validated as a whole; a value the runtime would
 not honour (for example `harnessRetry.maxRetries` other than `0`) is refused at
@@ -955,7 +968,16 @@ only mirrors the status word, so the frame reads the same with colour stripped.
 
 ### Commands
 
-`/help` lists them. The ones that change something:
+`/help` lists them. Typing `/` opens a completion list of every command with its
+description; each further letter narrows it (`/m` offers `/model` and `/mcp`,
+`/mod` offers only `/model`). `tab` or `enter` takes the selected one, and the
+same list then completes the argument the command takes: the offered models for
+`/model`, the task ids for `/inspect` and `/cancel`, the queued submission ids
+for `/withdraw`, and the configured server names for `/mcp connect|disconnect`.
+Completions are values the command accepts — the list is the router's own table,
+so nothing offered is then refused as unknown.
+
+The ones that change something:
 
 | command | effect |
 | --- | --- |
@@ -966,7 +988,7 @@ only mirrors the status word, so the frame reads the same with colour stripped.
 | `/cancel all` | stop every batch and abort Main |
 | `/withdraw <id>` | withdraw a queued input by its submission id from the header |
 | `/inspect <id>` | one task: rounds, limits, evidence, failure, the contract's acceptance criteria |
-| `/model [<id>]` | the model in use and the ones the installed provider offers; `<id>` switches to one of them |
+| `/model [<id>]` | the model in use and every model the installed provider offers, each with its name and context window; `<id>` switches to one of them |
 | `/mcp` | configured MCP servers: live connection state, transport, sanitized target, tool and resource counts |
 | `/mcp connect <name>` | connect one configured server and read its advertised catalog |
 | `/mcp disconnect <name>` | disconnect one server; a later model tool call can reconnect on demand |

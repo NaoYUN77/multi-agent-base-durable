@@ -1,5 +1,10 @@
 {
 	"provider": "faux",
+	"models": [
+		{ "id": "faux-1", "name": "Faux One", "contextWindow": 128000, "maxTokens": 16384 },
+		{ "id": "faux-2", "name": "Faux Two", "contextWindow": 64000, "maxTokens": 8192 },
+		{ "id": "faux-3", "name": "Faux Three", "contextWindow": 32000, "maxTokens": 4096 }
+	],
 	"runConfig": {
 		"schemaVersion": 1,
 		"maxConcurrentSubAgents": 2,

@@ -108,7 +108,7 @@ export async function runScreen(session: AgentSession, animate: boolean): Promis
 	const done = new Promise<number>((resolve) => {
 		exiting = resolve;
 	});
-	app = mountApp(tui, controller, theme);
+	app = mountApp(tui, controller, theme, () => session.mcpStatus().map((server) => server.name));
 	try {
 		tui.start();
 		await controller.start();

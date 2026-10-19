@@ -133,6 +133,41 @@ describe("TASK-005.5 entry configuration", () => {
 		expect(parsed.ok).toBe(true);
 		if (parsed.ok) expect(parsed.value.runConfig).toEqual(runConfigOf(RUN_CONFIG));
 	});
+
+	it("accepts a faux catalog, so /model has more than one name to offer", () => {
+		const parsed = parseAgentConfig({
+			...FAUX_CONFIG,
+			models: [
+				{ id: "faux-1", name: "Faux One", contextWindow: 128_000 },
+				{ id: "faux-2", name: "Faux Two", contextWindow: 64_000, maxTokens: 8_192 },
+			],
+		});
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.value.models?.map((model) => model.id)).toEqual(["faux-1", "faux-2"]);
+		// The first entry is the model a fresh database's root is configured with,
+		// so the file need not repeat it as `modelId`.
+		expect(parsed.value.modelId).toBe("faux-1");
+	});
+
+	it("refuses a catalog the provider could not honour", () => {
+		const errors = (raw: Record<string, unknown>): string => {
+			const parsed = parseAgentConfig({ ...FAUX_CONFIG, ...raw });
+			expect(parsed.ok).toBe(false);
+			return parsed.ok ? "" : parsed.errors.join("\n");
+		};
+		expect(errors({ models: [] })).toContain("non-empty array");
+		expect(errors({ models: [{ id: "a" }, { id: "a" }] })).toContain("appears more than once");
+		expect(errors({ models: [{ name: "no id" }] })).toContain("id must be a non-empty string");
+		expect(errors({ models: [{ id: "a", contextWindow: 0 }] })).toContain("contextWindow must be a positive integer");
+		expect(errors({ models: [{ id: "a", contxtWindow: 1 }] })).toContain("unknown field `contxtWindow`");
+		// A model named as the one to open with must be one the catalog offers.
+		expect(errors({ models: [{ id: "a" }], modelId: "b" })).toContain("is not in models");
+		// Another provider's catalog is its own; the file cannot replace it.
+		const custom = parseAgentConfig({ provider: "custom", baseUrl: "https://example.invalid/v1", apiKeyEnv: "HOME", modelId: "m", runConfig: RUN_CONFIG, models: [{ id: "a" }] });
+		expect(custom.ok).toBe(false);
+		if (!custom.ok) expect(custom.errors.join("\n")).toContain("models is only used by provider faux");
+	});
 });
 
 describe("TASK-005.5 entry order", { timeout: 60_000 }, () => {
