@@ -180,6 +180,9 @@ async function mount(latest: () => TuiSnapshot, animate = false) {
 describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 	let mounted: Awaited<ReturnType<typeof mount>> | undefined;
 	afterEach(() => {
+		// An animated mount runs a frame timer. Leaving it running would tick a
+		// stopped screen for the rest of the suite.
+		mounted?.app.dispose();
 		mounted?.tui.stop();
 		mounted = undefined;
 	});
@@ -376,6 +379,27 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		prompt.handleInput("\x04");
 		prompt.handleInput("\r");
 		expect(answers).toEqual(["yes", "no", "no", "no", "no", "yes"]);
+	});
+
+	it("advances the spinner while nothing else changes", async () => {
+		// The spinner runs on the app's own clock, because a pass only happens when
+		// a document changed. That clock ticked once a second and took every second
+		// tick, so a frame advanced every two seconds — a full turn in twenty, which
+		// reads as a stuck frame rather than a spinner.
+		mounted = await mount(() => snapshot([row("t-alpha", "running")]), true);
+		const app = mounted.app;
+		const glyph = (): string => {
+			const status = stripTerminalSequences(frame(app)).split("\n").at(-1) ?? "";
+			return status.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)?.[0] ?? "";
+		};
+		const seen = new Set<string>();
+		const deadline = Date.now() + 1_000;
+		while (Date.now() < deadline && seen.size < 2) {
+			seen.add(glyph());
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		// A frame every 80 ms gives twelve in a second; the old clock gave none.
+		expect(seen.size).toBeGreaterThan(1);
 	});
 
 	it("under --no-animation the spinner is static and the elapsed clock still shows", async () => {

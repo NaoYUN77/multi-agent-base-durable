@@ -17,8 +17,16 @@ import { renderView } from "../service/view.ts";
 import type { Controller } from "./controller.ts";
 import type { Theme } from "./theme.ts";
 
-/** How often the spinner advances. */
-export const TICK_MS = 1000;
+/**
+ * How often the spinner advances.
+ *
+ * pi-tui's own loader takes a frame every 80 ms, so a turn takes 800 ms. This
+ * clock ticked once a second and took every second tick, which advanced a frame
+ * every two seconds: a turn in twenty, slow enough to read as a stuck frame
+ * rather than a spinner. Every tick re-renders, but pi-tui writes only the lines
+ * that changed, so a turn costs the two lines the spinner sits on.
+ */
+export const SPINNER_MS = 80;
 
 export type ControllerAppOptions = {
 	readonly controller: Controller;
@@ -60,7 +68,7 @@ export class ControllerApp implements Component {
 			this.timer = setInterval(() => {
 				this.ticks += 1;
 				this.controller.tick();
-			}, TICK_MS);
+			}, SPINNER_MS);
 			// Node keeps the process alive for a timer; the session's work must not be
 			// outlived by a redraw clock.
 			this.timer.unref?.();
@@ -125,7 +133,7 @@ export class ControllerApp implements Component {
 		// while a long round writes nothing.
 		const view = this.controller.view();
 		return renderView(
-			{ state: view.state, now: view.now, width: Math.max(20, width), height: rows, animate: view.animate, frame: Math.floor(this.ticks / 2), transcript: view.transcript },
+			{ state: view.state, now: view.now, width: Math.max(20, width), height: rows, animate: view.animate, frame: this.ticks, transcript: view.transcript },
 			this.theme,
 		);
 	}
