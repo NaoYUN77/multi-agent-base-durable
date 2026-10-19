@@ -1,0 +1,17 @@
+{
+	"mcpServers": {
+		"local": {
+			"command": "node",
+			"args": ["${MCP_SERVER_SCRIPT}"],
+			"env": {
+				"SERVICE_TOKEN": "${MCP_SERVICE_TOKEN}"
+			}
+		},
+		"remote": {
+			"url": "https://example.invalid/mcp",
+			"headers": {
+				"Authorization": "Bearer ${MCP_HTTP_TOKEN}"
+			}
+		}
+	}
+}

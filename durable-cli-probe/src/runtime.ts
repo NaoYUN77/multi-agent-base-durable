@@ -29,6 +29,7 @@ import {
 	fauxAssistantMessage,
 	fauxProvider,
 	fauxToolCall,
+	type FauxModelDefinition,
 	type FauxProviderHandle,
 	type FauxResponseFactory,
 	type Model,
@@ -68,6 +69,12 @@ export interface ProbeOptions {
 	readonly modelId?: string;
 	/** Faux answers, in order, used only when `provider` is `faux`. */
 	readonly fauxResponses?: readonly string[];
+	/**
+	 * The faux provider's model catalog, used only when `provider` is `faux`.
+	 * Defaults to the provider's own single model. A catalog of more than one is
+	 * what lets a model switch be observed at all.
+	 */
+	readonly fauxModels?: readonly FauxModelDefinition[];
 	/**
 	 * TASK-002: faux turns that call a tool, used only when `provider` is `faux`.
 	 * Each entry is one assistant turn of tool calls; the faux provider emits them
@@ -217,7 +224,9 @@ async function buildModels(
 	const provider = options.provider ?? "faux";
 	const models = createModels();
 	if (provider === "faux") {
-		const faux = fauxProvider();
+		// The catalog is the provider's own; an empty list falls back to its default,
+		// so a caller that passes nothing gets the same single model as before.
+		const faux = fauxProvider(options.fauxModels === undefined ? {} : { models: [...options.fauxModels] });
 		models.setProvider(faux.provider);
 		// Tool-call turns first, then text turns. A real turn order is "call the
 		// tools, then answer", and the Harness settles the submission on the first

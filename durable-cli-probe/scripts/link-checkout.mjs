@@ -31,6 +31,9 @@ const packages = [
 	{ dir: "packages/chord", name: "@earendil-works/chord" },
 	{ dir: "packages/ai", name: "@earendil-works/pi-ai" },
 	{ dir: "packages/durable", name: "@earendil-works/pi-durable" },
+	{ dir: "packages/tui", name: "@earendil-works/pi-tui" },
+	// MCP client and the stdio / Streamable HTTP transports.
+	{ dir: "packages/mcp", name: "@earendil-works/pi-mcp" },
 ];
 
 async function exists(path) {

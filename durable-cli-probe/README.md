@@ -785,8 +785,8 @@ npm run pi:prepare -- --clean
 | 2 | prepare the checkout at the pinned commit | `git rev-parse HEAD` equals the pin; a dirty or mismatched checkout is a hard failure, never a silent rewrite |
 | 3 | `npm ci --ignore-scripts` (upstream, then app) | installs from the lockfiles, no lifecycle scripts |
 | 4 | hydrate the generated model data from the pinned catalog revision | `packages/ai` can compile at all (see below) |
-| 5 | `packages/chord` → `packages/telemetry` → `packages/ai` (`build:offline`) → `packages/durable` | the `dist/*.d.ts` the app's typecheck resolves |
-| 6 | `scripts/link-checkout.mjs` (unchanged from TASK-001) | the three names are symlinks into the checkout, one identity per package |
+| 5 | `packages/chord` → `packages/telemetry` → `packages/ai` (`build:offline`) → `packages/durable` → `packages/tui` → `packages/mcp` | the `dist/*.d.ts` the app's typecheck resolves |
+| 6 | `scripts/link-checkout.mjs` | the five names are symlinks into the checkout, one identity per package |
 | 7 | verification | SHA, package name, symlink target, and the existence of the built declarations |
 
 **Why step 4 exists — the minimal chain alone does not build on a fresh clone.**
@@ -801,9 +801,8 @@ data locally and in CI. Only that gitignored, generated directory is replaced.
 
 `packages/telemetry` is in the chain for the same class of reason: `packages/ai/src/types.ts`
 imports `@earendil-works/pi-telemetry`. The chain is the topological order of the workspace
-dependency closure of the three linked packages; the other nine workspaces (`tui`, `codemode`,
-`mcp`, `env`, `agent`, `protocol`, `client`, `server`, `coding-agent`) are outside it and are not
-built.
+dependency closure of the five linked packages; the other seven workspaces (`codemode`,
+`env`, `agent`, `protocol`, `client`, `server`, `coding-agent`) are outside it and are not built.
 
 Two things the script deliberately does **not** do: the upstream `npm run check` (it runs
 `biome check --write`, which rewrites files) and the upstream full `build` / `generate-models` (no
@@ -866,4 +865,257 @@ npm download cache keyed on the pinned Pi commit plus the app lockfile hash, and
 | `spawnSync`/`execSync` fail with `EBUSY` while `spawn` works | some Windows hosts refuse synchronous child-process creation to processes started from a node script | nothing to do: `prepare.mjs` uses async `spawn` on purpose |
 | `npm warn EBADENGINE ... @earendil-works/gondolin@0.12.0 requires node >=23.6.0` | the upstream workspace contains a package that wants a newer Node than the pinned 22.22.2 | informational only; the four packages in the chain build and typecheck on 22.22.2 |
 | `dist/index.d.ts is missing` during verification | the build step did not run or failed silently | re-run `npm run pi:prepare -- --clean` and read the build output |
+
+---
+
+## 19. TASK-005.5 — the terminal entry
+
+`npm run agent:tui` opens the agent session in the terminal: one frame above
+one editor. The frame is the newest read pass over the durable documents, the
+conversation tail, and a status line; the editor sends a line to Main or runs a
+command. Closing the window never cancels work; it pauses at the last durable
+point and the next open replays it.
+
+### Command
+
+```bash
+npm run agent:tui -- --db data/agent-tui.sqlite --config agent-tui.example.json
+```
+
+| argument | meaning |
+| --- | --- |
+| `--db <path>` (required) | SQLite file. It must be a file, not `:memory:`: the point of the entry is that a closed session can be reopened |
+| `--config <path>` (required) | JSON configuration, see below |
+| `--mcp-config <path>` | standalone MCP server file; defaults to optional `./mcp.json` in the working directory |
+| `--no-animation` | no spinner. The elapsed clock and every status word still show; use this in recordings and on terminals where a moving spinner is noise |
+
+Exit codes: `0` the screen closed normally; `1` the session could not open
+(locked file, missing provider key, a failed run); `2` stdin or stdout is not a
+TTY (a pipe gets a refusal, not a frame of escape sequences); `3` a bad argument
+or a configuration that was refused. Codes 2 and 3 are decided before the
+database is touched. A session that cannot open (code 1) may still have created
+the database file.
+
+The terminal is restored on every way out: a confirmed quit, a failed start, and
+a session whose close throws. A storage failure at close is not reported on
+screen (the screen is what is being torn down); the next open meets the same
+storage state and reports it there.
+
+### Configuration
+
+```json
+{
+	"provider": "faux",
+	"models": [
+		{ "id": "faux-1", "name": "Faux One", "contextWindow": 128000 },
+		{ "id": "faux-2", "name": "Faux Two", "contextWindow": 64000 }
+	],
+	"runConfig": { "schemaVersion": 1, "maxConcurrentSubAgents": 2, "maxSubAgentsPerRequest": 4, "...": "as in agent-tui.example.json" }
+}
+```
+
+`models` is the faux provider's catalog, and it is what `/model` lists. It is
+accepted only for `provider: "faux"`; a real provider has its own fixed catalog,
+and the file cannot replace it. Every entry needs an `id`; `name`,
+`contextWindow` and `maxTokens` are optional and default in the provider. The
+first entry is the model a fresh database's root conversation is configured
+with, so `modelId` may be omitted — and if it is given, it has to name one of
+the entries. Without `models`, the provider installs its own single default
+model, which is why the shipped example declares three.
+
+`runConfig` is required and is validated as a whole; a value the runtime would
+not honour (for example `harnessRetry.maxRetries` other than `0`) is refused at
+startup. A real provider is configured like the CLI's (`provider`, `modelId`,
+`baseUrl` for `custom`), with one rule for the key:
+
+* the file never holds a key. It names the environment variable that does,
+  `"apiKeyEnv": "DEEPSEEK_API_KEY"`, and startup refuses if that variable is not
+  set;
+* a field name that looks like a credential (`apiKey`, `token`, `secret`,
+  `password`, and the like) is refused by name. The message never repeats the
+  value.
+
+An unknown field is refused too, so a typo cannot silently configure nothing.
+
+### What the frame shows
+
+Above the editor, top to bottom:
+
+* **header.** `main busy` or `main idle` with Main's live tasks, the request id
+  and version, an open question when there is one, queued inputs, and how many
+  batches have settled;
+* **conversation.** the newest lines of Main's conversation, `you ›` and
+  `main ›`;
+* **tasks.** one row per task of every admitted batch: the task id (what
+  `/inspect` and `/cancel` take) followed by the saved task name, status word,
+  round, tool invocations used over the limit, failed tool calls, elapsed time;
+* **panel.** the answer to the last command (`/help`, `/tasks`, `/inspect`, ...);
+* **notice.** the outcome of the last input (sent, queued, answered, refused),
+  and a stop that was asked for until its receipt lands;
+* **status line.** how many tasks are active, how many questions are open, and
+  the keys.
+
+The rows are derived, never estimated. A status word is the ledger's business
+status when the task has a ledger, otherwise the item's receipt, otherwise the
+runtime's own state (a live slot is `running`, a queue place is `queued`, an
+admitted item with neither is `planned`). A row that never started shows no
+elapsed time, and nothing shows a percentage, because no document counts steps.
+A finished task usually reads `awaiting review`: that is the durable lifecycle's
+fixed point, and nothing in this entry accepts on its behalf.
+
+The spinner is the only thing that changes when nothing has happened. Colour
+only mirrors the status word, so the frame reads the same with colour stripped.
+
+### Commands
+
+`/help` lists them. Typing `/` opens a completion list of every command with its
+description; each further letter narrows it (`/m` offers `/model` and `/mcp`,
+`/mod` offers only `/model`). `tab` or `enter` takes the selected one, and the
+same list then completes the argument the command takes: the offered models for
+`/model`, the task ids for `/inspect` and `/cancel`, the queued submission ids
+for `/withdraw`, and the configured server names for `/mcp connect|disconnect`.
+Completions are values the command accepts — the list is the router's own table,
+so nothing offered is then refused as unknown.
+
+The ones that change something:
+
+| command | effect |
+| --- | --- |
+| `enter` | send the line as input. Queued if Main is busy; refused while a question is open |
+| `/answer <text>` | answer the open question, marked sufficient |
+| `/answer --insufficient <text>` | reply that is not yet an answer |
+| `/cancel <id>` | stop one task's batch. The rest of Main keeps running; the task id may be a unique prefix |
+| `/cancel all` | stop every batch and abort Main |
+| `/withdraw <id>` | withdraw a queued input by its submission id from the header |
+| `/inspect <id>` | one task: rounds, limits, evidence, failure, the contract's acceptance criteria |
+| `/model [<id>]` | the model in use and every model the installed provider offers, each with its name and context window; `<id>` switches to one of them |
+| `/mcp` | configured MCP servers: live connection state, transport, sanitized target, tool and resource counts |
+| `/mcp connect <name>` | connect one configured server and read its advertised catalog |
+| `/mcp disconnect <name>` | disconnect one server; a later model tool call can reconnect on demand |
+| `/tasks`, `/transcript` | the same facts as a panel |
+| `/quit` or `ctrl+c` | asks first; `y` or `enter` quits, anything else stays |
+
+Ctrl+C never cancels tasks. The confirmation says so, and the only way work is
+stopped is `/cancel`.
+
+`/cancel <id>` is refused rather than guessed: an id in two batches, an id that
+is already finished, and an unknown id each answer with what was found and
+change nothing.
+
+`/model <id>` writes the durable agent configuration of the Main conversation, so
+the choice survives a reopen and Main's next request uses it; a round already in
+flight keeps the model it started with. It changes Main only: a delegated task's
+conversation is configured when the task is created, with the model the session
+opened with (the configuration file's `modelId`, or the provider's default), and that
+model is part of the task's configuration snapshot — a later run compares the
+snapshot and refuses a task whose configuration differs rather than running it
+with the difference. Both spellings are accepted: the bare model id, and the
+`provider/modelId` form the panel prints, so a line copied from the list works.
+A model the installed provider does not offer is refused before anything is
+written: the runtime answers a request carrying an unknown model by failing it as
+`no_model`, and a document that broke every later request would outlive the typo
+that wrote it.
+
+The `modelId` in the configuration file is used only when the database's root
+conversation is created — that is, on the first open of a fresh database. The
+Harness returns an existing root as it is and ignores the agent change, so on
+every later open the model in the document is the one in use, and `/model` shows
+which one that is.
+
+### MCP servers
+
+MCP configuration lives in a standalone `mcp.json`, separate from the provider
+and run limits file. The session reads `./mcp.json` from the working directory
+when present; an absent default means no servers. `--mcp-config <path>` selects
+a different file and requires it to exist. Invalid MCP configuration stops the
+session from opening. The local `mcp.json` is ignored by Git; start from
+[`mcp.example.json`](mcp.example.json), set its referenced environment variables,
+and remove any server you do not need.
+
+```json
+{
+  "mcpServers": {
+    "local": { "command": "node", "args": ["${MCP_SERVER_SCRIPT}"] },
+    "remote": {
+      "url": "https://example.invalid/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_HTTP_TOKEN}" }
+    }
+  }
+}
+```
+
+A `command` entry uses stdio and accepts `args`, `env`, and `cwd`. Its working
+directory defaults to the configuration file's directory; a relative `cwd` is
+resolved from that directory too. A `url` entry
+uses Streamable HTTP and accepts `headers`; legacy SSE endpoints are unsupported.
+`${VAR}` references expand from the environment in these fields. An unset
+variable is an error. Keep credentials in environment variables. Server names
+use lowercase letters, digits, `_` and `-`, start with a letter or digit, and
+have at most 64 characters.
+
+`/mcp` reads current process state. It lists all configured servers, including
+idle and failed ones. `/mcp connect local` initializes a connection;
+`/mcp disconnect local` closes it. The panel omits raw errors, instructions,
+resource URIs, arguments, headers and environment values. Targets contain only
+the command basename or the HTTP origin/path, without user info or query values.
+Connections close with the session and reconnect on demand after a reopen.
+
+Main and delegated tasks can use configured servers. Each server exposes one
+stable model tool, such as `mcp__local`. Calling it with
+`{"action":"list"}` returns the server's tool catalog and input schemas;
+`{"action":"call","tool":"echo","arguments":{"text":"hello"}}`
+invokes one of those tools. Names longer than 59 characters use
+`mcp___<first 32 hex characters of the server name's SHA-256>` to keep the tool
+name within the model API limit. A server's advertised catalog can change
+without changing its durable tool registration.
+
+Delegated task authorization is per server: use `"skillId":"mcp-work"` and
+`"requestedTools":["mcp__local"]` in the task contract to grant that server's
+list/call interface. Granting a server grants access to the tools it advertises,
+so configure servers with the permissions appropriate to the task. MCP calls
+use unsafe replay semantics: an interrupted call surfaces as interrupted and is
+not automatically retried, because the remote operation may already have run.
+
+A conversation is bound to the MCP configuration it was opened with. Opening a
+database that has unfinished work under a *changed* configuration is refused,
+because a call the previous run had already committed would otherwise reach a
+different server than the one it was written for. Restore the previous
+configuration and reopen, or finish and cancel the outstanding work first. An
+idle database accepts a changed configuration, and a database from before this
+check existed is treated the same way. The recorded identity hashes dispatcher
+names and destination versions only — never a URL argument, a header or a
+credential, so rotating a token is not a configuration change.
+
+### Manual checklist (AC-06)
+
+The suites below drive the screen over a fake terminal; these cannot be proven
+by one and are checked by hand in Windows Terminal:
+
+1. `npm run agent:tui -- --db data/manual.sqlite --config agent-tui.example.json`
+   starts, draws the frame with the editor on the last line, and the cursor
+   stays in the editor.
+2. Type a line and press enter: the request appears in the conversation and the
+   header turns `main busy`, then `main idle`.
+3. `ctrl+c` shows the confirmation without moving the frame; `n` keeps the
+   session, the cursor and the typed text intact.
+4. Send a long input and `ctrl+c`, then `y`: the screen restores, the shell
+   prompt returns on a clean line, and keystrokes typed after exit are not
+   echoed twice.
+5. Reopen with the same `--db`: the header shows `reopened: reconciled ...`
+   when a batch was in flight, and the conversation continues.
+6. Resize the window narrower and wider: every line stays inside the width and
+   nothing wraps into the editor.
+7. `npm run agent:tui -- --db data/manual.sqlite --config agent-tui.example.json --no-animation`
+   draws no spinner, and the elapsed column still counts.
+8. Pipe the command (`npm run agent:tui ... | cat`) and check the exit code is
+   `2` with the refusal on stderr.
+
+### Tests
+
+| suite | proves |
+| --- | --- |
+| `test/tui-config.test.ts` | argument parsing, the exit codes, and that a refused configuration never echoes a credential and never creates the database |
+| `test/tui-state.test.ts` | the real session over the faux provider: derived statuses, `/answer` reaching Main with its sufficiency, `/cancel` proven by the receipt, close-mid-run then reopen finishing |
+| `test/tui-terminal.test.ts` | the real app over a recorded terminal: the frame, `ctrl+c` then `n` / `y`, `/cancel all`, the quit overlay's keys, `--no-animation`, leaving when the session's close throws, and one follow-up pass for a burst of notifications |
+| `test/tui-view.test.ts` | the frame's rules: every status word and tone, colour changes no column, column-accurate fitting with CJK text, no invented numbers |
 

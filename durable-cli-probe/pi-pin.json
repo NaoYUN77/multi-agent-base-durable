@@ -5,15 +5,19 @@
 	"packages": [
 		{ "name": "@earendil-works/chord", "dir": "packages/chord" },
 		{ "name": "@earendil-works/pi-ai", "dir": "packages/ai" },
-		{ "name": "@earendil-works/pi-durable", "dir": "packages/durable" }
+		{ "name": "@earendil-works/pi-durable", "dir": "packages/durable" },
+		{ "name": "@earendil-works/pi-tui", "dir": "packages/tui" },
+		{ "name": "@earendil-works/pi-mcp", "dir": "packages/mcp" }
 	],
 	"build": [
 		{ "dir": "packages/chord", "script": "build" },
 		{ "dir": "packages/telemetry", "script": "build" },
 		{ "dir": "packages/ai", "script": "build:offline" },
-		{ "dir": "packages/durable", "script": "build" }
+		{ "dir": "packages/durable", "script": "build" },
+		{ "dir": "packages/tui", "script": "build" },
+		{ "dir": "packages/mcp", "script": "build" }
 	],
-	"buildNote": "Topological order of the workspace dependency closure of the three linked packages. pi-ai depends on pi-telemetry (src/types.ts imports @earendil-works/pi-telemetry), pi-durable depends on chord and pi-ai. The other nine workspaces (tui, codemode, mcp, env, agent, protocol, client, server, coding-agent) are outside that closure and are not built.",
+	"buildNote": "Topological order of the workspace dependency closure of the five linked packages. pi-ai depends on pi-telemetry (src/types.ts imports @earendil-works/pi-telemetry), pi-durable depends on chord and pi-ai. pi-tui and pi-mcp have no workspace dependencies of their own. The other seven workspaces (codemode, env, agent, protocol, client, server, coding-agent) are outside that closure and are not built.",
 	"modelCatalog": {
 		"endpoint": "https://pi.dev/api/models/revisions/{revision}?types=chat,image,classifier",
 		"revisionSource": "nix/model-catalog.json inside the pinned checkout",

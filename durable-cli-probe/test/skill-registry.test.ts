@@ -58,10 +58,10 @@ describe("TASK-005.3 skill registry", () => {
 		await rm(directory, { recursive: true, force: true });
 	});
 
-	it("loads the two shipped skills with their manifest facts and content hash", async () => {
+	it("loads the shipped skills with their manifest facts and content hash", async () => {
 		const registry = await loadSkillRegistry({ root: REPOSITORY_SKILLS });
 		const ids = registry.list().map((skill) => skill.manifest.id);
-		expect(ids).toEqual(["material-summary", "text-stats"]);
+		expect(ids).toEqual(["material-summary", "mcp-work", "text-stats"]);
 
 		const stats = skillOf(registry, "text-stats");
 		expect(stats.manifest.version).toBe("1.0.0");
@@ -74,6 +74,11 @@ describe("TASK-005.3 skill registry", () => {
 		const summary = skillOf(registry, "material-summary");
 		expect(summary.manifest.requiredTools).toEqual([]);
 		expect(summary.hash).toMatch(/^[0-9a-f]{64}$/);
+
+		const mcp = skillOf(registry, "mcp-work");
+		expect(mcp.manifest.requiredTools).toEqual([]);
+		expect(mcp.instructions).toContain("explicitly granted");
+		expect(mcp.hash).toBe(hashInstructions(mcp.instructions));
 	});
 
 	it("hashes the instructions content, not the directory name", async () => {
