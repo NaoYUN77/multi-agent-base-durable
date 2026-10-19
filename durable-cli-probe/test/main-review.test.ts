@@ -367,12 +367,18 @@ describe("TASK-005.7 review — accept, rework and one winner per round (AC-01, 
 		const system = await openBatchSystem({
 			databasePath,
 			router: mainRouter(
-				scriptOf([specBody(TASK_A)], [TASK_A], [
+				scriptOf([specBody(TASK_A), specBody(TASK_B)], [TASK_A, TASK_B], [
+					// Turn 2 ends the first drive, so the second one starts at turn 3.
+					[],
 					[{ name: "review_task", arguments: { taskId: TASK_A, round: 1, decision: "accept" } }],
-					// A second accept of the same round, from a different call.
+					// A second accept of the same round, from a different call. The task is
+					// already terminal, so this is refused as a terminal review — the
+					// non-terminal "already has a decision" path is the concurrent case below.
 					[{ name: "review_task", arguments: { taskId: TASK_A, round: 1, decision: "accept" } }],
-					// An accept aimed at a round the task has already left.
-					[{ name: "review_task", arguments: { taskId: TASK_A, round: 0, decision: "accept" } }],
+					// B's round 1 is reviewed, which starts round 2. A review aimed at round 1
+					// then names a round the task has left, while round 2 is undecided.
+					[{ name: "review_task", arguments: { taskId: TASK_B, round: 1, decision: "rework", feedback: FEEDBACK_ONE } }],
+					[{ name: "review_task", arguments: { taskId: TASK_B, round: 1, decision: "accept" } }],
 				]),
 				reviewingChild(flats),
 			),
@@ -380,17 +386,31 @@ describe("TASK-005.7 review — accept, rework and one winner per round (AC-01, 
 		});
 		try {
 			await driveMain(system, INPUT);
+			await driveMain(system, "review what came back", "req-review");
 
-			const ledger = await readLedger(system, TASK_A);
-			// One decision, one transition. The refused calls changed nothing.
-			expect(ledger?.status).toBe("accepted");
-			expect(ledger?.reviews).toHaveLength(1);
-			expect(ledger?.operations.filter((operation) => operation.kind === "review")).toHaveLength(1);
-			expect(ledger?.events.filter((event) => event.to === "accepted")).toHaveLength(1);
+			const accepted = await readLedger(system, TASK_A);
+			// One decision, one transition. The duplicate changed nothing.
+			expect(accepted?.status).toBe("accepted");
+			expect(accepted?.reviews).toHaveLength(1);
+			expect(accepted?.operations.filter((operation) => operation.kind === "review")).toHaveLength(1);
+			expect(accepted?.events.filter((event) => event.to === "accepted")).toHaveLength(1);
+
+			// B moved to round 2 by the rework; the stale review wrote no second decision.
+			const reworked = await readLedger(system, TASK_B);
+			expect(reworked?.status).toBe("awaiting_review");
+			expect(reworked?.currentRound).toBe(2);
+			expect(reworked?.rounds.map((round) => round.round)).toEqual([1, 2]);
+			expect(reworked?.reviews).toHaveLength(1);
+			expect(reworked?.reviews[0]?.round).toBe(1);
+			expect(reworked?.operations.filter((operation) => operation.kind === "review")).toHaveLength(1);
 
 			const receipts = await reviewReceipts(system);
-			expect(receipts.filter((receipt) => receipt.isError !== true)).toHaveLength(1);
+			// The accept and the rework landed; the duplicate accept and the stale round did not.
+			expect(receipts.filter((receipt) => receipt.isError !== true)).toHaveLength(2);
 			expect(receipts.filter((receipt) => receipt.isError === true)).toHaveLength(2);
+			// Each refusal names its own reason, so the two cases are not one path twice.
+			expect(receipts.some((receipt) => receipt.result?.includes("review_task_terminal"))).toBe(true);
+			expect(receipts.some((receipt) => receipt.result?.includes("review_stale_round"))).toBe(true);
 		} finally {
 			await system.runtime.close();
 		}
@@ -440,18 +460,42 @@ describe("TASK-005.7 review — accept, rework and one winner per round (AC-01, 
 
 	it("refuses a review of a failed or cancelled task and writes no terminal state (AC-03)", async () => {
 		const flats: string[] = [];
+		// Two drivers: the first settles both tasks at `awaiting_review` so the
+		// ledgers carry a dispatched round, the second issues the reviews.
+		let reviewing = false;
+		let reviewed = false;
+		const script = (flat: string): MainStep => {
+			if (!flat.includes(`saved plan ${PLAN_ID}`)) {
+				return [{ name: "save_plan", arguments: { planId: PLAN_ID, goals: ["run and review"], taskIds: [TASK_A, TASK_B] } }];
+			}
+			if (!flat.includes(`dispatched plan ${PLAN_ID}`)) {
+				return [{ name: "dispatch_tasks", arguments: { planId: PLAN_ID, version: 1, tasks: [specBody(TASK_A), specBody(TASK_B)] } }];
+			}
+			if (!reviewing || reviewed) return [];
+			reviewed = true;
+			return [
+				{ name: "review_task", arguments: { taskId: TASK_A, round: 1, decision: "accept" } },
+				{ name: "review_task", arguments: { taskId: TASK_B, round: 1, decision: "accept" } },
+			];
+		};
 		const system = await openBatchSystem({
 			databasePath,
-			router: mainRouter(
-				scriptOf([specBody(TASK_A), specBody(TASK_B)], [TASK_A, TASK_B], [
-					[{ name: "review_task", arguments: { taskId: TASK_A, round: 1, decision: "accept" } }],
-					[{ name: "review_task", arguments: { taskId: TASK_B, round: 1, decision: "accept" } }],
-				]),
-				reviewingChild(flats),
-			),
+			router: transcriptRouter(script, reviewingChild(flats)),
 			runConfig: configOf({}),
 		});
 		try {
+			await driveMain(system, INPUT);
+
+			// The tasks really ran: a ledger seeded before dispatch would have `createdAt`
+			// 0 and no round, and a review of it would be refused as an unknown task
+			// rather than as a terminal one — testing the wrong refusal.
+			for (const taskId of [TASK_A, TASK_B]) {
+				const settled = await readLedger(system, taskId);
+				expect(settled?.status).toBe("awaiting_review");
+				expect(settled?.rounds).toHaveLength(1);
+				expect(settled?.createdAt).not.toBe(0);
+			}
+
 			// `failed` and `cancelled` are states only Main can reach, and no production
 			// path sets `failed` yet. They are written here directly so the review tool
 			// is tested against the states it must refuse rather than against a proxy.
@@ -462,7 +506,8 @@ describe("TASK-005.7 review — accept, rework and one winner per round (AC-01, 
 				recordTransition(cancelled, "cancelled", 1_700_000_000_000, { reason: "test-fixture" });
 			}, context);
 
-			await driveMain(system, INPUT);
+			reviewing = true;
+			await driveMain(system, "review what came back", "req-review");
 
 			for (const [taskId, status] of [
 				[TASK_A, "failed"],
@@ -479,6 +524,8 @@ describe("TASK-005.7 review — accept, rework and one winner per round (AC-01, 
 			const receipts = await reviewReceipts(system);
 			expect(receipts).toHaveLength(2);
 			expect(receipts.every((receipt) => receipt.isError === true)).toBe(true);
+			// Refused because they are terminal, not because the task was unknown.
+			expect(receipts.every((receipt) => receipt.result?.includes("review_task_terminal"))).toBe(true);
 		} finally {
 			await system.runtime.close();
 		}

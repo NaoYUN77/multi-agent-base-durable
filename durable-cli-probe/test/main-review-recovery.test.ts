@@ -3,6 +3,9 @@
 // AC-04 — a process killed around a review decision reopens into the same
 // decision, and never decides or executes twice:
 //
+//   review-pending   killed after the round settled at `awaiting_review` and
+//                    before the review committed: the reopen decides once, and
+//                    the round is not executed again;
 //   review-accepted  killed after the accept committed, before the tool call
 //                    returned: the reopen finds `accepted`, one review, and does
 //                    not accept a second time;
@@ -94,7 +97,11 @@ function documentValue(databasePath: string, kind: string, key: string): unknown
 type LedgerOnDisk = {
 	readonly status: string;
 	readonly currentRound: number;
-	readonly rounds: readonly { readonly round: number; readonly kind: string }[];
+	readonly rounds: readonly {
+		readonly round: number;
+		readonly kind: string;
+		readonly execution?: { readonly status: string };
+	}[];
 	readonly reviews: readonly { readonly round: number; readonly decision: string; readonly reason?: string }[];
 	readonly operations: readonly { readonly kind: string; readonly round: number; readonly decision?: string }[];
 };
@@ -155,7 +162,7 @@ async function reviewReceipts(system: BatchSystem) {
 async function waitForSettled(system: BatchSystem, boundary: ReviewBoundary): Promise<void> {
 	await waitUntil(async () => {
 		const ledger = await readLedger(system, TASK);
-		if (boundary === "review-accepted") return ledger?.status === "accepted";
+		if (boundary === "review-accepted" || boundary === "review-pending") return ledger?.status === "accepted";
 		const revision = ledger?.rounds.find((round) => round.round === 2);
 		return revision?.execution?.status === "completed" || revision?.execution?.status === "failed";
 	}, `the reopened process never settled the ${boundary} decision`);
@@ -190,6 +197,14 @@ describe("TASK-005.7 review recovery — a killed process reopens into one decis
 		const before = ledgerOnDisk(databasePath);
 		expect(before).toBeDefined();
 		switch (boundary) {
+			case "review-pending":
+				// The round settled and nobody has decided: this is the state the
+				// review commit is about to change.
+				expect(before?.status).toBe("awaiting_review");
+				expect(before?.reviews).toHaveLength(0);
+				expect(before?.rounds).toHaveLength(1);
+				expect(before?.rounds[0]?.execution?.status).toBe("completed");
+				break;
 			case "review-accepted":
 				// The decision committed; the round before it did too.
 				expect(before?.status).toBe("accepted");
@@ -236,8 +251,9 @@ describe("TASK-005.7 review recovery — a killed process reopens into one decis
 			const quota = await readQuota(system, RECOVERY_REQUEST_ID);
 			expect(quota?.instancesUsed).toBe(ledger?.rounds.length);
 
-			if (boundary === "review-accepted") {
-				// The accept stands. Nothing ran a second round and nothing re-decided.
+			if (boundary === "review-accepted" || boundary === "review-pending") {
+				// The accept stands (decided here, for `review-pending`). Nothing ran a
+				// second round and nothing re-decided.
 				expect(ledger?.status).toBe("accepted");
 				expect(ledger?.reviews[0]?.decision).toBe("accept");
 				expect(ledger?.rounds).toHaveLength(1);

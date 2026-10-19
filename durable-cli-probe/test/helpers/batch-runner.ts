@@ -58,6 +58,9 @@ const system = await openRecoverySystem({
 	databasePath,
 	failFirst: state === "retry-wait",
 	...(review === undefined ? {} : { review }),
+	// `review-pending` is the state *before* the review commit: this process must
+	// not decide, or the state it is killed in would be the one after the commit.
+	...(review === "review-pending" ? { decide: false } : {}),
 });
 
 const watcher = new Worker(new URL("./batch-watch.mjs", import.meta.url), {

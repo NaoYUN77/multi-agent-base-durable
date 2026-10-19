@@ -66,12 +66,19 @@ const reached = {
 	"result-not-returned": (state) => state.answered && !state.result,
 	"retry-wait": (state) => state.retryWait,
 	// TASK-005.7 (AC-04). The review decision is its own commit, and a rework is a
-	// round the decision starts, so the three windows a crash can land in are:
+	// round the decision starts, so the four windows a crash can land in are:
 	//
+	//   review-pending   the round settled at awaiting_review and the review call
+	//                    has not committed its decision yet;
 	//   review-accepted  the accept is committed, before the tool call returned;
 	//   rework-decided   the rejection is committed, and the next round has not been
 	//                    claimed yet — the window between deciding and executing;
 	//   rework-settled   the revision round settled, before the tool call returned.
+	//
+	// `review-pending` is latched on the settled round alone, so it is true whether
+	// or not the review tool has been called; the test asserts the *decision* is
+	// absent after the reopen, which is what makes it a kill before the commit.
+	"review-pending": (state) => state.awaitingReview,
 	"review-accepted": (state) => state.reviewAccepted,
 	"rework-decided": (state) => state.reviewRejected && !state.roundAdvanced,
 	"rework-settled": (state) => state.reworkSettled,
@@ -147,6 +154,10 @@ function snapshot() {
 			retryWait: rounds.find((entry) => entry.round === round)?.execution?.status === "retry_wait",
 			// The decision is a delta on the ledger, so its own review list is the
 			// cheapest true signal; the status and the round list say what followed it.
+			awaitingReview:
+				value?.status === "awaiting_review" &&
+				(value?.reviews ?? []).length === 0 &&
+				rounds.some((entry) => entry.round === round && entry.execution?.status === "completed"),
 			reviewAccepted: value?.status === "accepted" && review?.decision === "accept",
 			reviewRejected: review?.decision === "reject",
 			roundAdvanced: rounds.some((entry) => entry.round > round),

@@ -56,13 +56,22 @@ export const RECOVERY_BOUNDARIES: readonly RecoveryBoundary[] = [
 ];
 
 /**
- * The three review boundaries of TASK-005.7 (AC-04). They live in this fixture
+ * The four review boundaries of TASK-005.7 (AC-04). They live in this fixture
  * because they reuse the same plan, task and run configuration; what differs is
  * the Main script and the child, which are chosen by the runner's `--review`.
+ *
+ * `review-pending` is the kill *before* the review commit: the round has settled
+ * at `awaiting_review` and no decision exists yet. The reopening test is the one
+ * that decides a task that had none.
  */
-export type ReviewBoundary = "review-accepted" | "rework-decided" | "rework-settled";
+export type ReviewBoundary = "review-pending" | "review-accepted" | "rework-decided" | "rework-settled";
 
-export const REVIEW_BOUNDARIES: readonly ReviewBoundary[] = ["review-accepted", "rework-decided", "rework-settled"];
+export const REVIEW_BOUNDARIES: readonly ReviewBoundary[] = [
+	"review-pending",
+	"review-accepted",
+	"rework-decided",
+	"rework-settled",
+];
 
 /** The feedback the review fixture sends back, and the child's marker for it. */
 export const REVIEW_FEEDBACK = "name the second count as well";
@@ -171,11 +180,20 @@ export async function openRecoverySystem(options: {
 	readonly databasePath: string;
 	readonly failFirst?: boolean;
 	readonly review?: ReviewBoundary;
+	/**
+	 * Whether this process makes the review decision once the round has settled.
+	 *
+	 * The process killed at `review-pending` must not decide: its whole point is
+	 * that the decision has not been committed when it dies. Every other process —
+	 * and every reopening one — does decide.
+	 */
+	readonly decide?: boolean;
 }): Promise<BatchSystem> {
+	const decide = options.decide ?? true;
 	return await openBatchSystem({
 		databasePath: options.databasePath,
 		router: transcriptRouter(
-			(flat) => (options.review === undefined ? recoveryScript(flat) : reviewScript(flat, options.review)),
+			(flat) => (options.review === undefined ? recoveryScript(flat) : reviewScript(flat, options.review, decide)),
 			options.review === undefined ? recoveryChildRouter({ failFirst: options.failFirst ?? false }) : reviewChildRouter(),
 		),
 		runConfig: recoveryRunConfig(),
@@ -193,13 +211,16 @@ export async function openRecoverySystem(options: {
  * @param flat - the flattened transcript of this provider request.
  * @param boundary - which decision the fixture makes: `review-accepted` accepts,
  *   the two rework boundaries reject with `REVIEW_FEEDBACK`.
+ * @param decide - when `false`, this process stops after the dispatch, so the
+ *   review decision is left for the process that reopens the database.
  * @returns the tool calls this request should make; `[]` is the final answer.
  */
-export function reviewScript(flat: string, boundary: ReviewBoundary): MainStep {
+export function reviewScript(flat: string, boundary: ReviewBoundary, decide = true): MainStep {
 	if (flat.includes(`dispatched plan ${RECOVERY_PLAN_ID}`)) {
+		if (!decide) return [];
 		if (flat.includes("reworked task ")) return [];
 		if (flat.includes("accepted task ")) return [];
-		const decision = boundary === "review-accepted" ? "accept" : "rework";
+		const decision = boundary === "review-accepted" || boundary === "review-pending" ? "accept" : "rework";
 		return [
 			{
 				name: "review_task",
