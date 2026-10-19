@@ -274,6 +274,9 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 			cancelTask: session.cancelTask,
 			cancelAll: session.cancelAll,
 			setModel: session.setModel,
+			mcpStatus: session.mcpStatus,
+			connectMcp: session.connectMcp,
+			disconnectMcp: session.disconnectMcp,
 			close: session.close,
 		};
 		const host = { requestRender: () => {}, askQuit: () => {}, dismissQuit: () => {}, leave: () => {} };

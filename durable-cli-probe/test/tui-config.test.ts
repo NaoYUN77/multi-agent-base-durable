@@ -37,6 +37,19 @@ describe("TASK-005.5 entry arguments", () => {
 		expect(parseTuiArgs(["--db=a.sqlite", "--config=c.json", "--no-animation"])).toEqual({ ok: true, value: { databasePath: "a.sqlite", configPath: "c.json", animate: false } });
 	});
 
+	it("accepts an optional standalone MCP config path and refuses malformed options", () => {
+		const base = ["--db", "a.sqlite", "--config", "c.json"];
+		for (const option of [["--mcp-config", "servers.json"], ["--mcp-config=servers.json"]]) {
+			expect(parseTuiArgs([...base, ...option])).toEqual({
+				ok: true,
+				value: { databasePath: "a.sqlite", configPath: "c.json", animate: true, mcpConfigPath: "servers.json" },
+			});
+		}
+		expect(parseTuiArgs([...base, "--mcp-config"])).toMatchObject({ ok: false });
+		expect(parseTuiArgs([...base, "--mcp-config="])).toMatchObject({ ok: false });
+		expect(parseTuiArgs([...base, "--mcp-config", "a.json", "--mcp-config", "b.json"])).toMatchObject({ ok: false });
+	});
+
 	it("refuses unknown, repeated, missing and memory arguments", () => {
 		const unknown = parseTuiArgs(["--db", "a", "--config", "b", "--verbose"]);
 		expect(unknown).toMatchObject({ ok: false });
@@ -177,6 +190,28 @@ describe("TASK-005.5 entry order", { timeout: 60_000 }, () => {
 			stubTTY.restore();
 		}
 		await expect(readFile(databasePath)).rejects.toThrow();
+	});
+
+	it("loads the standalone MCP file selected by the CLI", async () => {
+		const stubTTY = fakeTTY();
+		try {
+			const configPath = join(directory, "agent.json");
+			const mcpConfigPath = join(directory, "servers.json");
+			await writeFile(configPath, JSON.stringify(FAUX_CONFIG), "utf8");
+			await writeFile(mcpConfigPath, JSON.stringify({ mcpServers: { local: { command: "node", args: ["--version"] } } }), "utf8");
+			const io = collector();
+			const prepared = await prepare(["--db", databasePath, "--config", configPath, "--mcp-config", mcpConfigPath], io);
+			expect(io.stderrText()).toBe("");
+			expect("session" in prepared).toBe(true);
+			if (!("session" in prepared)) return;
+			try {
+				expect(prepared.session.mcpStatus()).toMatchObject([{ name: "local", transport: "stdio", state: "idle" }]);
+			} finally {
+				await prepared.session.close();
+			}
+		} finally {
+			stubTTY.restore();
+		}
 	});
 
 	it("opens the session for a valid configuration and leaves a database behind", async () => {

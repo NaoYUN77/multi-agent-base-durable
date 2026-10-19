@@ -785,8 +785,8 @@ npm run pi:prepare -- --clean
 | 2 | prepare the checkout at the pinned commit | `git rev-parse HEAD` equals the pin; a dirty or mismatched checkout is a hard failure, never a silent rewrite |
 | 3 | `npm ci --ignore-scripts` (upstream, then app) | installs from the lockfiles, no lifecycle scripts |
 | 4 | hydrate the generated model data from the pinned catalog revision | `packages/ai` can compile at all (see below) |
-| 5 | `packages/chord` → `packages/telemetry` → `packages/ai` (`build:offline`) → `packages/durable` | the `dist/*.d.ts` the app's typecheck resolves |
-| 6 | `scripts/link-checkout.mjs` (unchanged from TASK-001) | the three names are symlinks into the checkout, one identity per package |
+| 5 | `packages/chord` → `packages/telemetry` → `packages/ai` (`build:offline`) → `packages/durable` → `packages/tui` → `packages/mcp` | the `dist/*.d.ts` the app's typecheck resolves |
+| 6 | `scripts/link-checkout.mjs` | the five names are symlinks into the checkout, one identity per package |
 | 7 | verification | SHA, package name, symlink target, and the existence of the built declarations |
 
 **Why step 4 exists — the minimal chain alone does not build on a fresh clone.**
@@ -801,9 +801,8 @@ data locally and in CI. Only that gitignored, generated directory is replaced.
 
 `packages/telemetry` is in the chain for the same class of reason: `packages/ai/src/types.ts`
 imports `@earendil-works/pi-telemetry`. The chain is the topological order of the workspace
-dependency closure of the three linked packages; the other nine workspaces (`tui`, `codemode`,
-`mcp`, `env`, `agent`, `protocol`, `client`, `server`, `coding-agent`) are outside it and are not
-built.
+dependency closure of the five linked packages; the other seven workspaces (`codemode`,
+`env`, `agent`, `protocol`, `client`, `server`, `coding-agent`) are outside it and are not built.
 
 Two things the script deliberately does **not** do: the upstream `npm run check` (it runs
 `biome check --write`, which rewrites files) and the upstream full `build` / `generate-models` (no
@@ -887,6 +886,7 @@ npm run agent:tui -- --db data/agent-tui.sqlite --config agent-tui.example.json
 | --- | --- |
 | `--db <path>` (required) | SQLite file. It must be a file, not `:memory:`: the point of the entry is that a closed session can be reopened |
 | `--config <path>` (required) | JSON configuration, see below |
+| `--mcp-config <path>` | standalone MCP server file; defaults to optional `./mcp.json` in the working directory |
 | `--no-animation` | no spinner. The elapsed clock and every status word still show; use this in recordings and on terminals where a moving spinner is noise |
 
 Exit codes: `0` the screen closed normally; `1` the session could not open
@@ -967,6 +967,9 @@ only mirrors the status word, so the frame reads the same with colour stripped.
 | `/withdraw <id>` | withdraw a queued input by its submission id from the header |
 | `/inspect <id>` | one task: rounds, limits, evidence, failure, the contract's acceptance criteria |
 | `/model [<id>]` | the model in use and the ones the installed provider offers; `<id>` switches to one of them |
+| `/mcp` | configured MCP servers: live connection state, transport, sanitized target, tool and resource counts |
+| `/mcp connect <name>` | connect one configured server and read its advertised catalog |
+| `/mcp disconnect <name>` | disconnect one server; a later model tool call can reconnect on demand |
 | `/tasks`, `/transcript` | the same facts as a panel |
 | `/quit` or `ctrl+c` | asks first; `y` or `enter` quits, anything else stays |
 
@@ -996,6 +999,70 @@ conversation is created — that is, on the first open of a fresh database. The
 Harness returns an existing root as it is and ignores the agent change, so on
 every later open the model in the document is the one in use, and `/model` shows
 which one that is.
+
+### MCP servers
+
+MCP configuration lives in a standalone `mcp.json`, separate from the provider
+and run limits file. The session reads `./mcp.json` from the working directory
+when present; an absent default means no servers. `--mcp-config <path>` selects
+a different file and requires it to exist. Invalid MCP configuration stops the
+session from opening. The local `mcp.json` is ignored by Git; start from
+[`mcp.example.json`](mcp.example.json), set its referenced environment variables,
+and remove any server you do not need.
+
+```json
+{
+  "mcpServers": {
+    "local": { "command": "node", "args": ["${MCP_SERVER_SCRIPT}"] },
+    "remote": {
+      "url": "https://example.invalid/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_HTTP_TOKEN}" }
+    }
+  }
+}
+```
+
+A `command` entry uses stdio and accepts `args`, `env`, and `cwd`. Its working
+directory defaults to the configuration file's directory; a relative `cwd` is
+resolved from that directory too. A `url` entry
+uses Streamable HTTP and accepts `headers`; legacy SSE endpoints are unsupported.
+`${VAR}` references expand from the environment in these fields. An unset
+variable is an error. Keep credentials in environment variables. Server names
+use lowercase letters, digits, `_` and `-`, start with a letter or digit, and
+have at most 64 characters.
+
+`/mcp` reads current process state. It lists all configured servers, including
+idle and failed ones. `/mcp connect local` initializes a connection;
+`/mcp disconnect local` closes it. The panel omits raw errors, instructions,
+resource URIs, arguments, headers and environment values. Targets contain only
+the command basename or the HTTP origin/path, without user info or query values.
+Connections close with the session and reconnect on demand after a reopen.
+
+Main and delegated tasks can use configured servers. Each server exposes one
+stable model tool, such as `mcp__local`. Calling it with
+`{"action":"list"}` returns the server's tool catalog and input schemas;
+`{"action":"call","tool":"echo","arguments":{"text":"hello"}}`
+invokes one of those tools. Names longer than 59 characters use
+`mcp___<first 32 hex characters of the server name's SHA-256>` to keep the tool
+name within the model API limit. A server's advertised catalog can change
+without changing its durable tool registration.
+
+Delegated task authorization is per server: use `"skillId":"mcp-work"` and
+`"requestedTools":["mcp__local"]` in the task contract to grant that server's
+list/call interface. Granting a server grants access to the tools it advertises,
+so configure servers with the permissions appropriate to the task. MCP calls
+use unsafe replay semantics: an interrupted call surfaces as interrupted and is
+not automatically retried, because the remote operation may already have run.
+
+A conversation is bound to the MCP configuration it was opened with. Opening a
+database that has unfinished work under a *changed* configuration is refused,
+because a call the previous run had already committed would otherwise reach a
+different server than the one it was written for. Restore the previous
+configuration and reopen, or finish and cancel the outstanding work first. An
+idle database accepts a changed configuration, and a database from before this
+check existed is treated the same way. The recorded identity hashes dispatcher
+names and destination versions only — never a URL argument, a header or a
+credential, so rotating a token is not a configuration change.
 
 ### Manual checklist (AC-06)
 

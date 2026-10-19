@@ -1,0 +1,8 @@
+{
+	"schemaVersion": 1,
+	"id": "mcp-work",
+	"version": "1.0.0",
+	"entrypoint": "instructions.md",
+	"requiredTools": [],
+	"description": "Complete a task using only explicitly granted MCP servers and the supplied materials."
+}

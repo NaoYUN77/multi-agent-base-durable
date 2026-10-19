@@ -5,6 +5,7 @@
 //
 //   openProbe            Harness + provider + registry (+ the child-side tools, installed only)
 //   openRoot             the Main conversation, with its agent configured
+//   mcp identity check   refuse a changed MCP configuration over unfinished work
 //   skill registry, policy  what a child may be granted
 //   createBatchRuntime   the durable batch runtime of Issue #19
 //   openMainService      Main's control surface (extension selected, open reconciliation)
@@ -22,6 +23,11 @@
 // replayed by the runtime on the next open.
 
 import { fileURLToPath } from "node:url";
+import { access } from "node:fs/promises";
+import { resolve } from "node:path";
+import { readMcpConfig } from "../mcp/config.ts";
+import { createMcpManager } from "../mcp/manager.ts";
+import { createMcpTools } from "../mcp/tools.ts";
 import { AgentDoc, type EntryRecord, LiveDoc } from "@earendil-works/pi-durable";
 import { AgentTaskSpecDoc } from "../agent/contracts/documents.ts";
 import { loadSkillRegistry } from "../agent/builder/skill-registry.ts";
@@ -32,6 +38,7 @@ import { TaskLedgerDoc } from "../multiagent/ledger.ts";
 import { ChildTools } from "../multiagent/child-tools.ts";
 import { context as backgroundContext, openProbe, openRoot } from "../runtime.ts";
 import { openMainService } from "./main-service.ts";
+import { ensureMainMcpIdentity, mcpConfigIdentity } from "./mcp-identity.ts";
 import { createAnalysisReader } from "./analysis.ts";
 import { startChangeFeed } from "./changes.ts";
 import type { AgentSession, AgentSessionOptions, ModelOption, TranscriptLine, TuiSnapshot } from "./types.ts";
@@ -39,7 +46,7 @@ import type { AgentSession, AgentSessionOptions, ModelOption, TranscriptLine, Tu
 const REPOSITORY_SKILLS = fileURLToPath(new URL("../../skills", import.meta.url));
 
 /** The skills a task may name in this deployment: the ones the repository bundles for local text work. */
-const ALLOWED_SKILLS: readonly string[] = ["text-stats", "material-summary"];
+const ALLOWED_SKILLS: readonly string[] = ["text-stats", "material-summary", "mcp-work"];
 
 /** The newest transcript lines the TUI shows. */
 export const TRANSCRIPT_LIMIT = 200;
@@ -81,6 +88,21 @@ export function transcriptLine(entry: EntryRecord): TranscriptLine | undefined {
 export async function openAgentSession(options: AgentSessionOptions): Promise<AgentSession> {
 	const now = options.now ?? Date.now;
 	const context = backgroundContext;
+	const mcpPath = resolve(options.mcpConfigPath ?? "mcp.json");
+	let mcpConfigured = options.mcpConfigPath !== undefined;
+	if (!mcpConfigured) {
+		try {
+			await access(mcpPath);
+			mcpConfigured = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+	const mcpConfig = mcpConfigured ? await readMcpConfig(mcpPath) : { ok: true as const, value: { servers: [] } };
+	if (!mcpConfig.ok) throw new Error(mcpConfig.errors.join("\n"));
+	const mcp = createMcpManager({ servers: mcpConfig.value.servers });
+	const mcpTools = createMcpTools(mcp);
+	const mainExtensions = [...(options.extraMainExtensions ?? []), ...mcpTools.map((tool) => tool.extension)];
 	const runtime = await openProbe({
 		databasePath: options.databasePath,
 		provider: options.provider,
@@ -92,18 +114,29 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 		...(options.apiKeyEnv === undefined ? {} : { apiKey: process.env[options.apiKeyEnv] }),
 		...(options.fauxRouter === undefined ? {} : { fauxRouter: options.fauxRouter }),
 		...(options.fauxModels === undefined ? {} : { fauxModels: options.fauxModels }),
-		...(options.extraMainExtensions === undefined ? {} : { extensions: options.extraMainExtensions }),
+		extensions: mainExtensions,
 		// Installed, never selected on Main: a child is granted these per task.
 		registryExtensions: [ChildTools],
 	});
 	try {
 		const root = await openRoot(runtime);
+		// Before anything can run: a conversation that committed a call to an MCP
+		// dispatcher is bound to the destination that dispatcher resolved to then.
+		// Checked here rather than after the service is up, because `resume()` is
+		// what re-executes the outstanding work.
+		const identity = await ensureMainMcpIdentity({
+			harness: runtime.harness,
+			conversationId: root.id,
+			identity: mcpConfigIdentity(mcpTools),
+			context,
+		});
+		if (!identity.ok) throw new Error(identity.detail);
 		const skills = await loadSkillRegistry({ root: REPOSITORY_SKILLS });
 		const policy: TaskAuthorizationPolicy = {
 			skills,
 			allowedSkills: [...ALLOWED_SKILLS],
-			allowedTools: [...LOCAL_TEXT_TOOL_NAMES],
-			tools: [...LOCAL_TEXT_TOOLS],
+			allowedTools: [...LOCAL_TEXT_TOOL_NAMES, ...mcpTools.map((tool) => tool.name)],
+			tools: [...LOCAL_TEXT_TOOLS, ...mcpTools],
 		};
 		const batch = createBatchRuntime({
 			harness: runtime.harness,
@@ -128,7 +161,8 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 			conversationId: root.id,
 			runtime: batch,
 			now,
-			...(options.extraMainExtensions === undefined ? {} : { extensionsExtra: options.extraMainExtensions }),
+			extensionsExtra: mainExtensions,
+			...(mcpTools.length === 0 ? {} : { instructionsExtra: `Configured MCP servers are available through ${mcpTools.map((tool) => tool.name).join(", ")}. Use action=list to discover remote tools, then action=call. Child tasks using external services should select skillId=mcp-work and must explicitly request the server dispatcher in requestedTools.` }),
 		});
 		const conversation = await runtime.harness.conversation(root.id, context);
 		if (conversation === undefined) throw new Error("main service: the Main conversation vanished while the session opened");
@@ -202,6 +236,9 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 					.filter((line): line is TranscriptLine => line !== undefined)
 					.slice(-limit);
 			},
+			mcpStatus: () => mcp.status(),
+			connectMcp: async (name) => await mcp.connect(name),
+			disconnectMcp: async (name) => await mcp.disconnect(name),
 			cancelTask: async (taskId, reason) => await main.cancelTask(taskId, reason),
 			inspectTask: async (taskId, clock) => await analysis.inspectTask(taskId, clock),
 			cancelAll: async (reason) => await main.requestCancel(reason),
@@ -221,7 +258,11 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 				listeners.clear();
 				await feed.stop();
 				await runtimeWatches.stop();
-				await runtime.close();
+				try {
+					await runtime.close();
+				} finally {
+					await mcp.close();
+				}
 			},
 		};
 		// Resume last: see the header.
@@ -229,6 +270,7 @@ export async function openAgentSession(options: AgentSessionOptions): Promise<Ag
 		return session;
 	} catch (error) {
 		await runtime.close().catch(() => {});
+		await mcp.close();
 		throw error;
 	}
 }

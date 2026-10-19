@@ -13,8 +13,8 @@
 //      (npm ci --ignore-scripts)
 //   5. hydrate the generated model data from the pinned catalog revision
 //   6. build the type artifacts the app's typecheck needs
-//      (Chord -> Telemetry -> Pi AI build:offline -> Durable)
-//   7. link the three Pi packages (scripts/link-checkout.mjs, unchanged)
+//      (Chord -> Telemetry -> Pi AI build:offline -> Durable -> TUI -> MCP)
+//   7. link the five Pi packages (scripts/link-checkout.mjs)
 //   8. verify revision, package identity, and link targets
 //
 // Deliberate non-actions:

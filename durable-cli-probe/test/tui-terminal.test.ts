@@ -15,9 +15,11 @@
 // A human still runs the real terminal checklist in the README (AC-06): raw
 // mode restore and Windows Terminal behaviour cannot be proven by a fake.
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { stripTerminalSequences, TuiMainScreen, type Terminal } from "@earendil-works/pi-tui";
 import type { AgentSession, TaskRow, TuiSnapshot } from "../src/service/types.ts";
+import type { McpServerStatus } from "../src/mcp/manager.ts";
+import { HELP_LINES, routeLine } from "../src/service/router.ts";
 import { type ControllerApp, mountApp, QuitPrompt } from "../src/tui/app.ts";
 import { Controller } from "../src/tui/controller.ts";
 import { createTheme, plainPainter } from "../src/tui/theme.ts";
@@ -102,6 +104,9 @@ function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
 		throw new Error("not used by the terminal suite");
 	};
 	return {
+		mcpStatus: () => [],
+		connectMcp: unused,
+		disconnectMcp: unused,
 		setModel: async (provider, modelId) => {
 			calls.models.push([provider, modelId]);
 			// The service's own rule, mirrored: an id the provider does not offer is
@@ -192,7 +197,7 @@ async function mount(latest: () => TuiSnapshot, animate = false) {
 	await settle();
 	tui.renderNow(true);
 	await settle();
-	return { terminal, tui, app, controller, calls, left };
+	return { terminal, tui, app, controller, session, calls, left };
 }
 
 describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
@@ -218,6 +223,70 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		expect(text).toContain("main › started");
 		expect(text).toContain("2 active");
 		expect(text).toContain("ctrl+c quits");
+	});
+
+	it("routes MCP commands strictly and includes them in help", () => {
+		expect(routeLine("/mcp", undefined)).toEqual({ kind: "mcp" });
+		expect(routeLine("/mcp connect local", undefined)).toEqual({ kind: "connect-mcp", name: "local" });
+		expect(routeLine("/mcp disconnect local", undefined)).toEqual({ kind: "disconnect-mcp", name: "local" });
+		for (const line of ["/mcp connect", "/mcp disconnect", "/mcp list", "/mcp connect local extra", "/mcp disconnect local extra"]) {
+			expect(routeLine(line, undefined)).toMatchObject({ kind: "noop", notice: expect.stringContaining("/mcp") });
+		}
+		expect(HELP_LINES.join("\n")).toContain("/mcp");
+	});
+
+	it("lists MCP status, connects and disconnects by name without exposing server text", async () => {
+		mounted = await mount(() => snapshot([]));
+		const session = mounted.session;
+		const secret = "secret-from-server";
+		let state: McpServerStatus["state"] = "idle";
+		const status = (): McpServerStatus => ({
+			name: "local", transport: "stdio", target: "node", state,
+			tools: ["echo"], resources: [`https://example.invalid/?token=${secret}`],
+			instructions: secret, error: secret,
+		});
+		const connected: string[] = [];
+		const disconnected: string[] = [];
+		vi.spyOn(session, "mcpStatus").mockImplementation(() => [status()]);
+		vi.spyOn(session, "connectMcp").mockImplementation(async (name) => {
+			connected.push(name);
+			state = "connected";
+			return status();
+		});
+		vi.spyOn(session, "disconnectMcp").mockImplementation(async (name) => {
+			disconnected.push(name);
+			state = "idle";
+		});
+		await mounted.controller.submit("/mcp");
+		expect(frame(mounted.app)).toContain("local  idle  stdio  node");
+		expect(frame(mounted.app)).toContain("tools 1");
+		expect(frame(mounted.app)).toContain("resources 1");
+		expect(frame(mounted.app)).not.toContain(secret);
+		await mounted.controller.submit("/mcp connect local");
+		expect(connected).toEqual(["local"]);
+		expect(frame(mounted.app)).toContain("local  connected");
+		await mounted.controller.submit("/mcp disconnect local");
+		expect(disconnected).toEqual(["local"]);
+		expect(frame(mounted.app)).toContain("local  idle");
+		state = "failed";
+		await mounted.controller.submit("/mcp");
+		expect(frame(mounted.app)).toContain("connection failed");
+		expect(frame(mounted.app)).not.toContain(secret);
+	});
+
+	it("reports empty MCP config and contains operation failures without secret values", async () => {
+		mounted = await mount(() => snapshot([]));
+		const session = mounted.session;
+		await mounted.controller.submit("/mcp");
+		expect(frame(mounted.app)).toContain("no MCP servers configured");
+		const secret = "sk-mcp-must-not-appear";
+		vi.spyOn(session, "connectMcp").mockRejectedValue(new Error(secret));
+		vi.spyOn(session, "disconnectMcp").mockRejectedValue(new Error(secret));
+		for (const action of ["connect", "disconnect"]) {
+			await expect(mounted.controller.submit(`/mcp ${action} missing`)).resolves.toBeUndefined();
+			expect(mounted.controller.view().state.notice).toContain("MCP");
+			expect(mounted.controller.view().state.notice).not.toContain(secret);
+		}
 	});
 
 	it("draws what is being typed, before it is sent", async () => {

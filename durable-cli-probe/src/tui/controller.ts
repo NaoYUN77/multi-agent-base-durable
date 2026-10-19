@@ -20,6 +20,7 @@
 //     queued input, a refused restatement: each is the service's answer to
 //     report, not the controller's decision to make.
 
+import type { McpServerStatus } from "../mcp/manager.ts";
 import { HELP_LINES, routeLine, type Route } from "../service/router.ts";
 import type { AgentSession, SessionWatch, TaskDetail, TaskRow, TranscriptLine, TuiSnapshot } from "../service/types.ts";
 import { outcomeNotice, type ViewState } from "../service/view.ts";
@@ -39,7 +40,7 @@ export type ControllerHost = {
 /** The part of the session the controller uses. */
 export type ControllerSession = Pick<
 	AgentSession,
-	"main" | "snapshot" | "watch" | "transcript" | "inspectTask" | "cancelTask" | "cancelAll" | "setModel" | "close"
+	"main" | "snapshot" | "watch" | "transcript" | "inspectTask" | "cancelTask" | "cancelAll" | "setModel" | "mcpStatus" | "connectMcp" | "disconnectMcp" | "close"
 >;
 
 export type ControllerOptions = {
@@ -189,8 +190,14 @@ export class Controller {
 			// throws would end the process with the terminal still in raw mode and
 			// nothing left to restore it. The failure is reported in the notice, where
 			// the last line's outcome already belongs: the session stays open.
-			const detail = error instanceof Error ? error.message : String(error);
-			this.notice(`could not run ${line.trim().split(/\s+/)[0] ?? line}: ${detail}`);
+			if (route.kind === "mcp" || route.kind === "connect-mcp" || route.kind === "disconnect-mcp") {
+				// Transport exceptions may quote a URL, arguments or response body. None
+				// of that belongs on a terminal; the manager exposes safe connection facts.
+				this.notice("could not complete MCP command; check the server configuration and connection");
+			} else {
+				const detail = error instanceof Error ? error.message : String(error);
+				this.notice(`could not run ${line.trim().split(/\s+/)[0] ?? line}: ${detail}`);
+			}
 		}
 	}
 
@@ -224,6 +231,20 @@ export class Controller {
 				return;
 			case "cancel-all":
 				await this.cancelAll(route.reason);
+				return;
+			case "mcp":
+				this.panel("MCP servers", mcpLines(this.session.mcpStatus()));
+				return;
+			case "connect-mcp": {
+				const result = await this.session.connectMcp(route.name);
+				this.notice(`MCP ${result.name}: ${result.state}`);
+				this.panel("MCP servers", mcpLines(this.session.mcpStatus()));
+				return;
+			}
+			case "disconnect-mcp":
+				await this.session.disconnectMcp(route.name);
+				this.notice(`MCP ${route.name}: disconnected; a later tool call may reconnect`);
+				this.panel("MCP servers", mcpLines(this.session.mcpStatus()));
 				return;
 			case "models":
 				this.panel("models", modelLines(this.state.snapshot?.model));
@@ -377,6 +398,14 @@ function modelLines(model: TuiSnapshot["model"] | undefined): readonly string[] 
 			return `${inUse ? "*" : " "} ${option.provider}/${option.modelId}  ${option.name}  ${Math.round(option.contextWindow / 1000)}k context`;
 		}),
 	];
+}
+
+/** Only connection facts are displayed: server text and resource URIs may carry secrets. */
+function mcpLines(servers: readonly McpServerStatus[]): readonly string[] {
+	if (servers.length === 0) return ["no MCP servers configured; add servers to mcp.json or use --mcp-config <path>"];
+	return servers.map((server) =>
+		`${server.name}  ${server.state}  ${server.transport}  ${server.target}  tools ${server.tools.length}  resources ${server.resources.length}${server.state === "failed" ? "  connection failed; check the configuration and server" : ""}`,
+	);
 }
 
 function rowLine(row: TaskRow): string {

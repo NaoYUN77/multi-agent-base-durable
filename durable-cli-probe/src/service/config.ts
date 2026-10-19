@@ -35,13 +35,15 @@ export type ConfigResult<T> = { readonly ok: true; readonly value: T } | { reado
 export type ParsedArgs = {
 	readonly databasePath: string;
 	readonly configPath: string;
+	readonly mcpConfigPath?: string;
 	readonly animate: boolean;
 };
 
 const USAGE =
-	"usage: npm run agent:tui -- --db <path> --config <path> [--no-animation]\n" +
+	"usage: npm run agent:tui -- --db <path> --config <path> [--mcp-config <path>] [--no-animation]\n" +
 	"  --db <path>          SQLite database the session opens; a real file, so a reopen restores the view\n" +
 	"  --config <path>      JSON configuration (provider, model, limits); see README\n" +
+	"  --mcp-config <path>  standalone MCP server configuration (default: optional ./mcp.json)\n" +
 	"  --no-animation       no spinner and no periodic re-render; the elapsed clock still runs";
 
 export function usageText(): string {
@@ -49,7 +51,7 @@ export function usageText(): string {
 }
 
 /**
- * Parse `--db`, `--config` and `--no-animation`. Strict, in one pass: an
+ * Parse `--db`, `--config`, `--mcp-config` and `--no-animation`. Strict, in one pass: an
  * unknown argument, a missing value or a repeated option is an error, and
  * nothing is opened first.
  */
@@ -57,12 +59,13 @@ export function parseTuiArgs(argv: readonly string[]): ConfigResult<ParsedArgs> 
 	const errors: string[] = [];
 	let databasePath: string | undefined;
 	let configPath: string | undefined;
+	let mcpConfigPath: string | undefined;
 	let animate = true;
 	const seen = new Set<string>();
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index] ?? "";
 		const [flag, inline] = arg.startsWith("--") && arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, undefined];
-		if (flag !== "--db" && flag !== "--config" && flag !== "--no-animation") {
+		if (flag !== "--db" && flag !== "--config" && flag !== "--mcp-config" && flag !== "--no-animation") {
 			errors.push(`unknown argument ${JSON.stringify(arg)}`);
 			continue;
 		}
@@ -84,7 +87,8 @@ export function parseTuiArgs(argv: readonly string[]): ConfigResult<ParsedArgs> 
 			continue;
 		}
 		if (flag === "--db") databasePath = value;
-		else configPath = value;
+		else if (flag === "--config") configPath = value;
+		else mcpConfigPath = value;
 	}
 	if (databasePath === undefined && !seen.has("--db")) errors.push("--db is required");
 	if (configPath === undefined && !seen.has("--config")) errors.push("--config is required");
@@ -93,7 +97,7 @@ export function parseTuiArgs(argv: readonly string[]): ConfigResult<ParsedArgs> 
 	}
 	if (errors.length > 0) return { ok: false, errors };
 	if (databasePath === undefined || configPath === undefined) return { ok: false, errors: ["--db and --config are required"] };
-	return { ok: true, value: { databasePath, configPath, animate } };
+	return { ok: true, value: { databasePath, configPath, animate, ...(mcpConfigPath === undefined ? {} : { mcpConfigPath }) } };
 }
 
 /** Field names that hold a credential rather than name where one lives. Matched case- and separator-insensitively. */

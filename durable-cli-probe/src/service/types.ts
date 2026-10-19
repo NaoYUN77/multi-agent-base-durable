@@ -22,6 +22,7 @@ import type { TaskBusinessStatus } from "../agent/state/lifecycle.ts";
 import type { EvidenceReference } from "../multiagent/ledger.ts";
 import type { QueuedInput } from "../agent/main/service-doc.ts";
 import type { MainService } from "./main-service.ts";
+import type { McpServerStatus } from "../mcp/manager.ts";
 
 /**
  * How one task reads in the table, detail and status bar.
@@ -281,6 +282,12 @@ export type AgentSession = {
 	 * changing it.
 	 */
 	readonly setModel: (provider: string, modelId: string) => Promise<ModelSetResult>;
+	/** Live connection facts for configured MCP servers; never reads or creates a durable document. */
+	readonly mcpStatus: () => readonly McpServerStatus[];
+	/** Connect a configured server for Main and delegated tasks; returns its resulting state. */
+	readonly connectMcp: (name: string) => Promise<McpServerStatus>;
+	/** Disconnect one configured server; a later tool call may connect it on demand. */
+	readonly disconnectMcp: (name: string) => Promise<void>;
 	/** The context every call runs under. */
 	readonly context: Context;
 	close(): Promise<void>;
@@ -298,6 +305,8 @@ export type SessionWatch = {
 /** What `openAgentSession` needs. A test passes a scripted router; the entry passes none. */
 export type AgentSessionOptions = AgentConfig & {
 	readonly databasePath: string;
+	/** Standalone MCP config path. Omission reads cwd/mcp.json if it exists. */
+	readonly mcpConfigPath?: string;
 	/** Test seam: serve the faux provider from this router instead of a fixed script. */
 	readonly fauxRouter?: FauxResponseFactory;
 	/** Test seam: the faux provider's catalog. A second model gives a switch a destination. */

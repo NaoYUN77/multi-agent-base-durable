@@ -52,7 +52,10 @@ export async function prepare(argv: readonly string[], io: EntryIo): Promise<{ r
 	}
 	const databasePath = args.value.databasePath;
 	try {
-		return { session: await openAgentSession({ ...config.value, databasePath }), animate: args.value.animate };
+		return {
+			session: await openAgentSession({ ...config.value, databasePath, ...(args.value.mcpConfigPath === undefined ? {} : { mcpConfigPath: args.value.mcpConfigPath }) }),
+			animate: args.value.animate,
+		};
 	} catch (error) {
 		io.stderr(`error: could not open the session: ${error instanceof Error ? error.message : String(error)}\n`);
 		return { exit: EXIT.openFailed };

@@ -37,6 +37,9 @@ export type Route =
 	/** Show the model in use and the ones the installed provider offers. */
 	| { readonly kind: "models" }
 	| { readonly kind: "set-model"; readonly provider: string; readonly modelId: string }
+	| { readonly kind: "mcp" }
+	| { readonly kind: "connect-mcp"; readonly name: string }
+	| { readonly kind: "disconnect-mcp"; readonly name: string }
 	| { readonly kind: "quit" }
 	| { readonly kind: "panel"; readonly title: string; readonly lines: readonly string[] };
 
@@ -50,6 +53,9 @@ export const HELP_LINES: readonly string[] = [
 	"/answer --insufficient <text>   reply that is not yet an answer",
 	"/withdraw <id>     withdraw a queued input (its submission id from the header)",
 	"/model [<id>]      the model in use and the ones the provider offers; <id> switches it",
+	"/mcp               list configured MCP servers and their live connection state",
+	"/mcp connect <name> connect one configured MCP server",
+	"/mcp disconnect <name> disconnect it (a later tool call may reconnect)",
 	"/transcript        the latest conversation lines",
 	"/help              this list",
 	"/quit              leave (ctrl+c asks to confirm first)",
@@ -134,6 +140,14 @@ export function routeLine(line: string, snapshot: TuiSnapshot | undefined): Rout
 		case "/withdraw": {
 			if (rest === "") return { kind: "noop", notice: "/withdraw needs a submission id (shown in the queued line)" };
 			return { kind: "withdraw", submissionId: rest };
+		}
+		case "/mcp": {
+			if (rest === "") return { kind: "mcp" };
+			const [action, name, extra] = rest.split(/\s+/);
+			if ((action === "connect" || action === "disconnect") && name !== undefined && extra === undefined) {
+				return { kind: action === "connect" ? "connect-mcp" : "disconnect-mcp", name };
+			}
+			return { kind: "noop", notice: "usage: /mcp, /mcp connect <name>, or /mcp disconnect <name>" };
 		}
 		case "/model": {
 			if (rest === "") return { kind: "models" };
