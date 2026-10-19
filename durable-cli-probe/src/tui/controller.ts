@@ -20,7 +20,7 @@
 //     queued input, a refused restatement: each is the service's answer to
 //     report, not the controller's decision to make.
 
-import { HELP_LINES, routeLine } from "../service/router.ts";
+import { HELP_LINES, routeLine, type Route } from "../service/router.ts";
 import type { AgentSession, SessionWatch, TaskDetail, TaskRow, TranscriptLine, TuiSnapshot } from "../service/types.ts";
 import { outcomeNotice, type ViewState } from "../service/view.ts";
 
@@ -98,7 +98,22 @@ export class Controller {
 	/** Ask for the next spinner frame; a no-op under `--no-animation`. */
 	tick(): void {
 		if (!this.animate) return;
-		this.host.requestRender();
+		this.render();
+	}
+
+	/**
+	 * Ask the screen for a redraw.
+	 *
+	 * The one place a redraw is requested, and it never throws: several callers
+	 * run from a promise nobody awaits (a submitted line, a change feed), and a
+	 * screen that went away must not become an unhandled rejection.
+	 */
+	private render(): void {
+		try {
+			this.host.requestRender();
+		} catch {
+			// The screen is gone; the path that removes it restores the terminal.
+		}
 	}
 
 	/**
@@ -140,7 +155,7 @@ export class Controller {
 			const stopping = rest.stopping;
 			const settled = stopping === undefined || this.stopSettled(snapshot, stopping.ids);
 			this.state = { ...rest, snapshot, ...(stopping === undefined || settled ? { stopping: undefined } : {}) };
-			this.host.requestRender();
+			this.render();
 		} catch (error) {
 			this.state = { ...this.state, readError: error instanceof Error ? error.message : String(error) };
 		}
@@ -164,6 +179,20 @@ export class Controller {
 		// read now: `/answer` and `/cancel` must see the question and the ids.
 		if (this.state.snapshot === undefined) await this.refresh();
 		const route = routeLine(line, this.state.snapshot);
+		try {
+			await this.apply(route);
+		} catch (error) {
+			// The screen starts `submit()` without awaiting it, so a service call that
+			// throws would end the process with the terminal still in raw mode and
+			// nothing left to restore it. The failure is reported in the notice, where
+			// the last line's outcome already belongs: the session stays open.
+			const detail = error instanceof Error ? error.message : String(error);
+			this.notice(`could not run ${line.trim().split(/\s+/)[0] ?? line}: ${detail}`);
+		}
+	}
+
+	/** Run one route. Nothing here may reject: `submit` reports what it throws. */
+	private async apply(route: Route): Promise<void> {
 		switch (route.kind) {
 			case "noop":
 				this.notice(route.notice);
@@ -239,7 +268,7 @@ export class Controller {
 
 	cancelQuit(): void {
 		this.host.dismissQuit();
-		this.host.requestRender();
+		this.render();
 	}
 
 	/** The newest pass, for a host that needs one before its first render. */
@@ -289,12 +318,12 @@ export class Controller {
 
 	private panel(title: string, lines: readonly string[]): void {
 		this.state = { ...this.state, panel: { title, lines } };
-		this.host.requestRender();
+		this.render();
 	}
 
 	private notice(text: string): void {
 		this.state = { ...this.state, notice: text };
-		this.host.requestRender();
+		this.render();
 	}
 
 	private async reloadTranscript(): Promise<void> {
@@ -307,7 +336,7 @@ export class Controller {
 		} catch (error) {
 			this.state = { ...this.state, readError: error instanceof Error ? error.message : String(error) };
 		}
-		this.host.requestRender();
+		this.render();
 	}
 }
 

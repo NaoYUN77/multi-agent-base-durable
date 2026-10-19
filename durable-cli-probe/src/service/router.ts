@@ -68,7 +68,7 @@ export function routeLine(line: string, snapshot: TuiSnapshot | undefined): Rout
 	if (!text.startsWith("/")) {
 		const open = snapshot?.request.openQuestionIds ?? [];
 		if (open.length > 0) {
-			return { kind: "noop", notice: `a question is open (${open[0]}); answer it with /answer <text> or start with / say to send a new request` };
+			return { kind: "noop", notice: `a question is open (${open[0]}); answer it with /answer <text>, or /answer --insufficient <text> if it is not yet an answer` };
 		}
 		return { kind: "send", text };
 	}

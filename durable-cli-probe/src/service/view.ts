@@ -48,6 +48,26 @@ export type RenderInput = {
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/**
+ * Every word the status column can hold. Written as a `Record` so a status added
+ * to `TaskRowStatus` stops the build here, where its word's width is measured.
+ */
+const STATUS_WORDS: Record<TaskRowStatus, true> = {
+	planned: true,
+	queued: true,
+	running: true,
+	retry_wait: true,
+	stopping: true,
+	"awaiting-review": true,
+	"awaiting-input": true,
+	accepted: true,
+	failed: true,
+	cancelled: true,
+};
+
+/** Wide enough for the longest status word (`awaiting review`): a column one cell short shifts every later cell. */
+const STATUS_WIDTH = Math.max(...(Object.keys(STATUS_WORDS) as TaskRowStatus[]).map((status) => visibleWidth(statusLabel(status))));
+
 const WORKING: ReadonlySet<TaskRowStatus> = new Set(["planned", "queued", "running", "retry_wait", "stopping"]);
 
 const FINISHED: ReadonlySet<TaskRowStatus> = new Set(["accepted", "failed", "cancelled"]);
@@ -123,24 +143,51 @@ function fitColumns(text: string, width: number): string {
 	return `${sliceByColumn(text, 0, Math.max(0, width - 1), true)}…`;
 }
 
+/**
+ * One drawn line, never two.
+ *
+ * A purpose, an error message or a quoted refusal can hold a newline: the frame
+ * gives each element of a block exactly one line, so the text is folded first.
+ */
+function oneLine(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
 function pad(text: string, width: number): string {
 	const fitted = fitColumns(text, width);
 	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
 }
 
-/** Wrap at column boundaries, keeping every line inside the width. */
+/**
+ * Wrap at column boundaries, keeping every line inside the width.
+ *
+ * A paragraph with a newline in it is several lines, and the callers budget by
+ * the lines they get back: one element that draws three would push the frame
+ * past the height it was given.
+ */
 function wrap(text: string, width: number): string[] {
 	const lines: string[] = [];
-	const total = visibleWidth(text);
-	for (let offset = 0; offset < Math.max(1, total); offset += Math.max(1, width)) lines.push(fitColumns(sliceByColumn(text, offset, width, true), width));
+	for (const paragraph of text.replace(/\r/g, "").split("\n")) {
+		const total = visibleWidth(paragraph);
+		for (let offset = 0; offset < Math.max(1, total); offset += Math.max(1, width)) lines.push(fitColumns(sliceByColumn(paragraph, offset, width, true), width));
+	}
 	return lines;
+}
+
+/**
+ * The row's first cell: the id every command takes, then the saved purpose when
+ * the documents hold one that says more than the id does.
+ */
+function taskCell(row: TaskRow): string {
+	const title = oneLine(row.title);
+	return title === "" || title === row.taskId ? row.taskId : `${row.taskId}  ${title}`;
 }
 
 /** The task table: one row per task, in the runtime's admission order. */
 export function taskTableLines(rows: readonly TaskRow[], now: number, width: number, animate: boolean, frame: number, theme?: Theme): string[] {
-	const fixed = 14 + 5 + 7 + 7 + 9 + 10;
+	const fixed = STATUS_WIDTH + 5 + 7 + 7 + 9 + 10;
 	const task = { header: "task", width: Math.max(10, Math.min(26, width - fixed)) };
-	const status = { header: "status", width: 14 };
+	const status = { header: "status", width: STATUS_WIDTH };
 	const round = { header: "round", width: 5 };
 	const tools = { header: "tools", width: 7 };
 	const failed = { header: "failed", width: 7 };
@@ -162,7 +209,7 @@ export function taskTableLines(rows: readonly TaskRow[], now: number, width: num
 		const statusCell = painted + " ".repeat(Math.max(0, status.width - visibleWidth(word)));
 		lines.push(
 			[
-				pad(marker + row.taskId, task.width),
+				pad(marker + taskCell(row), task.width),
 				statusCell,
 				pad(row.round === 0 ? "-" : `r${row.round}`, round.width),
 				pad(counter(row.toolInvocations.used, row.toolInvocations.limit), tools.width),
@@ -188,7 +235,7 @@ function headerLines(snapshot: TuiSnapshot | undefined, input: RenderInput, them
 	const open = snapshot.request.openQuestionIds;
 	if (open.length > 0) {
 		const question = snapshot.request.questions.find((entry) => entry.questionId === open[0]);
-		lines.push(fitColumns(theme.warning(`main asks ${open.join(", ")}${question === undefined ? "" : `: ${question.question}`}`), width));
+		lines.push(fitColumns(theme.warning(oneLine(`main asks ${open.join(", ")}${question === undefined ? "" : `: ${question.question}`}`)), width));
 		lines.push(theme.dim("reply with /answer <text>, or /answer --insufficient <text>"));
 	}
 	if (snapshot.queue.length > 0) {
@@ -233,14 +280,18 @@ export function renderView(input: RenderInput, theme: Theme): string[] {
 	const notice = noticeText(state, now);
 	const fixedTail = 3 + (notice === undefined ? 0 : 2) + (state.readError === undefined ? 0 : 1);
 	const panelAll = state.panel === undefined ? [] : ["", theme.dim(`── ${state.panel.title} ──`), ...state.panel.lines.flatMap((line) => wrap(line, width))];
-	const panelRoom = Math.max(0, height - head.length - table.length - fixedTail - 2);
+	// The transcript block brings a blank line and a heading of its own. A budget
+	// that forgot them made the frame one line taller than the height it was given,
+	// which pushes the header's first line out of the terminal's viewport.
+	const block = 2;
+	const panelRoom = Math.max(0, height - head.length - table.length - fixedTail - block);
 	const panel = panelAll.slice(0, panelRoom);
-	const transcript = transcriptLines(input, Math.max(0, height - head.length - table.length - panel.length - fixedTail), theme);
+	const transcript = transcriptLines(input, Math.max(0, height - head.length - table.length - panel.length - fixedTail - block), theme);
 	const out = [...head];
 	if (transcript.length > 0) out.push("", theme.dim("conversation (newest last)"), ...transcript);
 	out.push(...table, ...panel);
-	if (notice !== undefined) out.push("", theme.dim(fitColumns(notice, width)));
-	if (state.readError !== undefined) out.push(theme.warning(fitColumns(`read error: ${state.readError} (showing the last good pass)`, width)));
+	if (notice !== undefined) out.push("", theme.dim(fitColumns(oneLine(notice), width)));
+	if (state.readError !== undefined) out.push(theme.warning(fitColumns(oneLine(`read error: ${state.readError} (showing the last good pass)`), width)));
 	out.push(theme.frame("─".repeat(Math.max(1, width))));
 	out.push(statusLine(snapshot, state, input));
 	return out.map((line) => fitColumns(line, width));

@@ -933,7 +933,8 @@ Above the editor, top to bottom:
   batches have settled;
 * **conversation.** the newest lines of Main's conversation, `you ›` and
   `main ›`;
-* **tasks.** one row per task of every admitted batch: task id, status word,
+* **tasks.** one row per task of every admitted batch: the task id (what
+  `/inspect` and `/cancel` take) followed by the saved task name, status word,
   round, tool invocations used over the limit, failed tool calls, elapsed time;
 * **panel.** the answer to the last command (`/help`, `/tasks`, `/inspect`, ...);
 * **notice.** the outcome of the last input (sent, queued, answered, refused),

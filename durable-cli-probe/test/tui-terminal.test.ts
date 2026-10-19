@@ -85,7 +85,7 @@ function snapshot(rows: readonly TaskRow[]): TuiSnapshot {
 	};
 }
 
-type Calls = { closed: number; cancelledAll: string[]; cancelled: string[]; failClose?: boolean; snapshots: number; snapshotDelayMs: number };
+type Calls = { closed: number; cancelledAll: string[]; cancelled: string[]; failClose?: boolean; failCancelAll?: boolean; snapshots: number; snapshotDelayMs: number };
 
 /** A session double: every call the controller can make is recorded. */
 function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
@@ -116,6 +116,7 @@ function fakeSession(latest: () => TuiSnapshot, calls: Calls): AgentSession {
 		},
 		cancelAll: async (reason) => {
 			calls.cancelledAll.push(reason ?? "");
+			if (calls.failCancelAll === true) throw new Error("the storage refused the cancel");
 			return { requested: true, reason: reason ?? "" };
 		},
 		close: async () => {
@@ -244,7 +245,9 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		mounted.tui.renderNow(true);
 		const text = frame(mounted.app);
 		expect(text).toContain("cancel requested");
-		expect(text).toContain("stopping        r1");
+		// The status cell is as wide as its longest word (`awaiting review`), so
+		// `stopping` is padded by 7 and the two cells are joined by two more.
+		expect(text).toMatch(/stopping {9}r1/);
 
 		// Once the receipt lands the quiet notice returns and the stop clears.
 		latest = snapshot([row("t-alpha", "cancelled")]);
@@ -298,6 +301,41 @@ describe("TASK-005.5 terminal screen", { timeout: 30_000 }, () => {
 		});
 		await expect(controller.refresh()).resolves.toBeUndefined();
 		expect(calls.snapshots).toBe(1);
+	});
+
+	it("reports a command that throws instead of rejecting an unawaited submit", async () => {
+		// The app starts `submit()` without awaiting it. A service call that throws
+		// would otherwise reject that promise unhandled, which ends the process with
+		// the terminal still in raw mode and nothing left to restore it.
+		const calls: Calls = { closed: 0, cancelledAll: [], cancelled: [], snapshots: 0, snapshotDelayMs: 0, failCancelAll: true };
+		const controller = new Controller({
+			session: fakeSession(() => snapshot([row("t-alpha", "running")]), calls),
+			animate: false,
+			transcriptLimit: 50,
+			host: { requestRender: () => {}, askQuit: () => {}, dismissQuit: () => {}, leave: () => {} },
+		});
+		await controller.refresh();
+		await expect(controller.submit("/cancel all")).resolves.toBeUndefined();
+		expect(controller.view().state.notice).toContain("could not run /cancel");
+		expect(controller.view().state.notice).toContain("the storage refused the cancel");
+
+		// The same holds when the redraw is what throws, for a line that only asks
+		// for a redraw (a refusal is reported, not sent).
+		const gone = new Controller({
+			session: fakeSession(() => snapshot([]), calls),
+			animate: false,
+			transcriptLimit: 50,
+			host: {
+				requestRender: () => {
+					throw new Error("the screen is gone");
+				},
+				askQuit: () => {},
+				dismissQuit: () => {},
+				leave: () => {},
+			},
+		});
+		await gone.refresh();
+		await expect(gone.submit("a line with no question open")).resolves.toBeUndefined();
 	});
 
 	it("draws the quit confirmation with its promise and its keys, and answers it by key", () => {

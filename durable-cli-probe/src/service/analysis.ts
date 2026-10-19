@@ -48,21 +48,13 @@ export type AnalysisReader = {
 	/**
 	 * One pass.
 	 *
-	 * @param now - the clock reading stored as `takenAt`.
-	 * @param setWatched - receives the documents this pass read; the initial pass
-	 *   always resolves watchers for everything the pass depends on, later passes
-	 *   only add watchers for keys that are new.
+	 * @param now - the clock reading stored as `takenAt`. What the pass read is
+	 *   reported on the snapshot itself (`watchedTasks` and friends), which is what
+	 *   the composition root turns into watches.
 	 */
-	readonly snapshot: (now: number, setWatched?: (keys: PassKeys) => void) => Promise<TuiSnapshot>;
+	readonly snapshot: (now: number) => Promise<TuiSnapshot>;
 	/** One task's detail, or `undefined` when neither a batch nor a ledger knows it. */
 	readonly inspectTask: (taskId: string, now: number) => Promise<TaskDetail | undefined>;
-};
-
-/** What one pass read, as watch keys. */
-export type PassKeys = {
-	readonly status: true;
-	readonly ledgers: readonly string[];
-	readonly specs: readonly string[];
 };
 
 function rowWord(status: TaskBusinessStatus): TaskRowStatus {
@@ -232,7 +224,7 @@ export function createAnalysisReader(options: AnalysisReaderOptions): AnalysisRe
 		};
 	};
 
-	const snapshot = async (now: number, setWatched?: (keys: PassKeys) => void): Promise<TuiSnapshot> => {
+	const snapshot = async (now: number): Promise<TuiSnapshot> => {
 		// One Main read at a time: each one reconciles the queue, and three parallel
 		// reconciliations would race on the same pointer for no benefit.
 		const request = await main.readRequest();
@@ -258,8 +250,6 @@ export function createAnalysisReader(options: AnalysisReaderOptions): AnalysisRe
 			rows.push(deriveTaskRow({ taskId, batchId: task.batchId, title: await titleOf(taskId), ledger, task, quota }));
 		}
 		const batchIds = new Set(tasks.map((task) => task.batchId));
-		const known = [...seen];
-		setWatched?.({ status: true, ledgers: known, specs: known });
 		const settledBatches = [...batchIds].filter((batchId) => {
 			const items = tasks.filter((task) => task.batchId === batchId);
 			return items.length > 0 && items.every((task) => task.item.receipt !== undefined);

@@ -191,6 +191,13 @@ describe("TASK-005.5 session read model", { timeout: 90_000 }, () => {
 		// A plain line is refused while a question is open; nothing is written.
 		const plain = routeLine("a brand new request", asking);
 		expect(plain.kind).toBe("noop");
+		// The refusal names only commands the router has: a notice pointing at a bare
+		// `/` (or at a command that does not exist) sends the user to "unknown command".
+		const notice = plain.kind === "noop" ? plain.notice : "";
+		const named = notice.match(/\/[a-z-]+/g) ?? [];
+		expect(named.length).toBeGreaterThan(0);
+		expect(notice).not.toMatch(/\/$|\/\s/);
+		for (const command of named) expect(["/help", "/tasks", "/transcript", "/quit", "/exit", "/inspect", "/cancel", "/answer", "/withdraw"]).toContain(command);
 
 		// `--insufficient` answers without claiming sufficiency, and the question stays open.
 		const insufficient = routeLine("/answer --insufficient maybe the second one", asking);
