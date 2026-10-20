@@ -19,7 +19,15 @@
 
 import { Worker } from "node:worker_threads";
 import { driveMain } from "./batch-system.ts";
-import { openRecoverySystem, RECOVERY_BOUNDARIES, RECOVERY_INPUT, RECOVERY_TASK_ID, type RecoveryBoundary } from "./recovery-scenario.ts";
+import {
+	openRecoverySystem,
+	RECOVERY_BOUNDARIES,
+	RECOVERY_INPUT,
+	RECOVERY_TASK_ID,
+	REVIEW_BOUNDARIES,
+	type RecoveryBoundary,
+	type ReviewBoundary,
+} from "./recovery-scenario.ts";
 
 /** The value of `--<name>`, failing loudly when the argument is missing. */
 function argument(name: string): string {
@@ -32,20 +40,35 @@ function argument(name: string): string {
 const databasePath = argument("database");
 const markerPath = argument("marker");
 const requested = argument("boundary");
-const boundary = RECOVERY_BOUNDARIES.find((candidate) => candidate === requested);
-if (boundary === undefined) throw new Error(`batch-runner: unknown boundary ${JSON.stringify(requested)}`);
-const state: RecoveryBoundary = boundary;
+// The boundary's own vocabulary is the run's: the four round boundaries of
+// TASK-005.4 and the three review boundaries of TASK-005.7. They are looked up
+// separately because they select different Main scripts, not because they are
+// different watchers.
+const review = REVIEW_BOUNDARIES.find((candidate) => candidate === requested);
+const roundBoundary = RECOVERY_BOUNDARIES.find((candidate) => candidate === requested);
+if (review === undefined && roundBoundary === undefined) throw new Error(`batch-runner: unknown boundary ${JSON.stringify(requested)}`);
+const state: RecoveryBoundary | undefined = roundBoundary;
+// The watcher takes either vocabulary: it is the same poll loop, and the
+// boundary string is the key it looks its state predicate up by.
+const boundary: RecoveryBoundary | ReviewBoundary = review ?? (state as RecoveryBoundary);
 
 // Only the retry-wait scenario needs the provider to fail once; that failure is
 // the device that parks the round, not a behaviour the other states depend on.
-const system = await openRecoverySystem({ databasePath, failFirst: state === "retry-wait" });
+const system = await openRecoverySystem({
+	databasePath,
+	failFirst: state === "retry-wait",
+	...(review === undefined ? {} : { review }),
+	// `review-pending` is the state *before* the review commit: this process must
+	// not decide, or the state it is killed in would be the one after the commit.
+	...(review === "review-pending" ? { decide: false } : {}),
+});
 
 const watcher = new Worker(new URL("./batch-watch.mjs", import.meta.url), {
 	workerData: {
 		dbPath: databasePath,
 		taskId: RECOVERY_TASK_ID,
 		round: 1,
-		boundary: state,
+		boundary,
 		markerPath,
 		kill: true,
 		pid: process.pid,
@@ -66,5 +89,5 @@ await driveMain(system, RECOVERY_INPUT);
 // distinct exit code and leave the database intact for inspection.
 await watcher.terminate();
 await system.runtime.close();
-console.error(`batch-runner: the run finished without reaching ${state}`);
+console.error(`batch-runner: the run finished without reaching ${boundary}`);
 process.exitCode = 3;

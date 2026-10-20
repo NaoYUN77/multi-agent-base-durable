@@ -1,8 +1,8 @@
 // TASK-005.2 src/agent/main/tools.ts
 //
-// The Main agent's three management tools. They are the *only* way the model can
-// ask a question, save a plan or dispatch tasks, and each one is a write
-// boundary rather than a convention:
+// The Main agent's four management tools. They are the *only* way the model can
+// ask a question, save a plan, dispatch tasks or decide a review, and each one is
+// a write boundary rather than a convention:
 //
 //   request_clarification  the model proposes a question; the program derives the
 //                          question id from its own request identity and round
@@ -17,6 +17,11 @@
 //                          actually blocks the named tasks, an unaccepted
 //                          dependency, a task outside the plan or an exhausted
 //                          quota, and only then hands the batch to the executor.
+//   review_task            the model names a task, a round and a decision; the
+//                          program checks the round against the ledger, writes
+//                          the transition the table allows, and runs a rework
+//                          through the runtime's own channel. The model never
+//                          writes a business status.
 //
 // Three things this file deliberately does NOT do:
 //
@@ -31,6 +36,7 @@
 //     operation receipt keyed by the real tool call and returns that instead.
 
 import { Type, type Message } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/chord";
 import {
 	defineExtension,
 	defineTool,
@@ -293,7 +299,51 @@ export type MainToolHost = {
 	 * means the caller drives reconciliation itself.
 	 */
 	readonly beforeRequest?: (request: BeforeRequest) => Promise<BeforeRequestResult>;
+	/**
+	 * Review one finished round: accept it, or send it back for a rework.
+	 *
+	 * Absent means this deployment has no reviewer. The tool is then still offered
+	 * — the contract's tool set is not conditional — and every call is refused with
+	 * a stable reason, because a review that silently did nothing would be worse
+	 * than one that says why it could not run.
+	 */
+	readonly review?: ReviewRunner;
 };
+
+/**
+ * The review decision, as the Main tool hands it to the host.
+ *
+ * `begin` and `finish` are supplied by the tool and written by the service, so the
+ * decision and the record of the call that made it commit together.
+ */
+export type ReviewRequest = {
+	readonly api: ToolExecutionApi;
+	readonly context: Context;
+	readonly opKey: string;
+	readonly taskId: string;
+	readonly round: number;
+	readonly decision: "accept" | "rework";
+	readonly feedback?: string;
+	readonly begin: (tx: Tx) => Promise<void>;
+	readonly finish: (outcome: { readonly text: string; readonly isError: boolean }, tx?: Tx) => Promise<void>;
+	/**
+	 * The operation keys whose recorded result is an error, read before the decision
+	 * commits. Only a rework whose round never started needs it: such a decision won
+	 * nothing, so the round must stay decidable. The service supplies it; the tool
+	 * does not, because the receipt document is the service's.
+	 */
+	readonly failedOperations?: () => Promise<ReadonlySet<string>>;
+};
+
+/** What a review runner answers. */
+export type ReviewResult = {
+	readonly ok: boolean;
+	readonly text: string;
+	readonly code?: string;
+};
+
+/** The injected reviewer: the batch runtime's review entry, bound to its documents. */
+export type ReviewRunner = (request: ReviewRequest) => Promise<ReviewResult>;
 
 /** One generation attempt, offered to the host before the provider request is issued. */
 export type BeforeRequest = {
@@ -915,9 +965,84 @@ export function createMainExtension(host: MainToolHost): Extension {
 		},
 	});
 
+	/**
+	 * The review entry.
+	 *
+	 * Three things make this a write boundary rather than a convention:
+	 *
+	 *   * **The decision is the model's; the state change is not.** `accepted` is a
+	 *     terminal business status, and the program moves the ledger along the one
+	 *     edge the table has. The model cannot name a status, and the tool has no
+	 *     parameter for one.
+	 *   * **The round is checked against the ledger, not trusted.** A decision aimed
+	 *     at a round the task has left is refused, so a model that reviews a stale
+	 *     result cannot land it on newer work.
+	 *   * **One winner per round.** The decision and its receipt are one commit, so a
+	 *     duplicate call, a replay, or a call racing another decision sees the
+	 *     recorded binding and is refused. A refusal writes no terminal state.
+	 */
+	const reviewTask = defineTool({
+		name: "review_task",
+		description:
+			"Decide one finished round of a dispatched task: accept it, or send it back for a rework with feedback. " +
+			"Use the round the task's result reports. A rework runs the next round of the same task and the same child " +
+			"conversation; when the revision allowance is spent the rework is refused and the task stays awaiting review, " +
+			"so accept it or say plainly that it failed. Duplicate decisions, decisions for an older round and decisions " +
+			"on a failed or cancelled task are refused and change nothing.",
+		parameters: Type.Object({
+			taskId: Type.String({ description: "The task to review, exactly as the plan names it." }),
+			round: Type.Number({ description: "The round the result reports. A round the task has left is refused." }),
+			decision: Type.Union([Type.Literal("accept"), Type.Literal("rework")], {
+				description: "accept ends the task successfully; rework runs the next round with your feedback.",
+			}),
+			feedback: Type.Optional(
+				Type.String({ description: "What the next round must change. Required for a rework; ignored for an accept." }),
+			),
+		}),
+		replay: "safe",
+		executionMode: "parallel",
+		execute: async (args, api, callContext): Promise<ToolExecutionResult> => {
+			const opKey = operationKey("review", api.taskId, api.callId);
+			const replayed = await replayOf(opKey);
+			// Only a *finished* receipt answers a replay. A started marker with no
+			// result means the call died between its decision commit and the round it
+			// started; falling through re-enters `reviewTask`, which sees its own
+			// operation binding, decides nothing twice, and finishes the round the
+			// decision already owns. Returning a made-up "already recorded" here would
+			// abandon exactly that round.
+			if (replayed?.result !== undefined) {
+				// The stored error flag travels with the result: a refusal that replayed
+				// as an ordinary tool result would read as a decision that was taken.
+				return { output: [{ type: "text", text: replayed.result }], isError: replayed.isError === true };
+			}
+			if (host.review === undefined) {
+				const text = "review refused: this deployment has no reviewer wired in, so no task can be accepted or reworked.";
+				// Recorded, so a replay reports the same refusal instead of trying again.
+				await host.recordOperation?.({ opKey, result: text, isError: true });
+				return { output: [{ type: "text", text }], isError: true };
+			}
+			const result = await host.review({
+				api,
+				context: callContext,
+				opKey,
+				taskId: args.taskId,
+				round: args.round,
+				decision: args.decision,
+				...(args.feedback === undefined ? {} : { feedback: args.feedback }),
+				// The started marker and the receipt are written by the review entry
+				// inside its own decision transaction, so a crash between the decision and
+				// the round leaves a binding that proves what was decided.
+				begin: async (tx) => await host.beginOperation?.({ opKey }, tx),
+				finish: async (outcome, tx) =>
+					await host.recordOperation?.({ opKey, result: outcome.text, isError: outcome.isError }, tx),
+			});
+			return { output: [{ type: "text", text: result.text }], isError: result.ok === false };
+		},
+	});
+
 	return defineExtension({
 		name: "main-management",
-		tools: [requestClarification, savePlan, dispatchTasks],
+		tools: [requestClarification, savePlan, dispatchTasks, reviewTask],
 		// The restoration facts ride on a *section* rather than only on the handoff
 		// payload, so they are rendered from committed state for every attempt, during
 		// that attempt's preparation. The payload is a snapshot taken when the question
@@ -948,7 +1073,7 @@ export function createMainExtension(host: MainToolHost): Extension {
 }
 
 /** Tool names the Main agent is offered, for tests and the inspector. */
-export const MAIN_TOOL_NAMES: readonly string[] = ["request_clarification", "save_plan", "dispatch_tasks"];
+export const MAIN_TOOL_NAMES: readonly string[] = ["request_clarification", "save_plan", "dispatch_tasks", "review_task"];
 
 /** The request document, re-exported so a caller can name the contract without a second import. */
 export { AgentRequestDoc };

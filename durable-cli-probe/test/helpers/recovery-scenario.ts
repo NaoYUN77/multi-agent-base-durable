@@ -56,6 +56,29 @@ export const RECOVERY_BOUNDARIES: readonly RecoveryBoundary[] = [
 ];
 
 /**
+ * The four review boundaries of TASK-005.7 (AC-04). They live in this fixture
+ * because they reuse the same plan, task and run configuration; what differs is
+ * the Main script and the child, which are chosen by the runner's `--review`.
+ *
+ * `review-pending` is the kill *before* the review commit: the round has settled
+ * at `awaiting_review` and no decision exists yet. The reopening test is the one
+ * that decides a task that had none.
+ */
+export type ReviewBoundary = "review-pending" | "review-accepted" | "rework-decided" | "rework-settled";
+
+export const REVIEW_BOUNDARIES: readonly ReviewBoundary[] = [
+	"review-pending",
+	"review-accepted",
+	"rework-decided",
+	"rework-settled",
+];
+
+/** The feedback the review fixture sends back, and the child's marker for it. */
+export const REVIEW_FEEDBACK = "name the second count as well";
+/** The child's round-2 answer, which is what proves the rework ran in the same task. */
+export const REVIEW_REWORK_ANSWER = "the material holds three words: alpha twice and beta once, counted twice";
+
+/**
  * The run configuration every recovery run uses.
  *
  * The values are the fixture's: two concurrent sub-agents, two attempts per
@@ -156,10 +179,84 @@ export function recoveryChildRouter(options: { readonly failFirst: boolean }): C
 export async function openRecoverySystem(options: {
 	readonly databasePath: string;
 	readonly failFirst?: boolean;
+	readonly review?: ReviewBoundary;
+	/**
+	 * Whether this process makes the review decision once the round has settled.
+	 *
+	 * The process killed at `review-pending` must not decide: its whole point is
+	 * that the decision has not been committed when it dies. Every other process —
+	 * and every reopening one — does decide.
+	 */
+	readonly decide?: boolean;
 }): Promise<BatchSystem> {
+	const decide = options.decide ?? true;
 	return await openBatchSystem({
 		databasePath: options.databasePath,
-		router: transcriptRouter((flat) => recoveryScript(flat), recoveryChildRouter({ failFirst: options.failFirst ?? false })),
+		router: transcriptRouter(
+			(flat) => (options.review === undefined ? recoveryScript(flat) : reviewScript(flat, options.review, decide)),
+			options.review === undefined ? recoveryChildRouter({ failFirst: options.failFirst ?? false }) : reviewChildRouter(),
+		),
 		runConfig: recoveryRunConfig(),
 	});
+}
+
+/**
+ * Main's script for the review boundaries: dispatch, then decide.
+ *
+ * Read from the transcript, like `recoveryScript`, and for the same reason — a
+ * reopened process must not re-dispatch or re-decide. The decision is issued only
+ * once the dispatch's own result line is in the transcript, and only once, because
+ * the tool's result text is what carries the decision back.
+ *
+ * @param flat - the flattened transcript of this provider request.
+ * @param boundary - which decision the fixture makes: `review-accepted` accepts,
+ *   the two rework boundaries reject with `REVIEW_FEEDBACK`.
+ * @param decide - when `false`, this process stops after the dispatch, so the
+ *   review decision is left for the process that reopens the database.
+ * @returns the tool calls this request should make; `[]` is the final answer.
+ */
+export function reviewScript(flat: string, boundary: ReviewBoundary, decide = true): MainStep {
+	if (flat.includes(`dispatched plan ${RECOVERY_PLAN_ID}`)) {
+		if (!decide) return [];
+		if (flat.includes("reworked task ")) return [];
+		if (flat.includes("accepted task ")) return [];
+		const decision = boundary === "review-accepted" || boundary === "review-pending" ? "accept" : "rework";
+		return [
+			{
+				name: "review_task",
+				arguments: {
+					taskId: RECOVERY_TASK_ID,
+					round: 1,
+					decision,
+					...(decision === "rework" ? { feedback: REVIEW_FEEDBACK } : {}),
+				},
+			},
+		];
+	}
+	if (flat.includes(`saved plan ${RECOVERY_PLAN_ID}`)) {
+		return [{ name: "dispatch_tasks", arguments: { planId: RECOVERY_PLAN_ID, version: 1, tasks: [recoverySpec()] } }];
+	}
+	return [{ name: "save_plan", arguments: { planId: RECOVERY_PLAN_ID, goals: ["run and review the recovery scenario"], taskIds: [RECOVERY_TASK_ID] } }];
+}
+
+/**
+ * The child for the review boundaries: the same answer, but round 2 is a rework
+ * and must be recognisable in the transcript.
+ *
+ * A rework's submission carries the reviewer's feedback, so the router branches on
+ * that text rather than on a counter — the answer a recovered round gives has to be
+ * the answer that round is supposed to give, whether or not this process ran round 1.
+ */
+export function reviewChildRouter(): ChildRouter {
+	return (request) => {
+		const flat = flattenRequest(request.messages);
+		if (submittedTaskId(flat) !== RECOVERY_TASK_ID) throw new Error("review child router saw a request that is not the recovery task");
+		const last = [...request.messages].reverse().find((message) => message.role !== "system");
+		if (last?.role !== "toolResult") {
+			return fauxAssistantMessage([fauxToolCall("text_stats", { text: RECOVERY_MATERIAL, marker: "R" }, { id: "review-stats" })], {
+				stopReason: "toolUse",
+			});
+		}
+		return fauxAssistantMessage([fauxText(childAnswer(flat.includes(REVIEW_FEEDBACK) ? REVIEW_REWORK_ANSWER : RECOVERY_ANSWER))]);
+	};
 }
