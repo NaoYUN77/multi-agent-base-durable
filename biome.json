@@ -1,7 +1,14 @@
 {
 	"$schema": "https://biomejs.dev/schemas/2.3.5/schema.json",
 	"files": {
-		"includes": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs", "vitest.config.ts"]
+		"includes": [
+			"src/**/*.ts",
+			"test/**/*.ts",
+			"scripts/**/*.mjs",
+			"vitest.config.ts",
+			"!!vendor",
+			"!!base-durable-vaction-agent"
+		]
 	},
 	"linter": {
 		"enabled": true,

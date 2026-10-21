@@ -73,7 +73,7 @@ const appRoot = resolve(here, "..");
 const pinPath = join(appRoot, "pi-pin.json");
 
 /** Where link-checkout.mjs looks when PI_CHECKOUT is unset. */
-const DEFAULT_CHECKOUT = join(appRoot, "..", "base-durable-vaction-agent", "pi");
+const DEFAULT_CHECKOUT = join(appRoot, "base-durable-vaction-agent", "pi");
 
 const IS_WINDOWS = process.platform === "win32";
 

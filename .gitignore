@@ -1,7 +1,10 @@
 # ── 上游依赖：pi checkout ──────────────────────────────────────────────
-# durable-cli-probe 的 node_modules/@earendil-works/* 是指向这里的软链。
-# 505MB，且带自己的 .git 历史，绝不入库。恢复方式见 durable-cli-probe/README.md。
+# node_modules/@earendil-works/* 是指向这里的软链。
+# 505MB，且带自己的 .git 历史，绝不入库。恢复方式见 doc/probe-notes.md。
 base-durable-vaction-agent/
+
+# vendor/ 是同一 checkout 的实际位置（base-durable-vaction-agent 指向它）。
+vendor/
 
 # ── 原 billryan/resume fork 的 .git，已挪到一边保留，不入库 ─────────────
 .git-resume-fork-backup/
@@ -15,9 +18,12 @@ npm-debug.log*
 *.sqlite-wal
 *.sqlite-shm
 
+# ── 本地 MCP 配置（可能内联凭据，按 mcp.example.json 复制） ───────────────
+mcp.json
+
 ############################################
-## 简历模板残留（本目录原为 billryan/resume 的 fork）
-## 本仓库只承载 durable-cli-probe 探针项目，简历相关文件一律不入库。
+## 简历模板残留（本目录原为 billryan/resume 的 fork）。
+## 应用本身位于仓库根目录；下列规则仍然让简历相关文件不入库。
 ############################################
 
 # LaTeX 源码与模板
@@ -69,8 +75,7 @@ Noto*
 *.dvi
 *.ps
 
-# 模板自带的 scripts/
-/scripts/
+# 模板自带的 scripts/ 已随简历模板一并移除；仓库根的 scripts/ 属于应用。
 
 # ── 编辑器 / 系统 ───────────────────────────────────────────────────────
 .DS_Store

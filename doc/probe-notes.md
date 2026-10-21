@@ -1,4 +1,7 @@
-# durable-cli-probe
+# durable-cli-probe — task notes
+
+> Historical notes from the probe project (`durable-cli-probe/`), which was merged into the repository root.
+> Paths below refer to the root layout unless a section is explicitly a captured log from before the split.
 
 TASK-001: a standalone probe that verifies the **minimal Pi Durable run chain** without touching the Durable core or
 the Vacation demo.
@@ -27,7 +30,7 @@ exactly one identity for each package: the checkout's real directory.
 | `@earendil-works/pi-ai` | `<checkout>/packages/ai` |
 | `@earendil-works/chord` | `<checkout>/packages/chord` |
 
-Default checkout path: `../base-durable-vaction-agent/pi`. Override with `PI_CHECKOUT`.
+Default checkout path: `<repo>/base-durable-vaction-agent/pi`. Override with `PI_CHECKOUT`.
 
 Checked-out revision at the time of writing:
 
@@ -58,7 +61,7 @@ npm's arborist recurse on the next install (`#loadPeerSet` → `Cannot read prop
 ## 2. Layout
 
 ```
-durable-cli-probe/
+.                                    # repository root (was durable-cli-probe/ until the split)
 ├── package.json                     # scripts + dev tooling; no registry Pi packages
 ├── tsconfig.json                    # Node16 ESM, no paths override (one package identity)
 ├── vitest.config.ts                 # resolves the checkout with the `source` condition
@@ -69,10 +72,9 @@ durable-cli-probe/
 │   └── cli.ts                       # args -> root -> submit -> wait -> print -> close
 ├── test/
 │   └── persistence-reopen.test.ts   # faux provider + temp SQLite file
-├── data/
-│   ├── .gitkeep
-│   └── .gitignore                   # SQLite files are never committed
-└── README.md
+└── data/
+    ├── .gitkeep
+    └── .gitignore                   # SQLite files are never committed
 ```
 
 ---
@@ -80,7 +82,7 @@ durable-cli-probe/
 ## 3. Setup and run
 
 ```bash
-cd E:/Code/pi-durable/durable-cli-probe
+cd E:/Code/pi-durable
 
 # 1. Install dev tooling (vitest, typescript, @types/node).
 npm install --ignore-scripts
@@ -108,7 +110,7 @@ npm run typecheck
 
 | variable | meaning |
 | --- | --- |
-| `PI_CHECKOUT` | checkout root for `npm run link` (default `../base-durable-vaction-agent/pi`) |
+| `PI_CHECKOUT` | checkout root for `npm run link` (default `<repo>/base-durable-vaction-agent/pi`) |
 | `DEEPSEEK_API_KEY` | only read when `--provider deepseek`; read **inside** the built-in provider; never printed, logged, or written to SQLite |
 | `OPENAI_API_KEY` | only read when `--provider openai`; read **inside** the built-in provider; never printed, logged, or written to SQLite |
 | `PROBE_API_KEY` (name is configurable) | only read when `--provider custom`; read from the env var named by `--api-key-env`; never printed, logged, or written to SQLite |
@@ -759,7 +761,7 @@ poison a later one.
 
 ## 18. TASK-004 — typecheck, lint, and the pinned Pi checkout
 
-第一版 CI 的能力、实际验证证据、保障边界和后续补充计划见 [CI 文档](docs/ci.md)。
+第一版 CI 的能力、实际验证证据、保障边界和后续补充计划见 [CI 文档](ci.md)。
 
 This section supersedes the manual `npm install --ignore-scripts` + `npm run link` dance in
 §3 for a from-scratch setup. One entry point now does all of it, in a fixed order, and CI runs
@@ -768,9 +770,7 @@ exactly the same entry point (`.github/workflows/ci.yml`).
 ### 18.1 One preparation command
 
 ```bash
-cd durable-cli-probe
-
-# From a fresh clone (nothing pre-existing):
+# From the repository root (a fresh clone, nothing pre-existing):
 npm run pi:prepare
 
 # Or prove nothing pre-existing is relied upon first:
@@ -823,7 +823,7 @@ construction, not by an ignore list. `noExplicitAny` is set to `error`.
 
 ### 18.3 Where the Pi version is pinned
 
-`durable-cli-probe/pi-pin.json` — the official repository URL, the full commit SHA, the three
+`pi-pin.json` (repository root) — the official repository URL, the full commit SHA, the three
 package names, the build chain, and the model catalog endpoint. Local preparation and CI both read
 this one file. To move the pin, edit that file; everything else follows. Do not substitute a
 branch, a tag, or a registry version: the whole point is that a checkout, a local run and a CI run
