@@ -44,7 +44,6 @@ avatar.*
 # 模板脚手架
 Makefile
 latexmkrc
-LICENSE
 README.md.bak
 fontawesome*
 Noto*

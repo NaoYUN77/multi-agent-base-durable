@@ -373,4 +373,4 @@ Boundaries and planned work, as recorded in `doc/ci.md`: a green run proves the 
 
 ## 5. License
 
-No license is declared: the repository contains no `LICENSE` file, `package.json` sets `"private": true` and has no `license` field, and the root `.gitignore` excludes `LICENSE` (a leftover from the resume template this directory was forked from). Until a license is added, the code carries no grant of rights.
+Apache License 2.0. The full text is in [`LICENSE`](LICENSE), and `package.json` declares `"license": "Apache-2.0"`. Copyright 2026 NaoYUN77.
