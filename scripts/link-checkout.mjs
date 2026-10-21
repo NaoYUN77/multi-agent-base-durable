@@ -25,7 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const probeRoot = resolve(here, "..");
 
 /** The checkout root, overridable for a different local clone. */
-const checkout = resolve(process.env.PI_CHECKOUT ?? join(probeRoot, "..", "base-durable-vaction-agent", "pi"));
+const checkout = resolve(process.env.PI_CHECKOUT ?? join(probeRoot, "base-durable-vaction-agent", "pi"));
 
 const packages = [
 	{ dir: "packages/chord", name: "@earendil-works/chord" },

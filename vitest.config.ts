@@ -4,7 +4,7 @@ import { defineConfig } from "vitest/config";
 // Resolve the checkout packages the same way the CLI does: through the symlinks
 // in node_modules, with the `source` condition so TypeScript sources are read
 // directly rather than the built dist.
-const checkout = fileURLToPath(new URL("../base-durable-vaction-agent/pi", import.meta.url));
+const checkout = fileURLToPath(new URL("./base-durable-vaction-agent/pi", import.meta.url));
 
 export default defineConfig({
 	resolve: {

@@ -11,7 +11,7 @@
 | 自动触发 | 所有 PR、推送到 main、手动 workflow_dispatch | 这些事件会启动检查；没有路径过滤 |
 | 类型检查 | 独立 job `typecheck`，执行 `tsc --noEmit`，strict 开启 | 本应用 src/test 的 TypeScript 类型一致 |
 | 静态规则 | 独立 job `lint`，Biome 2.3.5，recommended 规则，noExplicitAny 为 error | 配置范围内没有使命令失败的 lint 错误 |
-| 可重复准备 | 两个 job 各自执行同一个 prepare.mjs | 检查依赖脚本从锁定版本准备环境，而非开发机已有产物 |
+| 可重复准备 | 三个 job 各自执行同一个 prepare.mjs | 检查依赖脚本从锁定版本准备环境，而非开发机已有产物 |
 | 版本记录 | 输出应用 checkout SHA、Pi SHA、Node/npm 版本 | 能追溯该次检查实际使用的代码和工具链 |
 | 下载缓存 | 缓存 ~/.npm；key 包含 Pi SHA 和应用 lockfile hash | 加速下载；node_modules 和 dist 均不缓存 |
 | 工作流权限 | contents: read，不读取模型/Notion凭据 | 普通检查不需要真实服务授权 |
@@ -21,7 +21,9 @@
 
 两个 job 没有互相依赖，也没有 `continue-on-error`。PR 默认检查 GitHub 生成的合并提交，日志的 checkout SHA 可能不同于 PR 分支 head SHA；追溯时应同时看运行元数据和 checkout 日志。
 
-源码入口：[workflow](../../.github/workflows/ci.yml)、[package.json](../package.json)、[tsconfig.json](../tsconfig.json)、[biome.json](../biome.json)。
+> 现状补充：本文写于两个 job 的版本。当前工作流已加入第三个 job `test`（`npm test`），三个 job 互不依赖，均先执行 `node scripts/prepare.mjs`。下文的“两项静态检查”仍准确，只是不再覆盖全部 job。
+
+源码入口：[workflow](../.github/workflows/ci.yml)、[package.json](../package.json)、[tsconfig.json](../tsconfig.json)、[biome.json](../biome.json)。
 
 ## 2. 依赖准备具体做了什么
 
@@ -40,7 +42,7 @@
 
 这避免把同名 npm registry 包当成本地 Pi 包，也避免使用未构建的类型声明。不会运行上游全仓库 build 或会改写源码的 `npm run check`。
 
-默认 checkout 在应用目录的 `../base-durable-vaction-agent/pi`。覆盖顺序为 `--checkout-dir`、`PI_CHECKOUT`、默认路径。准备过程会安装依赖并生成构建产物；只有后面的 lint/typecheck 是不写源码的检查。
+默认 checkout 在仓库根的 `base-durable-vaction-agent/pi`。覆盖顺序为 `--checkout-dir`、`PI_CHECKOUT`、默认路径。准备过程会安装依赖并生成构建产物；只有后面的 lint/typecheck/test 是不写源码的检查。
 
 `build:offline` 不刷新实时模型目录，但整个准备过程仍需要 GitHub、npm、pi.dev 网络访问；不能把它理解为完全离线构建。
 
@@ -69,7 +71,7 @@
 
 Codex 核查了源码、相关 Actions 记录，并只读查询了合并后运行的 job/step 结果。此前复审还实际执行了针对 prepare.mjs 参数、相对路径及删除路径边界的 8 项断言，结果通过；它们是临时审阅验证，尚未作为永久 CI 测试提交。
 
-更完整的净室验证、问题修复和实施者命令记录保留在 [TASK-004-VERIFICATION.md](../TASK-004-VERIFICATION.md)。不要将实施者报告标成审阅者亲自运行：本次文档整理没有在本机执行 npm 安装、构建、测试或真实模型/Notion调用。
+更完整的净室验证、问题修复和实施者命令记录保留在 [TASK-004-VERIFICATION.md](reports/TASK-004-VERIFICATION.md)。不要将实施者报告标成审阅者亲自运行：本次文档整理没有在本机执行 npm 安装、构建、测试或真实模型/Notion调用。
 
 ## 5. 合并门禁现状
 
@@ -105,7 +107,7 @@ Codex 核查了源码、相关 Actions 记录，并只读查询了合并后运�
 
 ## 7. 本地复现
 
-以下为复现步骤，**不是本次文档任务已执行的命令**。先使用 Node 22.22.2，进入仓库内的 durable-cli-probe：
+以下为复现步骤，**不是本次文档任务已执行的命令**。先使用 Node 22.22.2，在仓库根目录执行：
 
 ```powershell
 node --version
@@ -123,7 +125,7 @@ npm run lint
 npm run pi:prepare -- --checkout-dir "E:/Code/pi-ci-local/pi"
 ```
 
-该目录应是新的或符合 pin 的 checkout。不要为了通过准备脚本而覆盖有本地修改的上游目录。可选 `--clean` 会删除部分依赖/构建产物，应按 [README §18](../README.md#18-task-004--typecheck-lint-and-the-pinned-pi-checkout) 的说明使用。
+该目录应是新的或符合 pin 的 checkout。不要为了通过准备脚本而覆盖有本地修改的上游目录。可选 `--clean` 会删除部分依赖/构建产物，应按 [探针笔记 §18](probe-notes.md#18-task-004--typecheck-lint-and-the-pinned-pi-checkout) 的说明使用。
 
 ## 8. 文档维护约定
 

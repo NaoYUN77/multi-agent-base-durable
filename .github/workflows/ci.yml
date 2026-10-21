@@ -2,10 +2,10 @@ name: ci
 
 # TASK-004: typecheck + lint on every PR, on main, and on demand.
 #
-# Both jobs run the same preparation entry point (durable-cli-probe/scripts/prepare.mjs),
-# so a red check here means the documented local steps fail too. The two jobs are
+# All three jobs run the same preparation entry point (scripts/prepare.mjs),
+# so a red check here means the documented local steps fail too. The jobs are
 # deliberately written out instead of using a matrix, so the required-check names are
-# exactly `lint` and `typecheck`.
+# exactly `lint`, `typecheck` and `test`.
 
 on:
   pull_request:
@@ -37,11 +37,10 @@ jobs:
 
       - name: Log the revisions and toolchain under test
         id: revisions
-        working-directory: durable-cli-probe
         run: |
           app_commit=$(git rev-parse HEAD)
           pi_commit=$(node -p "require('./pi-pin.json').commit")
-          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          app_lock_hash=${{ hashFiles('package-lock.json') }}
           node_version=$(node --version)
           npm_version=$(npm --version)
           {
@@ -68,11 +67,9 @@ jobs:
             ${{ runner.os }}-npm-
 
       - name: Prepare the pinned Pi checkout and build its type artifacts
-        working-directory: durable-cli-probe
         run: node scripts/prepare.mjs
 
       - name: lint
-        working-directory: durable-cli-probe
         run: npm run lint
 
   typecheck:
@@ -88,11 +85,10 @@ jobs:
 
       - name: Log the revisions and toolchain under test
         id: revisions
-        working-directory: durable-cli-probe
         run: |
           app_commit=$(git rev-parse HEAD)
           pi_commit=$(node -p "require('./pi-pin.json').commit")
-          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          app_lock_hash=${{ hashFiles('package-lock.json') }}
           node_version=$(node --version)
           npm_version=$(npm --version)
           {
@@ -115,11 +111,9 @@ jobs:
             ${{ runner.os }}-npm-
 
       - name: Prepare the pinned Pi checkout and build its type artifacts
-        working-directory: durable-cli-probe
         run: node scripts/prepare.mjs
 
       - name: typecheck
-        working-directory: durable-cli-probe
         run: npm run typecheck
 
   test:
@@ -135,11 +129,10 @@ jobs:
 
       - name: Log the revisions and toolchain under test
         id: revisions
-        working-directory: durable-cli-probe
         run: |
           app_commit=$(git rev-parse HEAD)
           pi_commit=$(node -p "require('./pi-pin.json').commit")
-          app_lock_hash=${{ hashFiles('durable-cli-probe/package-lock.json') }}
+          app_lock_hash=${{ hashFiles('package-lock.json') }}
           node_version=$(node --version)
           npm_version=$(npm --version)
           {
@@ -162,9 +155,7 @@ jobs:
             ${{ runner.os }}-npm-
 
       - name: Prepare the pinned Pi checkout and build its type artifacts
-        working-directory: durable-cli-probe
         run: node scripts/prepare.mjs
 
       - name: test
-        working-directory: durable-cli-probe
         run: npm test
