@@ -2,6 +2,7 @@
 	"name": "durable-cli-probe",
 	"version": "0.0.0",
 	"private": true,
+	"license": "Apache-2.0",
 	"type": "module",
 	"description": "TASK-001: minimal Pi Durable run-chain probe. Resolves the local pi checkout, never the registry.",
 	"engines": {
